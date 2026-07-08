@@ -535,6 +535,23 @@ pub mod demo {
     pub trait CommandApi {
         fn invoke(&mut self, cx: &mut gpui::Context<Self>) -> String;
     }
+
+    #[derive(Clone, Debug, crate::serde::Serialize, crate::serde::Deserialize)]
+    #[serde(crate = "gpui_embedded_shared::serde")]
+    pub struct WorkspaceSnapshot {
+        pub accent_hue: f32,
+        pub last_toast: Option<String>,
+    }
+
+    /// The mirror image of [`CommandApi`]: a service homed on the HOST that the plugin
+    /// drives. The same macro generates the same shape in the other direction — the
+    /// host implements the trait, and the guest's `Remote<WorkspaceSpec>` gets the
+    /// typed caller methods.
+    #[shared_interface(spec = WorkspaceSpec, type_name = "demo.workspace", snapshot = WorkspaceSnapshot)]
+    pub trait WorkspaceApi {
+        fn show_toast(&mut self, message: String, cx: &mut gpui::Context<Self>) -> String;
+        fn set_accent(&mut self, hue: f32, cx: &mut gpui::Context<Self>) -> String;
+    }
 }
 
 /// Schemas for the integration tests in `tests`.

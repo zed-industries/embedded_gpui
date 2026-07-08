@@ -13,7 +13,7 @@ use gpui_embedded::{
 };
 use gpui_embedded_shared::demo::{
     CommandApiCaller as _, CommandSpec, CounterSnapshot, CounterSpec, Increment, PaletteSpec,
-    TextSpec,
+    TextSpec, WorkspaceApi, WorkspaceSnapshot, WorkspaceSpec, register_workspace_api,
 };
 use std::collections::HashMap;
 
@@ -28,6 +28,37 @@ impl SharedEntitySource<CounterSpec> for Counter {
         CounterSnapshot {
             clicks: self.clicks,
         }
+    }
+}
+
+/// A host service the PLUGIN drives: wasm buttons call `show_toast` / `set_accent`
+/// through the schema's generated caller, and the native chrome reacts. Implementing
+/// the `WorkspaceApi` trait is all it takes; `register_workspace_api` wires it up.
+struct Workspace {
+    accent_hue: f32,
+    last_toast: Option<String>,
+}
+
+impl SharedEntitySource<WorkspaceSpec> for Workspace {
+    fn snapshot(&self, _cx: &App) -> WorkspaceSnapshot {
+        WorkspaceSnapshot {
+            accent_hue: self.accent_hue,
+            last_toast: self.last_toast.clone(),
+        }
+    }
+}
+
+impl WorkspaceApi for Workspace {
+    fn show_toast(&mut self, message: String, cx: &mut Context<Self>) -> String {
+        self.last_toast = Some(message);
+        cx.notify();
+        "the host is showing your toast".to_string()
+    }
+
+    fn set_accent(&mut self, hue: f32, cx: &mut Context<Self>) -> String {
+        self.accent_hue = hue.rem_euclid(1.0);
+        cx.notify();
+        format!("native accent set to hue {:.2}", self.accent_hue)
     }
 }
 
@@ -69,6 +100,10 @@ fn main() {
             move |window, cx| {
                 let scale = window.scale_factor();
                 let counter = cx.new(|_| Counter { clicks: 0 });
+                let workspace = cx.new(|_| Workspace {
+                    accent_hue: 0.58,
+                    last_toast: None,
+                });
                 let host = cx.new(|_| PluginHost::new(instance));
                 let (view0, view1, typed_text, palette) = host.update(cx, |host, cx| {
                     host.init(cx);
@@ -80,6 +115,8 @@ fn main() {
                         },
                         cx,
                     );
+                    // Homed on the HOST, driven by the plugin: the workspace service.
+                    host.share(&workspace, "workspace", register_workspace_api, cx);
                     // Homed in the GUEST: the wasm input line's text, projected natively.
                     let typed_text = host.remote::<TextSpec>("typed-text", cx);
                     // Also guest-homed: the command palette. Labels render as native
@@ -91,6 +128,7 @@ fn main() {
                 });
                 cx.new(|cx| {
                     cx.observe(&counter, |_, _, cx| cx.notify()).detach();
+                    cx.observe(&workspace, |_, _, cx| cx.notify()).detach();
                     cx.observe(typed_text.replica(), |_, _, cx| cx.notify())
                         .detach();
                     cx.observe(palette.replica(), |_, _, cx| cx.notify())
@@ -98,6 +136,7 @@ fn main() {
                     DemoView {
                         host,
                         counter,
+                        workspace,
                         typed_text,
                         palette,
                         command_remotes: HashMap::new(),
@@ -142,6 +181,7 @@ fn resolve_wasm_path() -> Option<PathBuf> {
 struct DemoView {
     host: Entity<PluginHost>,
     counter: Entity<Counter>,
+    workspace: Entity<Workspace>,
     typed_text: HostRemote<TextSpec>,
     palette: HostRemote<PaletteSpec>,
     /// Remotes materialized from palette refs, cached so repeated clicks reuse one
@@ -200,6 +240,8 @@ impl Render for DemoView {
             .map(|snapshot| snapshot.text.clone())
             .unwrap_or_default();
         let counter = self.counter.clone();
+        let accent = gpui::hsla(self.workspace.read(cx).accent_hue, 0.65, 0.6, 1.0);
+        let toast = self.workspace.read(cx).last_toast.clone();
         div()
             .size_full()
             .flex()
@@ -213,7 +255,7 @@ impl Render for DemoView {
                     .flex()
                     .items_center()
                     .gap_4()
-                    .child(div().text_xl().child("GPUI embedded in GPUI"))
+                    .child(div().text_xl().text_color(accent).child("GPUI embedded in GPUI"))
                     .child(
                         div()
                             .text_sm()
@@ -283,6 +325,19 @@ impl Render for DemoView {
                     }),
             )
             .child(framed_slot(px(480.), px(320.), self.view1.clone()))
+            .when_some(toast, |this, message| {
+                this.child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .rounded(px(8.))
+                        .border_1()
+                        .border_color(accent)
+                        .bg(rgb(0x2a2f36))
+                        .text_sm()
+                        .child(format!("🍞 from the plugin: {message}")),
+                )
+            })
     }
 }
 

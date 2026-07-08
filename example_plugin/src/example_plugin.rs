@@ -9,7 +9,8 @@ use gpui::{
 };
 use gpui_embedded_shared::demo::{
     CommandApi, CommandSnapshot, CommandSpec, CounterSnapshot, CounterSpec, Increment,
-    PaletteEntry, PaletteSnapshot, PaletteSpec, TextSnapshot, TextSpec, register_command_api,
+    PaletteEntry, PaletteSnapshot, PaletteSpec, TextSnapshot, TextSpec, WorkspaceApiCaller as _,
+    WorkspaceSpec, register_command_api,
 };
 use gpui_plugin::shared::{Remote, SharedEntitySource, SharedProjection};
 use gpui_plugin::{Plugin, register_plugin};
@@ -39,12 +40,15 @@ struct ExamplePlugin {
     /// A projection of the click counter homed on the HOST: reads come from snapshots,
     /// writes are `Increment` messages dispatched to the host's handler.
     counter: Remote<CounterSpec>,
+    /// The host's workspace service: the plugin drives native chrome through it.
+    workspace: Remote<WorkspaceSpec>,
 }
 
 impl Plugin for ExamplePlugin {
     fn new(cx: &mut App) -> Self {
         Self {
             counter: gpui_plugin::shared::remote::<CounterSpec>("clicks", cx),
+            workspace: gpui_plugin::shared::remote::<WorkspaceSpec>("workspace", cx),
         }
     }
 
@@ -53,7 +57,9 @@ impl Plugin for ExamplePlugin {
             0 => cx
                 .new(|cx| ButtonView::new(self.counter.clone(), cx))
                 .into(),
-            _ => cx.new(|cx| PanelView::new(self.counter.clone(), cx)).into(),
+            _ => cx
+                .new(|cx| PanelView::new(self.counter.clone(), self.workspace.clone(), cx))
+                .into(),
         }
     }
 
@@ -131,6 +137,7 @@ impl Render for ButtonView {
 
 struct PanelView {
     counter: Remote<CounterSpec>,
+    workspace: Remote<WorkspaceSpec>,
     input_line: Entity<InputLine>,
     gradient: Arc<RenderImage>,
     wave_phase: f32,
@@ -201,7 +208,11 @@ impl SharedEntitySource<TextSpec> for InputLine {
 }
 
 impl PanelView {
-    fn new(counter: Remote<CounterSpec>, cx: &mut Context<Self>) -> Self {
+    fn new(
+        counter: Remote<CounterSpec>,
+        workspace: Remote<WorkspaceSpec>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         cx.observe(counter.replica(), |_, _, cx| cx.notify())
             .detach();
         // Drives the wave at ~30fps through the guest's timer path: each await arms a
@@ -279,6 +290,7 @@ impl PanelView {
 
         Self {
             counter,
+            workspace,
             input_line,
             gradient: Arc::new(RenderImage::new(vec![image::Frame::new(gradient_bitmap(
                 48, 48,
@@ -360,6 +372,34 @@ impl Render for PanelView {
                     ),
             )
             .child(self.input_line.clone())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(rgb(0x9aa3af))
+                            .child("drive the host:"),
+                    )
+                    .child(panel_button("toast-host", "Toast the host", {
+                        let workspace = self.workspace.clone();
+                        move |cx| {
+                            let receipt = workspace
+                                .show_toast("hello from inside the sandbox 👋".to_string(), cx);
+                            log_reply(receipt, cx);
+                        }
+                    }))
+                    .child(panel_button("tint-host", "Tint host to wave color", {
+                        let workspace = self.workspace.clone();
+                        let hue = self.wave_hue;
+                        move |cx| {
+                            let receipt = workspace.set_accent(hue, cx);
+                            log_reply(receipt, cx);
+                        }
+                    })),
+            )
             .child(wave_canvas(self.wave_phase, self.wave_hue))
             .child(
                 div()
@@ -399,6 +439,33 @@ fn wave_canvas(phase: f32, hue: f32) -> impl IntoElement {
     )
     .w_full()
     .h(px(28.))
+}
+
+/// A wasm-side button that invokes a host capability when clicked.
+fn panel_button(
+    id: &'static str,
+    label: &'static str,
+    on_click: impl Fn(&mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .px(px(8.))
+        .py(px(4.))
+        .rounded(px(6.))
+        .bg(rgb(0x3a3f45))
+        .hover(|style| style.bg(rgb(0x4a5058)))
+        .text_size(px(12.))
+        .child(label)
+        .on_mouse_down(MouseButton::Left, move |_, _, cx| on_click(cx))
+}
+
+/// Await a call receipt in the background and log the host's reply.
+fn log_reply(receipt: gpui_plugin::shared::CallReceipt<String>, cx: &mut App) {
+    cx.spawn(async move |_| match receipt.await {
+        Ok(reply) => eprintln!("[example_plugin] host replied: {reply}"),
+        Err(error) => eprintln!("[example_plugin] host call failed: {error:#}"),
+    })
+    .detach();
 }
 
 /// A deliberately minimal editable line: enough of `EntityInputHandler` to receive text

@@ -3,9 +3,9 @@
 
 use gpui::{
     App, Bounds, BoxShadow, ContentMask, Context, Corners, Edges, FocusHandle, IntoElement,
-    KeyDownEvent, KeyUpEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PaintQuad, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, Size,
-    UnderlineStyle, WeakEntity, Window, canvas, div, point, prelude::*, px,
+    KeyDownEvent, KeyUpEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    PaintQuad, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, Size, UnderlineStyle,
+    WeakEntity, Window, canvas, div, point, prelude::*, px,
 };
 
 use crate::bindings;
@@ -158,19 +158,40 @@ impl Render for PluginViewState {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseUpEvent, _window, cx| {
-                    this.emit_button(false, event.button, event.position, event.modifiers, event.click_count, cx);
+                    this.emit_button(
+                        false,
+                        event.button,
+                        event.position,
+                        event.modifiers,
+                        event.click_count,
+                        cx,
+                    );
                 }),
             )
             .on_mouse_up(
                 MouseButton::Right,
                 cx.listener(|this, event: &MouseUpEvent, _window, cx| {
-                    this.emit_button(false, event.button, event.position, event.modifiers, event.click_count, cx);
+                    this.emit_button(
+                        false,
+                        event.button,
+                        event.position,
+                        event.modifiers,
+                        event.click_count,
+                        cx,
+                    );
                 }),
             )
             .on_mouse_up(
                 MouseButton::Middle,
                 cx.listener(|this, event: &MouseUpEvent, _window, cx| {
-                    this.emit_button(false, event.button, event.position, event.modifiers, event.click_count, cx);
+                    this.emit_button(
+                        false,
+                        event.button,
+                        event.position,
+                        event.modifiers,
+                        event.click_count,
+                        cx,
+                    );
                 }),
             )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
@@ -214,7 +235,10 @@ impl Render for PluginViewState {
                         });
                         bounds
                     },
-                    move |bounds: Bounds<Pixels>, _: Bounds<Pixels>, window: &mut Window, cx: &mut App| {
+                    move |bounds: Bounds<Pixels>,
+                          _: Bounds<Pixels>,
+                          window: &mut Window,
+                          cx: &mut App| {
                         let view = paint_entity.read(cx);
                         if let Some(list) = view.display_list.as_ref() {
                             let images = view.images.borrow();

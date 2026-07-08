@@ -73,7 +73,12 @@ fn expand(
                 }
             }
             ("snapshot", expr) => snapshot = Some((*expr).clone()),
-            _ => return Err(syn::Error::new(arg.span(), "expected `spec = Ident`, `type_name = \"...\"`, or `snapshot = Type`")),
+            _ => {
+                return Err(syn::Error::new(
+                    arg.span(),
+                    "expected `spec = Ident`, `type_name = \"...\"`, or `snapshot = Type`",
+                ));
+            }
         }
     }
     let spec = spec.ok_or_else(|| syn::Error::new(args.span(), "missing `spec = Ident`"))?;
@@ -147,9 +152,7 @@ fn expand(
     }
 
     // The trait is the home-side handler surface; its methods use Context<Self>.
-    item_trait
-        .supertraits
-        .push(syn::parse_quote!('static));
+    item_trait.supertraits.push(syn::parse_quote!('static));
     item_trait.supertraits.push(syn::parse_quote!(Sized));
 
     let caller_ident = format_ident!("{trait_ident}Caller");
@@ -173,7 +176,14 @@ fn expand(
     });
 
     let caller_methods = methods.iter().map(|method| {
-        let Method { ident, message_ident, field_names, field_types, response, .. } = method;
+        let Method {
+            ident,
+            message_ident,
+            field_names,
+            field_types,
+            response,
+            ..
+        } = method;
         quote! {
             fn #ident(
                 &self,
@@ -186,7 +196,13 @@ fn expand(
     });
 
     let registrations = methods.iter().map(|method| {
-        let Method { ident, message_ident, method_name, field_names, .. } = method;
+        let Method {
+            ident,
+            message_ident,
+            method_name,
+            field_names,
+            ..
+        } = method;
         quote! {
             methods.on_raw(#method_name, |entity, _method, payload, cx| {
                 let message: #message_ident = gpui_embedded_shared::decode(payload)?;

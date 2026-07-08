@@ -86,14 +86,16 @@ where
     /// Install the forwarding handler: a wildcard that pipes every method through to the
     /// wrapped capability, byte-for-byte, resolving when the real response comes back.
     pub fn register(methods: &mut Methods<S, Self>) {
-        methods.on_raw_async(WILDCARD_METHOD, |entity, method, payload, cx| {
-            match entity.read(cx).target.clone() {
-                Some(target) => {
-                    let receipt = target.forward_shared(method, payload.to_vec(), cx);
-                    cx.spawn(async move |_| receipt.await)
-                }
-                None => Task::ready(Err(anyhow!("capability revoked"))),
+        methods.on_raw_async(WILDCARD_METHOD, |entity, method, payload, cx| match entity
+            .read(cx)
+            .target
+            .clone()
+        {
+            Some(target) => {
+                let receipt = target.forward_shared(method, payload.to_vec(), cx);
+                cx.spawn(async move |_| receipt.await)
             }
+            None => Task::ready(Err(anyhow!("capability revoked"))),
         });
     }
 }

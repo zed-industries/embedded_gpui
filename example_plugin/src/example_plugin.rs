@@ -5,9 +5,12 @@
 use gpui::{
     AnyView, App, AssetSource, Bounds, Context, ElementInputHandler, Entity, EntityInputHandler,
     FocusHandle, KeyDownEvent, MouseButton, PathBuilder, Pixels, RenderImage, SharedString,
-    UTF16Selection, Window, canvas, div, hsla, img, point, prelude::*, px, rgb, svg,
+    UTF16Selection, WeakEntity, Window, canvas, div, hsla, img, point, prelude::*, px, rgb, svg,
 };
-use gpui_embedded_shared::demo::{CounterSnapshot, CounterSpec, Increment, TextSnapshot, TextSpec};
+use gpui_embedded_shared::demo::{
+    CommandApi, CommandSnapshot, CommandSpec, CounterSnapshot, CounterSpec, Increment,
+    PaletteEntry, PaletteSnapshot, PaletteSpec, TextSnapshot, TextSpec, register_command_api,
+};
 use gpui_plugin::shared::{Remote, SharedEntitySource, SharedProjection};
 use gpui_plugin::{Plugin, register_plugin};
 use std::borrow::Cow;
@@ -50,9 +53,7 @@ impl Plugin for ExamplePlugin {
             0 => cx
                 .new(|cx| ButtonView::new(self.counter.clone(), cx))
                 .into(),
-            _ => cx
-                .new(|cx| PanelView::new(self.counter.clone(), cx))
-                .into(),
+            _ => cx.new(|cx| PanelView::new(self.counter.clone(), cx)).into(),
         }
     }
 
@@ -77,7 +78,8 @@ struct ButtonView {
 
 impl ButtonView {
     fn new(counter: Remote<CounterSpec>, cx: &mut Context<Self>) -> Self {
-        cx.observe(counter.replica(), |_, _, cx| cx.notify()).detach();
+        cx.observe(counter.replica(), |_, _, cx| cx.notify())
+            .detach();
         Self { counter }
     }
 }
@@ -132,7 +134,62 @@ struct PanelView {
     input_line: Entity<InputLine>,
     gradient: Arc<RenderImage>,
     wave_phase: f32,
+    wave_speed: f32,
+    wave_hue: f32,
     _animation: gpui::Task<()>,
+    /// The panel owns its command entities and the palette that publishes them; the
+    /// anonymous shares hold them alive for the host too, but ownership lives here.
+    _commands: Vec<Entity<PanelCommand>>,
+    _palette: Entity<Palette>,
+}
+
+/// A command the host can discover and invoke: an entity implementing the schema's
+/// `CommandApi` interface, shared anonymously so its ref can travel in the palette
+/// snapshot. Each invocation mutates the panel and reports what it did; the report
+/// also lands in the command's own snapshot (`detail`), which republishes to anyone
+/// projecting the command entity itself.
+type CommandAction = fn(&mut PanelView, &mut Context<PanelView>) -> String;
+
+struct PanelCommand {
+    label: String,
+    detail: String,
+    panel: WeakEntity<PanelView>,
+    action: CommandAction,
+}
+
+impl SharedEntitySource<CommandSpec> for PanelCommand {
+    fn snapshot(&self, _cx: &App) -> CommandSnapshot {
+        CommandSnapshot {
+            label: self.label.clone(),
+            detail: self.detail.clone(),
+        }
+    }
+}
+
+impl CommandApi for PanelCommand {
+    fn invoke(&mut self, cx: &mut Context<Self>) -> String {
+        let outcome = match self.panel.upgrade() {
+            Some(panel) => panel.update(cx, |panel, cx| (self.action)(panel, cx)),
+            None => "the panel is gone".to_string(),
+        };
+        self.detail = outcome.clone();
+        cx.notify();
+        outcome
+    }
+}
+
+/// The registry the host renders natively: a list of labels plus the capability to run
+/// each one. Homed in the guest under the well-known name "palette".
+struct Palette {
+    entries: Vec<PaletteEntry>,
+}
+
+impl SharedEntitySource<PaletteSpec> for Palette {
+    fn snapshot(&self, _cx: &App) -> PaletteSnapshot {
+        PaletteSnapshot {
+            commands: self.entries.clone(),
+        }
+    }
 }
 
 impl SharedEntitySource<TextSpec> for InputLine {
@@ -145,7 +202,8 @@ impl SharedEntitySource<TextSpec> for InputLine {
 
 impl PanelView {
     fn new(counter: Remote<CounterSpec>, cx: &mut Context<Self>) -> Self {
-        cx.observe(counter.replica(), |_, _, cx| cx.notify()).detach();
+        cx.observe(counter.replica(), |_, _, cx| cx.notify())
+            .detach();
         // Drives the wave at ~30fps through the guest's timer path: each await arms a
         // dispatcher timer, which asks the host for a wakeup via `request-tick`.
         let animation = cx.spawn(async move |this, cx| {
@@ -154,7 +212,7 @@ impl PanelView {
                     .timer(std::time::Duration::from_millis(33))
                     .await;
                 let still_alive = this.update(cx, |this, cx| {
-                    this.wave_phase += 0.15;
+                    this.wave_phase += this.wave_speed;
                     cx.notify();
                 });
                 if still_alive.is_err() {
@@ -165,14 +223,72 @@ impl PanelView {
         let input_line = cx.new(InputLine::new);
         // Homed HERE in the guest: the host projects this entity to mirror the typed text.
         gpui_plugin::shared::share::<TextSpec, _>(&input_line, "typed-text", |_methods| {}, cx);
+
+        // The command palette: each command is an anonymously shared entity, and the
+        // palette snapshot carries their refs. The host renders the labels as native
+        // buttons; clicking one calls straight back into these closures.
+        let command_table: [(&str, CommandAction); 4] = [
+            ("Wave: faster", |panel, cx| {
+                panel.wave_speed = (panel.wave_speed * 1.6).clamp(-1.2, 1.2);
+                cx.notify();
+                format!("wave speed is now {:.2}/tick", panel.wave_speed)
+            }),
+            ("Wave: slower", |panel, cx| {
+                panel.wave_speed /= 1.6;
+                cx.notify();
+                format!("wave speed is now {:.2}/tick", panel.wave_speed)
+            }),
+            ("Wave: reverse", |panel, cx| {
+                panel.wave_speed = -panel.wave_speed;
+                cx.notify();
+                if panel.wave_speed < 0.0 {
+                    "the wave now runs right-to-left".to_string()
+                } else {
+                    "the wave now runs left-to-right".to_string()
+                }
+            }),
+            ("Wave: recolor", |panel, cx| {
+                panel.wave_hue = (panel.wave_hue + 0.13) % 1.0;
+                cx.notify();
+                format!("wave hue is now {:.2}", panel.wave_hue)
+            }),
+        ];
+        let weak_panel = cx.weak_entity();
+        let mut commands = Vec::new();
+        let mut entries = Vec::new();
+        for (label, action) in command_table {
+            let command = cx.new(|_| PanelCommand {
+                label: label.to_string(),
+                detail: "never invoked".to_string(),
+                panel: weak_panel.clone(),
+                action,
+            });
+            let reference = gpui_plugin::shared::share_anonymous::<CommandSpec, _>(
+                &command,
+                register_command_api,
+                cx,
+            );
+            entries.push(PaletteEntry {
+                label: label.to_string(),
+                command: reference,
+            });
+            commands.push(command);
+        }
+        let palette = cx.new(|_| Palette { entries });
+        gpui_plugin::shared::share::<PaletteSpec, _>(&palette, "palette", |_methods| {}, cx);
+
         Self {
             counter,
             input_line,
-            gradient: Arc::new(RenderImage::new(vec![image::Frame::new(
-                gradient_bitmap(48, 48),
-            )])),
+            gradient: Arc::new(RenderImage::new(vec![image::Frame::new(gradient_bitmap(
+                48, 48,
+            ))])),
             wave_phase: 0.0,
+            wave_speed: 0.15,
+            wave_hue: 0.85,
             _animation: animation,
+            _commands: commands,
+            _palette: palette,
         }
     }
 }
@@ -244,7 +360,7 @@ impl Render for PanelView {
                     ),
             )
             .child(self.input_line.clone())
-            .child(wave_canvas(self.wave_phase))
+            .child(wave_canvas(self.wave_phase, self.wave_hue))
             .child(
                 div()
                     .h(px(10.))
@@ -257,7 +373,7 @@ impl Render for PanelView {
 
 /// A tessellated path, drawn with GPUI's `PathBuilder` inside the guest and animated by a
 /// guest-side timer.
-fn wave_canvas(phase: f32) -> impl IntoElement {
+fn wave_canvas(phase: f32, hue: f32) -> impl IntoElement {
     canvas(
         |_bounds, _window, _cx| (),
         move |bounds: Bounds<Pixels>, _prepaint, window: &mut Window, _cx: &mut App| {
@@ -276,7 +392,7 @@ fn wave_canvas(phase: f32) -> impl IntoElement {
                 }
             }
             match builder.build() {
-                Ok(path) => window.paint_path(path, hsla(0.85, 0.6, 0.6, 1.0)),
+                Ok(path) => window.paint_path(path, hsla(hue, 0.6, 0.6, 1.0)),
                 Err(error) => eprintln!("failed to build wave path: {error:#}"),
             }
         },

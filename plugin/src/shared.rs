@@ -296,12 +296,7 @@ impl<S: SharedSpec> SharedCaller<S> for Remote<S> {
         self.call(message)
     }
 
-    fn forward_shared(
-        &self,
-        method: &str,
-        payload: Vec<u8>,
-        _cx: &mut App,
-    ) -> RawCallReceipt {
+    fn forward_shared(&self, method: &str, payload: Vec<u8>, _cx: &mut App) -> RawCallReceipt {
         self.forward(method, payload)
     }
 }

@@ -11,7 +11,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
-use gpui::{AppContext as _, Context, Entity, Pixels, PlatformTextSystem, Size, Task, WeakEntity, px};
+use gpui::{
+    AppContext as _, Context, Entity, Pixels, PlatformTextSystem, Size, Task, WeakEntity, px,
+};
 use gpui_embedded_shared::{
     AckSender, HandlerResponse, ResponseSender, SharedMessage, SharedProjection, SharedSpec,
 };
@@ -79,12 +81,7 @@ impl<S: SharedSpec> gpui_embedded_shared::SharedCaller<S> for HostRemote<S> {
         self.call(message, cx)
     }
 
-    fn forward_shared(
-        &self,
-        method: &str,
-        payload: Vec<u8>,
-        cx: &mut gpui::App,
-    ) -> RawCallReceipt {
+    fn forward_shared(&self, method: &str, payload: Vec<u8>, cx: &mut gpui::App) -> RawCallReceipt {
         self.forward(method, payload, cx)
     }
 }
@@ -140,9 +137,7 @@ impl<S: SharedSpec> HostRemote<S> {
     /// (intersected with this ref's own table — attenuation is monotonic).
     pub fn attenuate(&self, keep: &[&str], cx: &mut gpui::App) -> CallReceipt<SharedRef<S>> {
         match gpui_embedded_shared::encode(&keep) {
-            Ok(payload) => {
-                self.call_raw(gpui_embedded_shared::ATTENUATE_METHOD, payload, cx)
-            }
+            Ok(payload) => self.call_raw(gpui_embedded_shared::ATTENUATE_METHOD, payload, cx),
             Err(error) => {
                 log::error!("gpui_embedded: failed to encode attenuation: {error:#}");
                 CallReceipt::dropped()
@@ -307,7 +302,9 @@ impl PluginImports for HostState {
     }
 
     fn font_metrics_for(&mut self, font_id: u32) -> bindings::FontMetrics {
-        let metrics = self.text_system.font_metrics(gpui::FontId(font_id as usize));
+        let metrics = self
+            .text_system
+            .font_metrics(gpui::FontId(font_id as usize));
         bindings::FontMetrics {
             units_per_em: metrics.units_per_em,
             ascent: metrics.ascent,
@@ -837,8 +834,8 @@ impl PluginHost {
             let apply_snapshot: Rc<dyn Fn(&[u8], &mut gpui::App) -> Result<()>> = {
                 let replica = replica.downgrade();
                 Rc::new(move |bytes, cx| {
-                    let snapshot: S::Snapshot = gpui_embedded_shared::decode(bytes)
-                        .context("decoding shared snapshot")?;
+                    let snapshot: S::Snapshot =
+                        gpui_embedded_shared::decode(bytes).context("decoding shared snapshot")?;
                     replica.update(cx, |projection, cx| {
                         projection.state = Some(snapshot);
                         cx.notify();
@@ -1246,11 +1243,7 @@ impl PluginHost {
         }
     }
 
-    fn apply_guest_snapshot(
-        &mut self,
-        snapshot: bindings::SharedSnapshot,
-        cx: &mut Context<Self>,
-    ) {
+    fn apply_guest_snapshot(&mut self, snapshot: bindings::SharedSnapshot, cx: &mut Context<Self>) {
         let Some(name) = self
             .shared
             .projection_names_by_id
@@ -1304,11 +1297,9 @@ impl PluginHost {
                 );
                 continue;
             }
-            let Some(buffer) = image::RgbaImage::from_raw(
-                payload.width,
-                payload.height,
-                payload.bytes.clone(),
-            ) else {
+            let Some(buffer) =
+                image::RgbaImage::from_raw(payload.width, payload.height, payload.bytes.clone())
+            else {
                 log::error!("gpui_embedded: image payload {} is malformed", payload.id);
                 continue;
             };

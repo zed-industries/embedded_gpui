@@ -16,10 +16,10 @@ extern crate self as gpui_embedded_shared;
 
 use serde::{Serialize, de::DeserializeOwned};
 
-#[doc(hidden)]
-pub use serde;
 pub use gpui;
 pub use gpui_embedded_shared_macros::shared_interface;
+#[doc(hidden)]
+pub use serde;
 
 /// Identifies a kind of shared entity: a stable wire name plus the snapshot type its home
 /// publishes to projections.
@@ -175,7 +175,12 @@ impl<S: SharedSpec, T: 'static> Methods<S, T> {
     pub fn on_raw_async(
         &mut self,
         method: impl Into<String>,
-        handler: impl Fn(&gpui::Entity<T>, &str, &[u8], &mut gpui::App) -> gpui::Task<anyhow::Result<Vec<u8>>>
+        handler: impl Fn(
+            &gpui::Entity<T>,
+            &str,
+            &[u8],
+            &mut gpui::App,
+        ) -> gpui::Task<anyhow::Result<Vec<u8>>>
         + 'static,
     ) -> &mut Self {
         let entity = self.entity.clone();
@@ -257,8 +262,7 @@ pub trait SharedCaller<S: SharedSpec>: 'static + Clone {
 
     /// Call a method by name with a pre-encoded payload, resolving with the raw response
     /// bytes. The forwarding primitive: a caretaker pipes these straight through.
-    fn forward_shared(&self, method: &str, payload: Vec<u8>, cx: &mut gpui::App)
-    -> RawCallReceipt;
+    fn forward_shared(&self, method: &str, payload: Vec<u8>, cx: &mut gpui::App) -> RawCallReceipt;
 }
 
 /// A call receipt that resolves with the raw response bytes, undecoded — the forwarding
@@ -333,12 +337,15 @@ impl<R: DeserializeOwned> std::future::Future for CallReceipt<R> {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         let this = self.get_mut();
-        std::pin::Pin::new(&mut this.receiver).poll(cx).map(|result| {
-            let outcome =
-                result.map_err(|_| anyhow::anyhow!("shared entity went away before response"))?;
-            let bytes = outcome.map_err(|error| anyhow::anyhow!("shared call failed: {error}"))?;
-            decode(&bytes)
-        })
+        std::pin::Pin::new(&mut this.receiver)
+            .poll(cx)
+            .map(|result| {
+                let outcome = result
+                    .map_err(|_| anyhow::anyhow!("shared entity went away before response"))?;
+                let bytes =
+                    outcome.map_err(|error| anyhow::anyhow!("shared call failed: {error}"))?;
+                decode(&bytes)
+            })
     }
 }
 

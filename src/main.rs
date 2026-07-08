@@ -9,8 +9,13 @@ use gpui::{
 };
 use gpui_embedded::{
     HandleShared, HostRemote, PluginHost, PluginInstance, PluginViewState, SharedEntitySource,
+    SharedRef,
 };
-use gpui_embedded_shared::demo::{CounterSnapshot, CounterSpec, Increment, TextSpec};
+use gpui_embedded_shared::demo::{
+    CommandApiCaller as _, CommandSpec, CounterSnapshot, CounterSpec, Increment, PaletteSpec,
+    TextSpec,
+};
+use std::collections::HashMap;
 
 /// The home of the shared click counter: a plain host entity. The guest's views project it
 /// and send `Increment` messages; native UI reads and mutates it directly.
@@ -65,25 +70,39 @@ fn main() {
                 let scale = window.scale_factor();
                 let counter = cx.new(|_| Counter { clicks: 0 });
                 let host = cx.new(|_| PluginHost::new(instance));
-                let (view0, view1, typed_text) = host.update(cx, |host, cx| {
+                let (view0, view1, typed_text, palette) = host.update(cx, |host, cx| {
                     host.init(cx);
-                    host.share(&counter, "clicks", |methods| {
-                        methods.on::<Increment>();
-                    }, cx);
+                    host.share(
+                        &counter,
+                        "clicks",
+                        |methods| {
+                            methods.on::<Increment>();
+                        },
+                        cx,
+                    );
                     // Homed in the GUEST: the wasm input line's text, projected natively.
                     let typed_text = host.remote::<TextSpec>("typed-text", cx);
+                    // Also guest-homed: the command palette. Labels render as native
+                    // buttons below; the refs they carry are the authority to invoke.
+                    let palette = host.remote::<PaletteSpec>("palette", cx);
                     let view0 = host.create_view(0, size(px(240.), px(100.)), scale, cx);
                     let view1 = host.create_view(1, size(px(480.), px(320.)), scale, cx);
-                    (view0, view1, typed_text)
+                    (view0, view1, typed_text, palette)
                 });
                 cx.new(|cx| {
                     cx.observe(&counter, |_, _, cx| cx.notify()).detach();
                     cx.observe(typed_text.replica(), |_, _, cx| cx.notify())
                         .detach();
+                    cx.observe(palette.replica(), |_, _, cx| cx.notify())
+                        .detach();
                     DemoView {
-                        _host: host,
+                        host,
                         counter,
                         typed_text,
+                        palette,
+                        command_remotes: HashMap::new(),
+                        command_status: None,
+                        command_task: None,
                         view0,
                         view1,
                     }
@@ -121,16 +140,57 @@ fn resolve_wasm_path() -> Option<PathBuf> {
 }
 
 struct DemoView {
-    _host: Entity<PluginHost>,
+    host: Entity<PluginHost>,
     counter: Entity<Counter>,
     typed_text: HostRemote<TextSpec>,
+    palette: HostRemote<PaletteSpec>,
+    /// Remotes materialized from palette refs, cached so repeated clicks reuse one
+    /// projection (and so auto-release doesn't fire between clicks).
+    command_remotes: HashMap<u64, HostRemote<CommandSpec>>,
+    command_status: Option<String>,
+    command_task: Option<gpui::Task<()>>,
     view0: Entity<PluginViewState>,
     view1: Entity<PluginViewState>,
+}
+
+impl DemoView {
+    /// Invoke a palette command through its capability ref: materialize (or reuse) a
+    /// remote, call the schema-generated `invoke`, and surface the plugin's reply.
+    fn run_command(&mut self, reference: SharedRef<CommandSpec>, cx: &mut Context<Self>) {
+        let command = self
+            .command_remotes
+            .entry(reference.entity_id())
+            .or_insert_with(|| {
+                self.host
+                    .update(cx, |host, cx| host.remote_from_ref(reference, cx))
+            })
+            .clone();
+        let receipt = command.invoke(cx);
+        self.command_task = Some(cx.spawn(async move |this, cx| {
+            let status = match receipt.await {
+                Ok(status) => status,
+                Err(error) => format!("command failed: {error:#}"),
+            };
+            this.update(cx, |this, cx| {
+                this.command_status = Some(status);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
 }
 
 impl Render for DemoView {
     fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
         let clicks = self.counter.read(cx).clicks;
+        let commands = self
+            .palette
+            .replica()
+            .read(cx)
+            .state
+            .as_ref()
+            .map(|snapshot| snapshot.commands.clone())
+            .unwrap_or_default();
         let typed = self
             .typed_text
             .replica()
@@ -185,15 +245,48 @@ impl Render for DemoView {
                     ),
             )
             .child(framed_slot(px(240.), px(100.), self.view0.clone()))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0x9aa3af))
+                            .child("plugin commands (native buttons):"),
+                    )
+                    .children(commands.into_iter().enumerate().map(|(index, entry)| {
+                        div()
+                            .id(("palette-command", index))
+                            .px_2()
+                            .py_1()
+                            .rounded(px(6.))
+                            .bg(rgb(0x3a3f45))
+                            .hover(|style| style.bg(rgb(0x4a5058)))
+                            .text_sm()
+                            .child(entry.label.clone())
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.run_command(entry.command, cx);
+                                }),
+                            )
+                    }))
+                    .when_some(self.command_status.clone(), |this, status| {
+                        this.child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(0x8ec07c))
+                                .child(format!("plugin replied: {status}")),
+                        )
+                    }),
+            )
             .child(framed_slot(px(480.), px(320.), self.view1.clone()))
     }
 }
 
-fn framed_slot(
-    width: Pixels,
-    height: Pixels,
-    view: Entity<PluginViewState>,
-) -> impl IntoElement {
+fn framed_slot(width: Pixels, height: Pixels, view: Entity<PluginViewState>) -> impl IntoElement {
     div()
         .w(width)
         .h(height)

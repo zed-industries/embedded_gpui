@@ -6,14 +6,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{App, AppContext as _, Context, Entity, Task, TestAppContext};
-use gpui_embedded::{
-    HandleSharedAsync, PluginHost, PluginInstance, SharedEntitySource,
-};
+use gpui_embedded::{HandleSharedAsync, PluginHost, PluginInstance, SharedEntitySource};
+use gpui_embedded_shared::encode;
 use gpui_embedded_shared::test_schema::{
     Bump, ChameleonSpec, CreateItem, FactorySpec, GatekeeperSpec, Guard, ReadSecret,
     TestCounterSpec, TestIncrement, VaultSnapshot, VaultSpec,
 };
-use gpui_embedded_shared::encode;
 use rand::prelude::*;
 
 /// Builds the test plugin once per process and returns the component path.
@@ -63,7 +61,9 @@ fn settle(cx: &mut TestAppContext) {
 #[gpui::test]
 async fn test_send_gives_read_your_writes(cx: &mut TestAppContext) {
     let host = setup(cx);
-    let counter = host.update(cx, |host, cx| host.remote::<TestCounterSpec>("guest-counter", cx));
+    let counter = host.update(cx, |host, cx| {
+        host.remote::<TestCounterSpec>("guest-counter", cx)
+    });
 
     let receipt = cx.update(|cx| counter.send(TestIncrement { by: 3 }, cx));
     settle(cx);
@@ -79,7 +79,9 @@ async fn test_send_gives_read_your_writes(cx: &mut TestAppContext) {
 #[gpui::test]
 async fn test_call_returns_response_after_snapshot(cx: &mut TestAppContext) {
     let host = setup(cx);
-    let counter = host.update(cx, |host, cx| host.remote::<TestCounterSpec>("guest-counter", cx));
+    let counter = host.update(cx, |host, cx| {
+        host.remote::<TestCounterSpec>("guest-counter", cx)
+    });
 
     let first = cx.update(|cx| counter.call(TestIncrement { by: 2 }, cx));
     let second = cx.update(|cx| counter.call(TestIncrement { by: 5 }, cx));
@@ -198,7 +200,9 @@ async fn test_caretaker_membrane_forwards_and_revokes(cx: &mut TestAppContext) {
 
     // Hand the vault capability to the guest's gatekeeper; it wraps it in a caretaker
     // and returns a ref to *that*. The caller can't tell the difference.
-    let gatekeeper = host.update(cx, |host, cx| host.remote::<GatekeeperSpec>("gatekeeper", cx));
+    let gatekeeper = host.update(cx, |host, cx| {
+        host.remote::<GatekeeperSpec>("gatekeeper", cx)
+    });
     let guarded = cx.update(|cx| gatekeeper.call(Guard { vault: vault_ref }, cx));
     settle(cx);
     let guarded_ref = guarded.await.expect("guard should respond with a ref");
@@ -206,10 +210,14 @@ async fn test_caretaker_membrane_forwards_and_revokes(cx: &mut TestAppContext) {
 
     let guarded = host.update(cx, |host, cx| host.remote_from_ref(guarded_ref, cx));
     settle(cx);
-    let label = guarded
-        .replica()
-        .read_with(cx, |replica, _| replica.state.as_ref().map(|s| s.label.clone()));
-    assert_eq!(label.as_deref(), Some("prod"), "snapshots pass through the membrane");
+    let label = guarded.replica().read_with(cx, |replica, _| {
+        replica.state.as_ref().map(|s| s.label.clone())
+    });
+    assert_eq!(
+        label.as_deref(),
+        Some("prod"),
+        "snapshots pass through the membrane"
+    );
 
     // A read crosses the boundary four times: host -> caretaker (guest) -> vault (host),
     // resolves in the vault's async handler, and unwinds back through the caretaker.
@@ -219,9 +227,8 @@ async fn test_caretaker_membrane_forwards_and_revokes(cx: &mut TestAppContext) {
 
     // Revocation: the caretaker drops the wrapped capability. Its auto-release cascades
     // to the vault's home, which drops its strong handle.
-    let revoked = cx.update(|cx| {
-        guarded.call_raw::<()>("revoke", encode(&()).expect("encode unit"), cx)
-    });
+    let revoked =
+        cx.update(|cx| guarded.call_raw::<()>("revoke", encode(&()).expect("encode unit"), cx));
     settle(cx);
     revoked.await.expect("revoke");
 
@@ -233,9 +240,9 @@ async fn test_caretaker_membrane_forwards_and_revokes(cx: &mut TestAppContext) {
         "unexpected error: {error:#}"
     );
     // Revocable freezes the last observed snapshot for remaining subscribers.
-    let label = guarded
-        .replica()
-        .read_with(cx, |replica, _| replica.state.as_ref().map(|s| s.label.clone()));
+    let label = guarded.replica().read_with(cx, |replica, _| {
+        replica.state.as_ref().map(|s| s.label.clone())
+    });
     assert_eq!(label.as_deref(), Some("prod"));
 
     // With the caretaker's handle released and ours dropped, nothing keeps the vault
@@ -327,9 +334,9 @@ async fn test_attenuation_composes_from_held_refs(cx: &mut TestAppContext) {
     settle(cx);
 
     // The facet reads the same state...
-    let label = readonly
-        .replica()
-        .read_with(cx, |replica, _| replica.state.as_ref().map(|s| s.label.clone()));
+    let label = readonly.replica().read_with(cx, |replica, _| {
+        replica.state.as_ref().map(|s| s.label.clone())
+    });
     assert_eq!(label.as_deref(), Some("gamma"));
 
     // ...but rejects writes...
@@ -344,7 +351,11 @@ async fn test_attenuation_composes_from_held_refs(cx: &mut TestAppContext) {
     let facet_view = readonly
         .replica()
         .read_with(cx, |replica, _| replica.state.as_ref().map(|s| s.bumps));
-    assert_eq!(facet_view, Some(1), "facet replicas follow the shared state");
+    assert_eq!(
+        facet_view,
+        Some(1),
+        "facet replicas follow the shared state"
+    );
 }
 
 #[gpui::test]
@@ -353,28 +364,22 @@ async fn test_chameleon_handles_methods_dynamically(cx: &mut TestAppContext) {
     let chameleon = host.update(cx, |host, cx| host.remote::<ChameleonSpec>("chameleon", cx));
 
     // Default mode echoes.
-    let poke = cx.update(|cx| {
-        chameleon.call_raw::<String>("poke", encode(&"hello").unwrap(), cx)
-    });
+    let poke = cx.update(|cx| chameleon.call_raw::<String>("poke", encode(&"hello").unwrap(), cx));
     settle(cx);
     assert_eq!(poke.await.expect("poke"), "hello");
 
     // The entity reinterprets its own dispatch at runtime.
-    let become_shout =
-        cx.update(|cx| chameleon.send_raw("become", encode(&"shout").unwrap(), cx));
+    let become_shout = cx.update(|cx| chameleon.send_raw("become", encode(&"shout").unwrap(), cx));
     settle(cx);
     become_shout.await.expect("become");
 
-    let poke = cx.update(|cx| {
-        chameleon.call_raw::<String>("poke", encode(&"hello").unwrap(), cx)
-    });
+    let poke = cx.update(|cx| chameleon.call_raw::<String>("poke", encode(&"hello").unwrap(), cx));
     settle(cx);
     assert_eq!(poke.await.expect("poke"), "HELLO");
 
     // Unknown methods surface the entity's own error, not a protocol failure.
-    let nonsense = cx.update(|cx| {
-        chameleon.call_raw::<String>("transmogrify", encode(&"x").unwrap(), cx)
-    });
+    let nonsense =
+        cx.update(|cx| chameleon.call_raw::<String>("transmogrify", encode(&"x").unwrap(), cx));
     settle(cx);
     let error = nonsense.await.expect_err("must be rejected");
     assert!(error.to_string().contains("does not understand"));
@@ -391,7 +396,9 @@ async fn test_chameleon_handles_methods_dynamically(cx: &mut TestAppContext) {
 #[gpui::test(iterations = 10)]
 async fn test_random_interleavings_stay_consistent(cx: &mut TestAppContext, mut rng: StdRng) {
     let host = setup(cx);
-    let counter = host.update(cx, |host, cx| host.remote::<TestCounterSpec>("guest-counter", cx));
+    let counter = host.update(cx, |host, cx| {
+        host.remote::<TestCounterSpec>("guest-counter", cx)
+    });
 
     let mut expected_total = 0u32;
     let mut pending_calls = Vec::new();
@@ -423,10 +430,13 @@ async fn test_random_interleavings_stay_consistent(cx: &mut TestAppContext, mut 
     for (receipt, prefix_sum) in pending_sends {
         receipt.await.expect("send");
         // At ack time the replica must reflect at least this write.
-        let observed = counter
-            .replica()
-            .read_with(cx, |replica, _| replica.state.as_ref().map_or(0, |s| s.count));
-        assert!(observed >= prefix_sum, "replica {observed} < acked write {prefix_sum}");
+        let observed = counter.replica().read_with(cx, |replica, _| {
+            replica.state.as_ref().map_or(0, |s| s.count)
+        });
+        assert!(
+            observed >= prefix_sum,
+            "replica {observed} < acked write {prefix_sum}"
+        );
     }
 
     let final_count = counter

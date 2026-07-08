@@ -111,3 +111,184 @@ where
             .unwrap_or_else(|| self.fallback.clone())
     }
 }
+
+/// An allowlist forwarder: the userland form of attenuation. Wrap a capability you
+/// hold, list the methods that may pass, share the wrapper, and hand out *its* ref.
+/// Everything else is rejected without ever reaching the wrapped entity — monotonic by
+/// construction, since a wrapper can only forward what it can itself call, and no
+/// cooperation from the entity's author is required.
+///
+/// ```ignore
+/// let readonly = Attenuated::new(item_remote, &[], placeholder_snapshot, cx);
+/// let readonly_ref = share_anonymous::<ItemSpec, _>(&readonly, Attenuated::register, cx);
+/// ```
+pub struct Attenuated<S: SharedSpec, C: SharedCaller<S>> {
+    target: C,
+    allowed: Vec<String>,
+    /// Served while the target replica is empty.
+    fallback: S::Snapshot,
+    _observation: Subscription,
+}
+
+impl<S, C> Attenuated<S, C>
+where
+    S: SharedSpec,
+    S::Snapshot: Clone,
+    C: SharedCaller<S>,
+{
+    /// Wrap `target`, permitting only the listed methods through.
+    pub fn new(
+        target: C,
+        allowed: &[&str],
+        placeholder: S::Snapshot,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        let allowed = allowed.iter().map(|method| method.to_string()).collect();
+        cx.new(|cx| {
+            let observation = cx.observe(target.shared_replica(), |_, _, cx| cx.notify());
+            Self {
+                target,
+                allowed,
+                fallback: placeholder,
+                _observation: observation,
+            }
+        })
+    }
+
+    /// Install the filtering forwarder: allowed methods pipe through byte-for-byte,
+    /// everything else fails without touching the wrapped capability.
+    pub fn register(methods: &mut Methods<S, Self>) {
+        methods.on_raw_async(WILDCARD_METHOD, |entity, method, payload, cx| {
+            let target = entity
+                .read(cx)
+                .allowed
+                .iter()
+                .any(|allowed| allowed == method);
+            if !target {
+                return Task::ready(Err(anyhow!(
+                    "method {method:?} is not permitted by this capability"
+                )));
+            }
+            let target = entity.read(cx).target.clone();
+            let receipt = target.forward_shared(method, payload.to_vec(), cx);
+            cx.spawn(async move |_| receipt.await)
+        });
+    }
+}
+
+impl<S, C> SharedEntitySource<S> for Attenuated<S, C>
+where
+    S: SharedSpec,
+    S::Snapshot: Clone,
+    C: SharedCaller<S>,
+{
+    fn snapshot(&self, cx: &App) -> S::Snapshot {
+        self.target
+            .shared_replica()
+            .read(cx)
+            .state
+            .clone()
+            .unwrap_or_else(|| self.fallback.clone())
+    }
+}
+
+/// One forwarded call, as remembered by an [`Audited`] wrapper.
+#[derive(Clone, Debug)]
+pub struct AuditRecord {
+    pub method: String,
+    pub payload_len: usize,
+    /// `None` while the forwarded call is still in flight.
+    pub completed: Option<bool>,
+}
+
+/// An accounting forwarder: forwards every method like a transparent caretaker, but
+/// remembers each call — method name, payload size, and eventually whether it
+/// succeeded — and logs it. Observe the entity (`cx.observe`) to react to new records;
+/// read [`Audited::records`] to inspect them.
+///
+/// Reading the ledger is itself an authority: it stays with whoever holds this entity.
+/// Exposing it over the wire (or to a UI) is an explicit choice, exactly like
+/// revocation on [`Revocable`].
+pub struct Audited<S: SharedSpec, C: SharedCaller<S>> {
+    target: C,
+    records: Vec<AuditRecord>,
+    /// Served while the target replica is empty.
+    fallback: S::Snapshot,
+    _observation: Subscription,
+}
+
+impl<S, C> Audited<S, C>
+where
+    S: SharedSpec,
+    S::Snapshot: Clone,
+    C: SharedCaller<S>,
+{
+    /// Wrap `target`; every call forwarded through the wrapper is recorded.
+    pub fn new(target: C, placeholder: S::Snapshot, cx: &mut App) -> Entity<Self> {
+        cx.new(|cx| {
+            let observation = cx.observe(target.shared_replica(), |_, _, cx| cx.notify());
+            Self {
+                target,
+                records: Vec::new(),
+                fallback: placeholder,
+                _observation: observation,
+            }
+        })
+    }
+
+    /// The calls forwarded so far, oldest first.
+    pub fn records(&self) -> &[AuditRecord] {
+        &self.records
+    }
+
+    /// Install the recording forwarder.
+    pub fn register(methods: &mut Methods<S, Self>) {
+        methods.on_raw_async(WILDCARD_METHOD, |entity, method, payload, cx| {
+            let index = entity.update(cx, |audited, cx| {
+                log::info!(
+                    "audited capability: {:?} called with {} bytes",
+                    method,
+                    payload.len()
+                );
+                audited.records.push(AuditRecord {
+                    method: method.to_string(),
+                    payload_len: payload.len(),
+                    completed: None,
+                });
+                cx.notify();
+                audited.records.len() - 1
+            });
+            let target = entity.read(cx).target.clone();
+            let receipt = target.forward_shared(method, payload.to_vec(), cx);
+            let entity = entity.downgrade();
+            cx.spawn(async move |cx| {
+                let outcome = receipt.await;
+                entity
+                    .update(cx, |audited, cx| {
+                        if let Some(record) = audited.records.get_mut(index) {
+                            record.completed = Some(outcome.is_ok());
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                outcome
+            })
+        });
+    }
+}
+
+impl<S, C> SharedEntitySource<S> for Audited<S, C>
+where
+    S: SharedSpec,
+    S::Snapshot: Clone,
+    C: SharedCaller<S>,
+{
+    fn snapshot(&self, cx: &App) -> S::Snapshot {
+        self.target
+            .shared_replica()
+            .read(cx)
+            .state
+            .clone()
+            .unwrap_or_else(|| self.fallback.clone())
+    }
+}

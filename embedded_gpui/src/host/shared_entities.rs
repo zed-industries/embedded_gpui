@@ -7,8 +7,8 @@ use std::rc::Rc;
 
 use anyhow::{Context as _, Result, anyhow};
 use embedded_gpui::{
-    ATTENUATE_METHOD, AckSender, HandlerResponse, MethodHandler, Methods, RELEASE_METHOD,
-    ResponseSender, SUBSCRIBE_METHOD, SharedSpec, decode, encode,
+    AckSender, HandlerResponse, MethodHandler, Methods, RELEASE_METHOD, ResponseSender,
+    SUBSCRIBE_METHOD, SharedSpec, encode,
 };
 use gpui::{AnyEntity, App, Subscription};
 
@@ -28,9 +28,7 @@ pub(crate) struct HostSharedEntity {
     pub subscribed: bool,
     /// Anonymous shares keep their entity alive until released; named shares borrow.
     strong: Option<AnyEntity>,
-    /// Attenuated capabilities derived from this one; published in fan-out on notify.
-    pub facets: Vec<u64>,
-    _observation: Option<Subscription>,
+    _observation: Subscription,
 }
 
 impl HostSharedEntity {
@@ -52,8 +50,7 @@ impl HostSharedEntity {
             published_ack: 0,
             subscribed,
             strong,
-            facets: Vec::new(),
-            _observation: Some(observation),
+            _observation: observation,
         }
     }
 }
@@ -190,33 +187,6 @@ impl HostShared {
                 home.subscribed = false;
                 home.strong = None;
                 return Ok(HandlerResponse::Ready(encode(&())));
-            }
-            ATTENUATE_METHOD => {
-                let keep: Vec<String> = decode(payload)?;
-                let methods = home
-                    .methods
-                    .iter()
-                    .filter(|(name, _)| keep.iter().any(|kept| kept == *name))
-                    .map(|(name, handler)| (name.clone(), handler.clone()))
-                    .collect();
-                let facet = HostSharedEntity {
-                    name: format!("{}#facet", home.name),
-                    type_name: home.type_name,
-                    methods,
-                    snapshot_fn: home.snapshot_fn.clone(),
-                    applied_sequence: 0,
-                    published_ack: 0,
-                    subscribed: false,
-                    strong: home.strong.clone(),
-                    facets: Vec::new(),
-                    _observation: None,
-                };
-                let facet_id = self.insert_placeholder();
-                self.homes.insert(facet_id, facet);
-                if let Some(home) = self.homes.get_mut(&entity_id) {
-                    home.facets.push(facet_id);
-                }
-                return Ok(HandlerResponse::Ready(encode(&facet_id)));
             }
             _ => {}
         }

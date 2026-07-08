@@ -6,11 +6,11 @@ use embedded_gpui::shared::{HandleShared, SharedEntitySource, SharedRef};
 use embedded_gpui::{Plugin, register_plugin};
 use embedded_gpui::{decode, encode};
 use embedded_gpui_util::Revocable;
-use gpui::{AnyView, App, Context, Entity, Window, div, prelude::*};
+use gpui::{AnyView, App, Context, Entity, Task, Window, div, prelude::*};
 use test_schema::{
     Bump, ChameleonSnapshot, ChameleonSpec, CreateItem, FactorySnapshot, FactorySpec,
-    GatekeeperSnapshot, GatekeeperSpec, Guard, ItemSnapshot, ItemSpec, TestCounterSnapshot,
-    TestCounterSpec, TestIncrement, VaultSnapshot, VaultSpec,
+    GatekeeperSnapshot, GatekeeperSpec, Guard, ItemSnapshot, ItemSpec, ProbeRequest,
+    TestCounterSnapshot, TestCounterSpec, TestIncrement, VaultSnapshot, VaultSpec,
 };
 
 /// Named shares borrow their entities (the sharer owns the lifetime), so the plugin must
@@ -50,6 +50,22 @@ impl Plugin for TestGuest {
             "gatekeeper",
             |methods| {
                 methods.on::<Guard>();
+                // A raw prober: call any method on any item capability the host hands
+                // us, so tests can check what an attenuated ref permits from this side.
+                methods.on_raw_async("probe", |_, _method, payload, cx| {
+                    let request: ProbeRequest = match decode(payload) {
+                        Ok(request) => request,
+                        Err(error) => return Task::ready(Err(error)),
+                    };
+                    let remote =
+                        embedded_gpui::shared::remote_from_ref::<ItemSpec>(request.target, cx);
+                    let receipt = remote.forward(&request.method, request.payload);
+                    cx.spawn(async move |_| {
+                        let outcome = receipt.await;
+                        drop(remote);
+                        outcome
+                    })
+                });
             },
             cx,
         );

@@ -5,8 +5,8 @@
 use crate::wit;
 use anyhow::{Context as _, Result, anyhow};
 use embedded_gpui::{
-    ATTENUATE_METHOD, AckSender, HandlerResponse, MethodHandler, RELEASE_METHOD, ResponseSender,
-    SUBSCRIBE_METHOD, SharedMessage, SharedSpec, decode, encode,
+    AckSender, HandlerResponse, MethodHandler, RELEASE_METHOD, ResponseSender, SUBSCRIBE_METHOD,
+    SharedMessage, SharedSpec, decode, encode,
 };
 use gpui::{AnyEntity, App, AppContext as _, AsyncApp, Entity};
 use std::cell::RefCell;
@@ -18,9 +18,7 @@ pub use embedded_gpui::{
     SharedCaller, SharedEntitySource, SharedProjection, SharedRef,
 };
 
-/// Guest-homed entity ids have the high bit set so they can never collide with host-minted
-/// ids.
-const GUEST_HOME_BIT: u64 = 1 << 63;
+use crate::GUEST_HOME_BIT;
 
 type ApplySnapshot = Rc<dyn Fn(&[u8], &mut AsyncApp) -> Result<()>>;
 type SnapshotFn = Rc<dyn Fn(&App) -> Result<Vec<u8>>>;
@@ -76,8 +74,6 @@ struct HomeEntry {
     subscribed: bool,
     /// Anonymous shares keep their entity alive until released; named shares borrow.
     strong: Option<AnyEntity>,
-    /// Attenuated capabilities derived from this one; published in fan-out on notify.
-    facets: Vec<u64>,
 }
 
 #[derive(Default)]
@@ -237,19 +233,6 @@ impl<S: SharedSpec> Remote<S> {
                     M::METHOD
                 );
                 SendReceipt::dropped()
-            }
-        }
-    }
-
-    /// Derive a weaker capability to the same entity, keeping only the listed methods
-    /// (intersected with this ref's own table — attenuation is monotonic). OCAP-style:
-    /// callable on any ref you hold, no cooperation from the entity's author needed.
-    pub fn attenuate(&self, keep: &[&str]) -> CallReceipt<SharedRef<S>> {
-        match encode(&keep) {
-            Ok(payload) => call_raw(&self.name, ATTENUATE_METHOD, payload),
-            Err(error) => {
-                log::error!("embedded_gpui: failed to encode attenuation: {error:#}");
-                CallReceipt::dropped()
             }
         }
     }
@@ -479,7 +462,6 @@ fn insert_home(
                 published_ack: 0,
                 subscribed,
                 strong,
-                facets: Vec::new(),
             },
         );
         entity_id
@@ -487,20 +469,14 @@ fn insert_home(
 }
 
 fn publish_home(entity_id: u64, cx: &mut App) {
-    let (publish, facets) = REGISTRY.with(|registry| {
+    let publish = REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
-        let Some(home) = registry.homes.get_mut(&entity_id) else {
-            return (None, Vec::new());
-        };
-        let facets = home.facets.clone();
+        let home = registry.homes.get_mut(&entity_id)?;
         if !home.subscribed {
-            return (None, facets);
+            return None;
         }
         home.published_ack = home.applied_sequence;
-        (
-            Some((home.snapshot_fn.clone(), home.applied_sequence)),
-            facets,
-        )
+        Some((home.snapshot_fn.clone(), home.applied_sequence))
     });
     if let Some((snapshot_fn, acked_sequence)) = publish {
         match snapshot_fn(cx) {
@@ -511,10 +487,6 @@ fn publish_home(entity_id: u64, cx: &mut App) {
             }),
             Err(error) => log::error!("embedded_gpui: failed to snapshot shared entity: {error:#}"),
         }
-    }
-    // Attenuated facets alias the same entity state, so a change fans out to all of them.
-    for facet in facets {
-        publish_home(facet, cx);
     }
 }
 
@@ -615,7 +587,6 @@ pub(crate) fn message_delivered(message: wit::SharedMessage, cx: &mut AsyncApp) 
     enum Dispatch {
         Handler(MethodHandler),
         Control,
-        ControlResponse(Vec<u8>),
         Failed(String),
         Unknown,
     }
@@ -634,43 +605,6 @@ pub(crate) fn message_delivered(message: wit::SharedMessage, cx: &mut AsyncApp) 
                 home.subscribed = false;
                 home.strong = None;
                 Dispatch::Control
-            }
-            ATTENUATE_METHOD => {
-                let keep: Vec<String> = match decode(&message.payload) {
-                    Ok(keep) => keep,
-                    Err(error) => return Dispatch::Failed(format!("{error:#}")),
-                };
-                let methods = home
-                    .methods
-                    .iter()
-                    .filter(|(name, _)| keep.iter().any(|kept| kept == *name))
-                    .map(|(name, handler)| (name.clone(), handler.clone()))
-                    .collect();
-                let snapshot_fn = home.snapshot_fn.clone();
-                let strong = home.strong.clone();
-                let facet_id = {
-                    registry.next_home_id += 1;
-                    GUEST_HOME_BIT | registry.next_home_id
-                };
-                registry.homes.insert(
-                    facet_id,
-                    HomeEntry {
-                        methods,
-                        snapshot_fn,
-                        applied_sequence: 0,
-                        published_ack: 0,
-                        subscribed: false,
-                        strong,
-                        facets: Vec::new(),
-                    },
-                );
-                if let Some(home) = registry.homes.get_mut(&message.entity_id) {
-                    home.facets.push(facet_id);
-                }
-                match encode(&facet_id) {
-                    Ok(bytes) => Dispatch::ControlResponse(bytes),
-                    Err(error) => Dispatch::Failed(format!("{error:#}")),
-                }
             }
             _ => home
                 .methods
@@ -704,7 +638,6 @@ pub(crate) fn message_delivered(message: wit::SharedMessage, cx: &mut AsyncApp) 
             }
         }
         Dispatch::Control => encode(&()).map_err(|error| format!("{error:#}")),
-        Dispatch::ControlResponse(bytes) => Ok(bytes),
         Dispatch::Failed(error) => Err(error),
         Dispatch::Unknown => Err(format!(
             "no handler for shared method {:?} on entity {}",

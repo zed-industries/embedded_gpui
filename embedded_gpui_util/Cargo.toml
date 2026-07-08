@@ -16,3 +16,4 @@ path = "src/embedded_gpui_util.rs"
 anyhow = "1.0"
 embedded_gpui = { path = "../embedded_gpui" }
 gpui = { git = "https://github.com/zed-industries/zed.git", branch = "gpui-embedded-in-gpui", default-features = false }
+log = "0.4"

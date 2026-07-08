@@ -42,3 +42,14 @@ embedded_gpui::shared_schema! {
         snapshot ChameleonSnapshot { mode: String, pokes: u32 }
     }
 }
+
+/// Payload for the gatekeeper's raw "probe" method: exercise an arbitrary method on an
+/// arbitrary item capability from the guest side, so tests can verify what a ref does
+/// and does not permit from across the boundary.
+#[derive(Clone, Debug, embedded_gpui::serde::Serialize, embedded_gpui::serde::Deserialize)]
+#[serde(crate = "embedded_gpui::serde")]
+pub struct ProbeRequest {
+    pub target: embedded_gpui::SharedRef<ItemSpec>,
+    pub method: String,
+    pub payload: Vec<u8>,
+}

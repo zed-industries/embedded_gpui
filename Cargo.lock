@@ -1832,6 +1832,7 @@ dependencies = [
  "anyhow",
  "embedded_gpui",
  "gpui",
+ "log",
 ]
 
 [[package]]
@@ -5938,6 +5939,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "embedded_gpui",
+ "embedded_gpui_util",
  "gpui",
  "rand 0.9.4",
  "test_schema",

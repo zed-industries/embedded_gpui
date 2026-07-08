@@ -6,12 +6,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use embedded_gpui::encode;
-use embedded_gpui::{HandleSharedAsync, PluginHost, PluginInstance, SharedEntitySource};
+use embedded_gpui::{HandleSharedAsync, PluginHost, PluginInstance, SharedEntitySource, decode};
+use embedded_gpui_util::{Attenuated, Audited};
 use gpui::{App, AppContext as _, Context, Entity, Task, TestAppContext};
 use rand::prelude::*;
 use test_schema::{
-    Bump, ChameleonSpec, CreateItem, FactorySpec, GatekeeperSpec, Guard, ReadSecret,
-    TestCounterSpec, TestIncrement, VaultSnapshot, VaultSpec,
+    Bump, ChameleonSpec, CreateItem, FactorySpec, GatekeeperSpec, Guard, ItemSnapshot, ItemSpec,
+    ProbeRequest, ReadSecret, TestCounterSpec, TestIncrement, VaultSnapshot, VaultSpec,
 };
 
 /// Builds the test plugin once per process and returns the component path.
@@ -305,11 +306,11 @@ async fn test_dropping_last_remote_releases_the_capability(cx: &mut TestAppConte
 }
 
 #[gpui::test]
-async fn test_attenuation_composes_from_held_refs(cx: &mut TestAppContext) {
+async fn test_attenuation_is_a_library_pattern(cx: &mut TestAppContext) {
     let host = setup(cx);
     let factory = host.update(cx, |host, cx| host.remote::<FactorySpec>("factory", cx));
 
-    // Start from a FULL capability...
+    // Start from a FULL capability to a guest-homed item...
     let created = cx.update(|cx| {
         factory.call(
             CreateItem {
@@ -323,39 +324,139 @@ async fn test_attenuation_composes_from_held_refs(cx: &mut TestAppContext) {
     let full = host.update(cx, |host, cx| host.remote_from_ref(full_ref, cx));
     settle(cx);
 
-    // ...and derive a weaker one from it, OCAP-style: no factory method involved, just the
-    // generic $attenuate control on a ref the holder already possesses.
-    let attenuated = cx.update(|cx| full.attenuate(&[], cx));
-    settle(cx);
-    let readonly_ref = attenuated.await.expect("attenuate");
+    // ...and derive a weaker one in pure userland: wrap the remote in an Attenuated
+    // with an empty allowlist, share the wrapper, and hand out ITS ref. No core
+    // protocol support involved, and no cooperation from the item's author.
+    let placeholder = ItemSnapshot {
+        label: "pending".to_string(),
+        bumps: 0,
+    };
+    let readonly = cx.update(|cx| Attenuated::new(full.clone(), &[], placeholder, cx));
+    let readonly_ref = host.update(cx, |host, cx| {
+        host.share_anonymous::<ItemSpec, _>(&readonly, Attenuated::register, cx)
+    });
     assert_ne!(readonly_ref.entity_id(), full_ref.entity_id());
 
-    let readonly = host.update(cx, |host, cx| host.remote_from_ref(readonly_ref, cx));
-    settle(cx);
-
-    // The facet reads the same state...
-    let label = readonly.replica().read_with(cx, |replica, _| {
-        replica.state.as_ref().map(|s| s.label.clone())
+    // The guest probes a write through the attenuated ref: rejected by the wrapper,
+    // without the item ever hearing about it.
+    let gatekeeper = host.update(cx, |host, cx| {
+        host.remote::<GatekeeperSpec>("gatekeeper", cx)
     });
-    assert_eq!(label.as_deref(), Some("gamma"));
-
-    // ...but rejects writes...
-    let bump = cx.update(|cx| readonly.call(Bump {}, cx));
+    let probe = ProbeRequest {
+        target: readonly_ref,
+        method: "bump".to_string(),
+        payload: encode(&Bump {}).expect("encode bump"),
+    };
+    let denied =
+        cx.update(|cx| gatekeeper.forward("probe", encode(&probe).expect("encode probe"), cx));
     settle(cx);
-    bump.await.expect_err("attenuated ref must reject writes");
+    let error = denied.await.expect_err("attenuated ref must reject writes");
+    assert!(
+        error.to_string().contains("not permitted"),
+        "unexpected error: {error:#}"
+    );
 
-    // ...while the original still writes, and the change fans out to the facet's replica.
+    // The full capability still writes...
     let bump = cx.update(|cx| full.call(Bump {}, cx));
     settle(cx);
     assert_eq!(bump.await.expect("bump via full ref"), 1);
-    let facet_view = readonly
+
+    // ...and the wrapper's passthrough snapshot follows the shared state.
+    let passthrough = readonly.read_with(cx, |readonly, cx| readonly.snapshot(cx));
+    assert_eq!(passthrough.label, "gamma");
+    assert_eq!(passthrough.bumps, 1);
+
+    // An allowlist that names the method lets it through, byte-for-byte.
+    let writable = cx.update(|cx| {
+        Attenuated::new(
+            full.clone(),
+            &["bump"],
+            ItemSnapshot {
+                label: "pending".to_string(),
+                bumps: 0,
+            },
+            cx,
+        )
+    });
+    let writable_ref = host.update(cx, |host, cx| {
+        host.share_anonymous::<ItemSpec, _>(&writable, Attenuated::register, cx)
+    });
+    let probe = ProbeRequest {
+        target: writable_ref,
+        method: "bump".to_string(),
+        payload: encode(&Bump {}).expect("encode bump"),
+    };
+    let allowed =
+        cx.update(|cx| gatekeeper.forward("probe", encode(&probe).expect("encode probe"), cx));
+    settle(cx);
+    let response = allowed.await.expect("bump through allowlisted wrapper");
+    let bumps: u32 = decode(&response).expect("decode bump response");
+    assert_eq!(bumps, 2);
+}
+
+#[gpui::test]
+async fn test_audited_wrapper_keeps_a_ledger(cx: &mut TestAppContext) {
+    let host = setup(cx);
+    let factory = host.update(cx, |host, cx| host.remote::<FactorySpec>("factory", cx));
+
+    let created = cx.update(|cx| {
+        factory.call(
+            CreateItem {
+                label: "ledgered".to_string(),
+            },
+            cx,
+        )
+    });
+    settle(cx);
+    let item_ref = created.await.expect("create");
+    let item = host.update(cx, |host, cx| host.remote_from_ref(item_ref, cx));
+    settle(cx);
+
+    // Wrap the capability in an Audited and hand the WRAPPER's ref to the guest. The
+    // ledger stays with us, the wrapper's owner; the guest just sees a working item.
+    let audited = cx.update(|cx| {
+        Audited::new(
+            item.clone(),
+            ItemSnapshot {
+                label: "pending".to_string(),
+                bumps: 0,
+            },
+            cx,
+        )
+    });
+    let audited_ref = host.update(cx, |host, cx| {
+        host.share_anonymous::<ItemSpec, _>(&audited, Audited::register, cx)
+    });
+
+    let gatekeeper = host.update(cx, |host, cx| {
+        host.remote::<GatekeeperSpec>("gatekeeper", cx)
+    });
+    for _ in 0..2 {
+        let probe = ProbeRequest {
+            target: audited_ref,
+            method: "bump".to_string(),
+            payload: encode(&Bump {}).expect("encode bump"),
+        };
+        let bumped =
+            cx.update(|cx| gatekeeper.forward("probe", encode(&probe).expect("encode probe"), cx));
+        settle(cx);
+        bumped.await.expect("bump through audited wrapper");
+    }
+
+    // Every forwarded call is on the ledger, with its outcome.
+    let records: Vec<_> = audited.read_with(cx, |audited, _| audited.records().to_vec());
+    assert_eq!(records.len(), 2, "two calls, two records");
+    for record in &records {
+        assert_eq!(record.method, "bump");
+        assert!(record.payload_len > 0);
+        assert_eq!(record.completed, Some(true));
+    }
+
+    // The item actually changed: audit is accounting, not interference.
+    let bumps = item
         .replica()
         .read_with(cx, |replica, _| replica.state.as_ref().map(|s| s.bumps));
-    assert_eq!(
-        facet_view,
-        Some(1),
-        "facet replicas follow the shared state"
-    );
+    assert_eq!(bumps, Some(2));
 }
 
 #[gpui::test]

@@ -17,6 +17,9 @@
 // even when the macro expands inside this crate itself.
 extern crate self as embedded_gpui;
 
+/// Guest-homed entity ids set the high bit so the two sides' id spaces never collide.
+pub(crate) const GUEST_HOME_BIT: u64 = 1 << 63;
+
 #[cfg(not(target_arch = "wasm32"))]
 mod host;
 #[cfg(not(target_arch = "wasm32"))]
@@ -380,19 +383,15 @@ pub struct SharedProjection<S> {
     pub state: Option<S>,
 }
 
-/// Reserved control method: a projection announcing interest in an entity. The home starts
-/// publishing snapshots to it (and the subscribe's ack doubles as the initial snapshot).
-pub const SUBSCRIBE_METHOD: &str = "$subscribe";
+/// Reserved control method (runtime plumbing, never sent by user code): a projection
+/// announcing interest in an entity. The home starts publishing snapshots to it (and the
+/// subscribe's ack doubles as the initial snapshot).
+pub(crate) const SUBSCRIBE_METHOD: &str = "$subscribe";
 
-/// Reserved control method: a projection relinquishing an entity. Anonymous homes drop
-/// their strong handle, letting the entity die when nothing else owns it.
-pub const RELEASE_METHOD: &str = "$release";
-
-/// Reserved control method: derive a weaker capability to the same entity. The payload is
-/// the list of method names to keep (intersected with the caller's own table, so
-/// attenuation is monotonic); the response is the new ref. Callable on any ref you hold —
-/// no cooperation from the entity's author required.
-pub const ATTENUATE_METHOD: &str = "$attenuate";
+/// Reserved control method (runtime plumbing, never sent by user code): a projection
+/// relinquishing an entity. Anonymous homes drop their strong handle, letting the entity
+/// die when nothing else owns it.
+pub(crate) const RELEASE_METHOD: &str = "$release";
 
 /// A serializable capability reference to a shared entity of kind `S`.
 ///

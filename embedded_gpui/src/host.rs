@@ -103,23 +103,34 @@ impl<S: SharedSpec> HostRemote<S> {
         &self.replica
     }
 
+    /// All outgoing traffic is deferred rather than dispatched inline: a handler on a
+    /// host-homed entity runs inside a `PluginHost` update, so a synchronous re-entry
+    /// (e.g. a caretaker forwarding from its wildcard handler) would double-borrow the
+    /// host. Deferral keeps sends FIFO while making remotes safe to use from anywhere.
+    fn dispatch(
+        &self,
+        method: String,
+        payload: Vec<u8>,
+        ack: Option<AckSender>,
+        response: Option<ResponseSender>,
+        cx: &mut gpui::App,
+    ) {
+        let host = self.host.clone();
+        let name = self.name.clone();
+        cx.defer(move |cx| {
+            host.update(cx, |host, cx| {
+                host.send_to_guest(&name, &method, payload, ack, response, cx);
+            })
+            .ok();
+        });
+    }
+
     /// Send a typed message to the guest home. Await the receipt for read-your-writes.
     pub fn send<M: SharedMessage<Spec = S>>(&self, message: M, cx: &mut gpui::App) -> SendReceipt {
         let (ack_sender, receipt) = SendReceipt::channel();
         match embedded_gpui::encode(&message) {
             Ok(payload) => {
-                self.host
-                    .update(cx, |host, cx| {
-                        host.send_to_guest(
-                            &self.name,
-                            M::METHOD,
-                            payload,
-                            Some(ack_sender),
-                            None,
-                            cx,
-                        );
-                    })
-                    .ok();
+                self.dispatch(M::METHOD.to_string(), payload, Some(ack_sender), None, cx)
             }
             Err(error) => log::error!(
                 "embedded_gpui: failed to encode {}::{}: {error:#}",
@@ -130,26 +141,10 @@ impl<S: SharedSpec> HostRemote<S> {
         receipt
     }
 
-    /// Derive a weaker capability to the same entity, keeping only the listed methods
-    /// (intersected with this ref's own table — attenuation is monotonic).
-    pub fn attenuate(&self, keep: &[&str], cx: &mut gpui::App) -> CallReceipt<SharedRef<S>> {
-        match embedded_gpui::encode(&keep) {
-            Ok(payload) => self.call_raw(embedded_gpui::ATTENUATE_METHOD, payload, cx),
-            Err(error) => {
-                log::error!("embedded_gpui: failed to encode attenuation: {error:#}");
-                CallReceipt::dropped()
-            }
-        }
-    }
-
     /// The dynamic escape hatch: send an arbitrary method and payload.
     pub fn send_raw(&self, method: &str, payload: Vec<u8>, cx: &mut gpui::App) -> SendReceipt {
         let (ack_sender, receipt) = SendReceipt::channel();
-        self.host
-            .update(cx, |host, cx| {
-                host.send_to_guest(&self.name, method, payload, Some(ack_sender), None, cx);
-            })
-            .ok();
+        self.dispatch(method.to_string(), payload, Some(ack_sender), None, cx);
         receipt
     }
 
@@ -161,11 +156,7 @@ impl<S: SharedSpec> HostRemote<S> {
         cx: &mut gpui::App,
     ) -> CallReceipt<R> {
         let (response_sender, receipt) = CallReceipt::channel();
-        self.host
-            .update(cx, |host, cx| {
-                host.send_to_guest(&self.name, method, payload, None, Some(response_sender), cx);
-            })
-            .ok();
+        self.dispatch(method.to_string(), payload, None, Some(response_sender), cx);
         receipt
     }
 
@@ -174,11 +165,7 @@ impl<S: SharedSpec> HostRemote<S> {
     /// through to the entity it guards without knowing the method's types.
     pub fn forward(&self, method: &str, payload: Vec<u8>, cx: &mut gpui::App) -> RawCallReceipt {
         let (response_sender, receipt) = RawCallReceipt::channel();
-        self.host
-            .update(cx, |host, cx| {
-                host.send_to_guest(&self.name, method, payload, None, Some(response_sender), cx);
-            })
-            .ok();
+        self.dispatch(method.to_string(), payload, None, Some(response_sender), cx);
         receipt
     }
 
@@ -191,20 +178,13 @@ impl<S: SharedSpec> HostRemote<S> {
     ) -> CallReceipt<M::Response> {
         let (response_sender, receipt) = CallReceipt::channel();
         match embedded_gpui::encode(&message) {
-            Ok(payload) => {
-                self.host
-                    .update(cx, |host, cx| {
-                        host.send_to_guest(
-                            &self.name,
-                            M::METHOD,
-                            payload,
-                            None,
-                            Some(response_sender),
-                            cx,
-                        );
-                    })
-                    .ok();
-            }
+            Ok(payload) => self.dispatch(
+                M::METHOD.to_string(),
+                payload,
+                None,
+                Some(response_sender),
+                cx,
+            ),
             Err(error) => log::error!(
                 "embedded_gpui: failed to encode {}::{}: {error:#}",
                 S::TYPE_NAME,
@@ -909,7 +889,6 @@ impl PluginHost {
         let Some(home) = self.shared.home_mut(entity_id) else {
             return;
         };
-        let facets = home.facets.clone();
         if home.subscribed {
             home.published_ack = home.applied_sequence;
             let acked_sequence = home.applied_sequence;
@@ -934,10 +913,6 @@ impl PluginHost {
                     log::error!("embedded_gpui: failed to encode shared snapshot: {error:#}")
                 }
             }
-        }
-        // Attenuated facets alias the same entity state, so a change fans out to all.
-        for facet in facets {
-            self.publish_home(facet, cx);
         }
     }
 

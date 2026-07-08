@@ -16,6 +16,7 @@ path = "shared_entities.rs"
 [dev-dependencies]
 anyhow = "1.0"
 embedded_gpui = { path = "../embedded_gpui" }
+embedded_gpui_util = { path = "../embedded_gpui_util" }
 test_schema = { path = "schema" }
 gpui = { git = "https://github.com/zed-industries/zed.git", branch = "gpui-embedded-in-gpui", features = ["test-support"] }
 rand = "0.9"

@@ -162,11 +162,16 @@ same replica and the same guard.
 
 Refs can be weakened and severed without any cooperation from the entity's author:
 
-- **Attenuation** (`remote.attenuate(&["read"])`) is a generic `$attenuate` control
-  method: the home clones the dispatch entry with the method table intersected against
-  the caller's own — monotonic, so a facet can only shrink. Facets alias the entity's
-  state; snapshots fan out to all of them.
-- **Revocation** is `embedded_gpui_utils::Revocable`: wrap any capability you hold in a
+- **Attenuation** is a library pattern, not a protocol feature:
+  `embedded_gpui_util::Attenuated` wraps any capability you hold with an allowlist —
+  permitted methods forward byte-for-byte, everything else is rejected before reaching
+  the entity. Monotonic by construction (a wrapper can only forward what it can itself
+  call). The core deliberately has no `$attenuate` control: userland can build this,
+  so core doesn't.
+- **Accounting** is `embedded_gpui_util::Audited`: a transparent forwarder that records
+  every call (method, payload size, eventual outcome) in a ledger readable by whoever
+  holds the wrapper entity — capability accountability without interference.
+- **Revocation** is `embedded_gpui_util::Revocable`: wrap any capability you hold in a
   caretaker entity, share the wrapper, hand out *its* ref. Snapshots pass through, and a
   wildcard handler forwards every method — including ones the wrapper has never heard
   of — to the wrapped capability as raw bytes (`SharedCaller::forward_shared`).

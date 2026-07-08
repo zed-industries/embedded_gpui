@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use embedded_gpui::encode;
-use embedded_gpui::{PluginHost, PluginInstance, SharedEntitySource, decode};
+use embedded_gpui::{PluginHost, PluginInstance, PluginOptions, SharedEntitySource, decode};
 use embedded_gpui_util::{Attenuated, Audited};
 use gpui::{App, AppContext as _, Context, Entity, Task, TestAppContext};
 use rand::prelude::*;
@@ -43,12 +43,13 @@ fn test_plugin_path() -> PathBuf {
 fn setup(cx: &mut TestAppContext) -> Entity<PluginHost> {
     let path = test_plugin_path();
     let instance = cx.update(|_| {
-        PluginInstance::new(&path, Arc::new(gpui::NoopTextSystem::new()))
-            .expect("failed to instantiate test plugin")
+        PluginInstance::new(
+            &path,
+            PluginOptions::new(Arc::new(gpui::NoopTextSystem::new())),
+        )
+        .expect("failed to instantiate test plugin")
     });
-    let host = cx.new(|cx| PluginHost::new(instance, cx));
-    host.update(cx, |host, cx| host.init(cx));
-    host
+    cx.new(|cx| PluginHost::new(instance, cx))
 }
 
 /// Flush deferred effects and host-scheduled ticks deterministically.

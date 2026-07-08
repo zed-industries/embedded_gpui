@@ -113,7 +113,7 @@ impl Plugin for TestGuest {
         }
     }
 
-    fn create_view(&mut self, _view_id: u32, _window: &mut Window, cx: &mut App) -> AnyView {
+    fn create_view(&mut self, _name: &str, _window: &mut Window, cx: &mut App) -> AnyView {
         cx.new(|_| EmptyView).into()
     }
 }

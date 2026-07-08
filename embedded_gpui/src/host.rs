@@ -486,8 +486,40 @@ pub struct PluginInstance {
     bindings: Plugin,
 }
 
+/// Grants extra WASI authority to a plugin's sandbox at instantiation.
+pub type ConfigureWasi = Box<dyn FnOnce(&mut WasiCtxBuilder) + Send>;
+
+/// Everything an embedder decides about a plugin's environment.
+pub struct PluginOptions {
+    /// Shapes glyph layout for the guest; usually the host platform's own text system,
+    /// so plugin text is indistinguishable from native text.
+    pub text_system: Arc<dyn PlatformTextSystem>,
+    /// Configure the WASI sandbox the plugin runs in. The default grants nothing but
+    /// inherited stdout/stderr; every additional authority (filesystem, network, env)
+    /// is an explicit choice made here.
+    pub configure_wasi: Option<ConfigureWasi>,
+}
+
+impl PluginOptions {
+    pub fn new(text_system: Arc<dyn PlatformTextSystem>) -> Self {
+        Self {
+            text_system,
+            configure_wasi: None,
+        }
+    }
+
+    /// Grant the plugin additional WASI authority (preopened dirs, env vars, ...).
+    pub fn with_wasi(
+        mut self,
+        configure: impl FnOnce(&mut WasiCtxBuilder) + Send + 'static,
+    ) -> Self {
+        self.configure_wasi = Some(Box::new(configure));
+        self
+    }
+}
+
 impl PluginInstance {
-    pub fn new(component_path: &Path, text_system: Arc<dyn PlatformTextSystem>) -> Result<Self> {
+    pub fn new(component_path: &Path, options: PluginOptions) -> Result<Self> {
         let mut config = Config::new();
         config.wasm_component_model(true);
         let engine = Engine::new(&config).context("creating wasmtime engine")?;
@@ -500,14 +532,16 @@ impl PluginInstance {
         Plugin::add_to_linker::<_, HostState>(&mut linker, |state| state)
             .context("adding plugin host imports to linker")?;
 
-        let wasi = WasiCtxBuilder::new()
-            .inherit_stdout()
-            .inherit_stderr()
-            .build();
+        let mut wasi_builder = WasiCtxBuilder::new();
+        wasi_builder.inherit_stdout().inherit_stderr();
+        if let Some(configure) = options.configure_wasi {
+            configure(&mut wasi_builder);
+        }
+        let wasi = wasi_builder.build();
         let state = HostState {
             wasi,
             table: ResourceTable::new(),
-            text_system,
+            text_system: options.text_system,
             pending: PendingEffects::default(),
         };
         let mut store = Store::new(&engine, state);
@@ -526,10 +560,16 @@ impl PluginInstance {
         Ok(self.take_effects())
     }
 
-    pub fn create_view(&mut self, view_id: u32, size: Size<Pixels>, scale: f32) -> Result<Effects> {
+    pub fn create_view(
+        &mut self,
+        view_id: u32,
+        name: &str,
+        size: Size<Pixels>,
+        scale: f32,
+    ) -> Result<Effects> {
         let extent = extent_from_size(size);
         self.bindings
-            .call_create_view(&mut self.store, view_id, extent, scale)?;
+            .call_create_view(&mut self.store, view_id, name, extent, scale)?;
         Ok(self.take_effects())
     }
 
@@ -608,6 +648,7 @@ enum PluginRequest {
     Init,
     CreateView {
         view_id: u32,
+        name: String,
         size: Size<Pixels>,
         scale: f32,
     },
@@ -637,9 +678,10 @@ impl PluginInstance {
             PluginRequest::Init => self.init(),
             PluginRequest::CreateView {
                 view_id,
+                name,
                 size,
                 scale,
-            } => self.create_view(view_id, size, scale),
+            } => self.create_view(view_id, &name, size, scale),
             PluginRequest::ResizeView {
                 view_id,
                 size,
@@ -667,6 +709,8 @@ pub struct PluginHost {
     /// processes one call at a time, and each call's effects come back in order.
     requests: mpsc::UnboundedSender<PluginRequest>,
     views: HashMap<u32, Entity<PluginViewState>>,
+    views_by_name: HashMap<String, Entity<PluginViewState>>,
+    next_view_id: u32,
     images: PluginImages,
     shared: shared_entities::HostShared,
     remotes_by_name: HashMap<String, gpui::AnyEntity>,
@@ -711,9 +755,11 @@ impl PluginHost {
             }
         });
 
-        Self {
+        let this = Self {
             requests,
             views: HashMap::new(),
+            views_by_name: HashMap::new(),
+            next_view_id: 0,
             images: PluginImages::default(),
             shared: shared_entities::HostShared::default(),
             remotes_by_name: HashMap::new(),
@@ -722,7 +768,24 @@ impl PluginHost {
             scheduled_tick: None,
             _worker: worker,
             _pump: pump,
-        }
+        };
+        this.enqueue(PluginRequest::Init);
+        this
+    }
+
+    /// The whole embedding story in one call: compile and instantiate the component on
+    /// a background thread, then hand back a ready [`PluginHost`]. Pair with
+    /// [`PluginHost::view`] to place the plugin's surfaces in your UI.
+    pub fn load(
+        path: std::path::PathBuf,
+        options: PluginOptions,
+        cx: &mut gpui::App,
+    ) -> Task<Result<Entity<PluginHost>>> {
+        let instance = cx.background_spawn(async move { PluginInstance::new(&path, options) });
+        cx.spawn(async move |cx| {
+            let instance = instance.await?;
+            Ok(cx.update(|cx| cx.new(|cx| PluginHost::new(instance, cx))))
+        })
     }
 
     fn enqueue(&self, request: PluginRequest) {
@@ -1070,27 +1133,43 @@ impl PluginHost {
         }
     }
 
-    pub fn init(&mut self, _cx: &mut Context<Self>) {
-        self.enqueue(PluginRequest::Init);
-    }
-
-    pub fn create_view(
+    /// The view named `name` from the plugin, as a GPUI view: place it anywhere in
+    /// your element tree and it fills its slot. Creation is lazy — the guest's
+    /// `create-view` runs on first layout, with the measured slot size and the
+    /// window's actual scale factor — and repeated calls return the same view.
+    pub fn view(
         &mut self,
-        view_id: u32,
-        size: Size<Pixels>,
-        scale: f32,
+        name: impl Into<String>,
         cx: &mut Context<Self>,
     ) -> Entity<PluginViewState> {
+        let name = name.into();
+        if let Some(view) = self.views_by_name.get(&name) {
+            return view.clone();
+        }
+        let view_id = self.next_view_id;
+        self.next_view_id += 1;
         let host = cx.weak_entity();
         let images = self.images.clone();
-        let view = cx.new(|cx| PluginViewState::new(view_id, size, host, images, cx));
+        let view = cx.new(|cx| PluginViewState::new(view_id, name.clone(), host, images, cx));
         self.views.insert(view_id, view.clone());
+        self.views_by_name.insert(name, view.clone());
+        view
+    }
+
+    pub(crate) fn create_view_now(
+        &mut self,
+        view_id: u32,
+        name: String,
+        size: Size<Pixels>,
+        scale: f32,
+        _cx: &mut Context<Self>,
+    ) {
         self.enqueue(PluginRequest::CreateView {
             view_id,
+            name,
             size,
             scale,
         });
-        view
     }
 
     pub fn resize_view(

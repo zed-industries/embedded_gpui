@@ -414,7 +414,7 @@ world plugin {
 
     /// Create a plugin view (a "GPUI plugin window" in the guest) with the given id and
     /// initial geometry. The guest responds (possibly asynchronously) with `update-scene`.
-    export create-view: func(view-id: u32, size: extent, scale-factor: f32);
+    export create-view: func(view-id: u32, name: string, size: extent, scale-factor: f32);
 
     /// Notify the guest that a view's slot was resized or its scale factor changed.
     export resize-view: func(view-id: u32, size: extent, scale-factor: f32);

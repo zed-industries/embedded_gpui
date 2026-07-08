@@ -40,7 +40,7 @@ pub trait Plugin: 'static {
         Self: Sized;
 
     /// Called when the host creates a view slot. Return the root view to render in it.
-    fn create_view(&mut self, view_id: u32, window: &mut Window, cx: &mut App) -> AnyView;
+    fn create_view(&mut self, name: &str, window: &mut Window, cx: &mut App) -> AnyView;
 
     /// Assets (e.g. SVGs) bundled with the plugin, loadable by path from GPUI elements.
     fn assets() -> Option<Box<dyn AssetSource>>
@@ -172,7 +172,7 @@ impl Render for PluginRoot {
 struct Component;
 
 impl wit::Guest for Component {
-    fn create_view(view_id: u32, extent: wit::Extent, scale_factor: f32) {
+    fn create_view(view_id: u32, name: String, extent: wit::Extent, scale_factor: f32) {
         let Some((async_app, platform, plugin)) = runtime_handles() else {
             log::error!("embedded_gpui: create-view before init-plugin");
             return;
@@ -189,7 +189,7 @@ impl wit::Guest for Component {
                     ..Default::default()
                 },
                 |window, cx| {
-                    let view = plugin.borrow_mut().create_view(view_id, window, cx);
+                    let view = plugin.borrow_mut().create_view(&name, window, cx);
                     cx.new(|_| PluginRoot { view })
                 },
             )

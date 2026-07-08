@@ -28,6 +28,23 @@ changes; nothing here is a supported API yet.
   caretaker/membrane that wraps any capability with pass-through snapshots,
   method forwarding, and revocation.
 
+## Embedding
+
+```rust
+// Compile + instantiate on a background thread; the store never blocks your UI.
+let plugin = PluginHost::load(path, PluginOptions::new(text_system), cx);
+
+// Later: views by name, placed like any other element. Creation is lazy (the
+// guest sees the measured slot size), and layout changes become window resizes.
+div()
+    .w(px(480.))
+    .h(px(320.))
+    .child(plugin.update(cx, |plugin, cx| plugin.view("panel", cx)))
+```
+
+The WASI sandbox grants nothing but stdout/stderr by default; every additional
+authority is an explicit `PluginOptions::with_wasi` choice.
+
 ## Quick start
 
 Requires the `wasm32-wasip2` target (`rustup target add wasm32-wasip2`; the

@@ -18,6 +18,9 @@ pub struct PluginViewState {
     view_id: u32,
     display_list: Option<bindings::DisplayList>,
     cursor: Option<gpui::CursorStyle>,
+    /// Set until the first layout; the guest's `create-view` is deferred so the
+    /// measured slot size and real scale factor shape the initial window.
+    pending_create: Option<String>,
     last_size: Size<Pixels>,
     last_origin: Point<Pixels>,
     host: WeakEntity<PluginHost>,
@@ -28,7 +31,7 @@ pub struct PluginViewState {
 impl PluginViewState {
     pub fn new(
         view_id: u32,
-        size: Size<Pixels>,
+        name: String,
         host: WeakEntity<PluginHost>,
         images: PluginImages,
         cx: &mut Context<Self>,
@@ -37,7 +40,8 @@ impl PluginViewState {
             view_id,
             display_list: None,
             cursor: None,
-            last_size: size,
+            pending_create: Some(name),
+            last_size: Size::default(),
             last_origin: Point::default(),
             host,
             images,
@@ -101,6 +105,19 @@ impl PluginViewState {
             if let Some(host) = host.upgrade() {
                 host.update(cx, |host, cx| host.handle_key(view_id, event, cx));
             }
+        });
+    }
+
+    /// Ask the guest to open this view, now that its slot has been measured. Deferred
+    /// so it does not call into the host from inside layout.
+    fn request_create(&self, name: String, size: Size<Pixels>, scale: f32, cx: &mut Context<Self>) {
+        let host = self.host.clone();
+        let view_id = self.view_id;
+        cx.defer(move |cx| {
+            host.update(cx, |host, cx| {
+                host.create_view_now(view_id, name, size, scale, cx);
+            })
+            .ok();
         });
     }
 
@@ -228,7 +245,10 @@ impl Render for PluginViewState {
                         let scale = window.scale_factor();
                         prepaint_entity.update(cx, |this, cx| {
                             this.last_origin = bounds.origin;
-                            if bounds.size != this.last_size {
+                            if let Some(name) = this.pending_create.take() {
+                                this.last_size = bounds.size;
+                                this.request_create(name, bounds.size, scale, cx);
+                            } else if bounds.size != this.last_size {
                                 this.last_size = bounds.size;
                                 this.request_resize(bounds.size, scale, cx);
                             }

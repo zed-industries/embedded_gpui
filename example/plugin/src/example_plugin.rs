@@ -52,9 +52,9 @@ impl Plugin for ExamplePlugin {
         }
     }
 
-    fn create_view(&mut self, view_id: u32, _window: &mut Window, cx: &mut App) -> AnyView {
-        match view_id {
-            0 => cx
+    fn create_view(&mut self, name: &str, _window: &mut Window, cx: &mut App) -> AnyView {
+        match name {
+            "button" => cx
                 .new(|cx| ButtonView::new(self.counter.clone(), cx))
                 .into(),
             _ => cx

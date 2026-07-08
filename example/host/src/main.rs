@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use embedded_gpui::{
-    HandleShared, HostRemote, PluginHost, PluginInstance, PluginViewState, SharedEntitySource,
+    HandleShared, HostRemote, PluginHost, PluginOptions, PluginViewState, SharedEntitySource,
     SharedRef,
 };
 use example_schema::{
@@ -82,81 +82,87 @@ fn main() {
     let text_system = platform.text_system();
 
     Application::with_platform(platform).run(move |cx: &mut App| {
-        let instance = match PluginInstance::new(&wasm_path, text_system) {
-            Ok(instance) => instance,
-            Err(error) => {
-                log::error!("embedded_gpui: failed to load plugin: {error:#}");
-                cx.quit();
-                return;
-            }
-        };
-
-        let bounds = Bounds::centered(None, size(px(900.), px(700.)), cx);
-        let opened = cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                ..Default::default()
-            },
-            move |window, cx| {
-                let scale = window.scale_factor();
-                let counter = cx.new(|_| Counter { clicks: 0 });
-                let workspace = cx.new(|_| Workspace {
-                    accent_hue: 0.58,
-                    last_toast: None,
-                });
-                let host = cx.new(|cx| PluginHost::new(instance, cx));
-                let (view0, view1, typed_text, palette) = host.update(cx, |host, cx| {
-                    host.init(cx);
-                    host.share(
-                        &counter,
-                        "clicks",
-                        |methods| {
-                            methods.on::<Increment>();
-                        },
-                        cx,
-                    );
-                    // Homed on the HOST, driven by the plugin: the workspace service.
-                    host.share(&workspace, "workspace", register_workspace_api, cx);
-                    // Homed in the GUEST: the wasm input line's text, projected natively.
-                    let typed_text = host.remote::<TextSpec>("typed-text", cx);
-                    // Also guest-homed: the command palette. Labels render as native
-                    // buttons below; the refs they carry are the authority to invoke.
-                    let palette = host.remote::<PaletteSpec>("palette", cx);
-                    let view0 = host.create_view(0, size(px(240.), px(100.)), scale, cx);
-                    let view1 = host.create_view(1, size(px(480.), px(320.)), scale, cx);
-                    (view0, view1, typed_text, palette)
-                });
-                cx.new(|cx| {
-                    cx.observe(&counter, |_, _, cx| cx.notify()).detach();
-                    cx.observe(&workspace, |_, _, cx| cx.notify()).detach();
-                    cx.observe(typed_text.replica(), |_, _, cx| cx.notify())
-                        .detach();
-                    cx.observe(palette.replica(), |_, _, cx| cx.notify())
-                        .detach();
-                    DemoView {
-                        host,
-                        counter,
-                        workspace,
-                        typed_text,
-                        palette,
-                        command_remotes: HashMap::new(),
-                        command_status: None,
-                        command_task: None,
-                        view0,
-                        view1,
-                    }
-                })
-            },
-        );
-
-        if let Err(error) = opened {
-            log::error!("embedded_gpui: failed to open window: {error:#}");
-            cx.quit();
-            return;
-        }
-
-        cx.activate(true);
+        // The whole embedding story: compile on the background, get a ready host.
+        let plugin = PluginHost::load(wasm_path, PluginOptions::new(text_system), cx);
+        cx.spawn(async move |cx| {
+            let host = match plugin.await {
+                Ok(host) => host,
+                Err(error) => {
+                    log::error!("embedded_gpui: failed to load plugin: {error:#}");
+                    cx.update(|cx| cx.quit());
+                    return;
+                }
+            };
+            cx.update(move |cx| open_demo_window(host, cx));
+        })
+        .detach();
     });
+}
+
+fn open_demo_window(host: gpui::Entity<PluginHost>, cx: &mut App) {
+    let bounds = Bounds::centered(None, size(px(900.), px(700.)), cx);
+    let opened = cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            ..Default::default()
+        },
+        move |_window, cx| {
+            let counter = cx.new(|_| Counter { clicks: 0 });
+            let workspace = cx.new(|_| Workspace {
+                accent_hue: 0.58,
+                last_toast: None,
+            });
+            let (view0, view1, typed_text, palette) = host.update(cx, |host, cx| {
+                host.share(
+                    &counter,
+                    "clicks",
+                    |methods| {
+                        methods.on::<Increment>();
+                    },
+                    cx,
+                );
+                // Homed on the HOST, driven by the plugin: the workspace service.
+                host.share(&workspace, "workspace", register_workspace_api, cx);
+                // Homed in the GUEST: the wasm input line's text, projected natively.
+                let typed_text = host.remote::<TextSpec>("typed-text", cx);
+                // Also guest-homed: the command palette. Labels render as native
+                // buttons below; the refs they carry are the authority to invoke.
+                let palette = host.remote::<PaletteSpec>("palette", cx);
+                // Views by name; each fills whatever slot the host lays out for it.
+                let view0 = host.view("button", cx);
+                let view1 = host.view("panel", cx);
+                (view0, view1, typed_text, palette)
+            });
+            cx.new(|cx| {
+                cx.observe(&counter, |_, _, cx| cx.notify()).detach();
+                cx.observe(&workspace, |_, _, cx| cx.notify()).detach();
+                cx.observe(typed_text.replica(), |_, _, cx| cx.notify())
+                    .detach();
+                cx.observe(palette.replica(), |_, _, cx| cx.notify())
+                    .detach();
+                DemoView {
+                    host,
+                    counter,
+                    workspace,
+                    typed_text,
+                    palette,
+                    command_remotes: HashMap::new(),
+                    command_status: None,
+                    command_task: None,
+                    view0,
+                    view1,
+                }
+            })
+        },
+    );
+
+    if let Err(error) = opened {
+        log::error!("embedded_gpui: failed to open window: {error:#}");
+        cx.quit();
+        return;
+    }
+
+    cx.activate(true);
 }
 
 fn resolve_wasm_path() -> Option<PathBuf> {

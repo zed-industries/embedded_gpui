@@ -1986,9 +1986,18 @@ version = "0.1.0"
 dependencies = [
  "embedded_gpui",
  "env_logger",
+ "example_schema",
  "gpui",
  "gpui_platform",
  "log",
+]
+
+[[package]]
+name = "example_schema"
+version = "0.1.0"
+dependencies = [
+ "embedded_gpui",
+ "gpui",
 ]
 
 [[package]]
@@ -5916,6 +5925,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "test_schema"
+version = "0.1.0"
+dependencies = [
+ "embedded_gpui",
+ "gpui",
+]
+
+[[package]]
 name = "tests"
 version = "0.1.0"
 dependencies = [
@@ -5923,6 +5940,7 @@ dependencies = [
  "embedded_gpui",
  "gpui",
  "rand 0.9.4",
+ "test_schema",
 ]
 
 [[package]]

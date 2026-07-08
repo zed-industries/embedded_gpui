@@ -2,13 +2,13 @@
 //! App, rendered by the `embedded_gpui` host. The panel exercises text, SVGs, images,
 //! paths, and keyboard input. See `DESIGN.md`.
 
-use embedded_gpui::demo::{
+use embedded_gpui::shared::{Remote, SharedEntitySource, SharedProjection};
+use embedded_gpui::{Plugin, register_plugin};
+use example_schema::{
     CommandApi, CommandSnapshot, CommandSpec, CounterSnapshot, CounterSpec, Increment,
     PaletteEntry, PaletteSnapshot, PaletteSpec, TextSnapshot, TextSpec, WorkspaceApiCaller as _,
     WorkspaceSpec, register_command_api,
 };
-use embedded_gpui::shared::{Remote, SharedEntitySource, SharedProjection};
-use embedded_gpui::{Plugin, register_plugin};
 use gpui::{
     AnyView, App, AssetSource, Bounds, Context, ElementInputHandler, Entity, EntityInputHandler,
     FocusHandle, KeyDownEvent, MouseButton, PathBuilder, Pixels, RenderImage, SharedString,

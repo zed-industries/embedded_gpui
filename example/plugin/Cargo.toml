@@ -17,6 +17,7 @@ crate-type = ["cdylib"]
 anyhow = "1.0"
 gpui = { git = "https://github.com/zed-industries/zed.git", branch = "gpui-embedded-in-gpui", default-features = false }
 embedded_gpui = { path = "../../embedded_gpui" }
+example_schema = { path = "../schema" }
 image = "0.25"
 
 [profile.release]

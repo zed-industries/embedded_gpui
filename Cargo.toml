@@ -4,7 +4,9 @@ members = [
     "embedded_gpui_macros",
     "embedded_gpui_util",
     "example/host",
+    "example/schema",
     "tests",
+    "tests/schema",
 ]
 resolver = "2"
 

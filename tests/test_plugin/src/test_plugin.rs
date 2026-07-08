@@ -3,15 +3,15 @@
 
 use anyhow::anyhow;
 use embedded_gpui::shared::{HandleShared, SharedEntitySource, SharedRef};
-use embedded_gpui::test_schema::{
-    Bump, ChameleonSnapshot, ChameleonSpec, CreateItem, FactorySnapshot, FactorySpec,
-    GatekeeperSnapshot, GatekeeperSpec, Guard, ItemSnapshot, ItemSpec, TestCounterSnapshot,
-    TestCounterSpec, TestIncrement, VaultSnapshot, VaultSpec,
-};
 use embedded_gpui::{Plugin, register_plugin};
 use embedded_gpui::{decode, encode};
 use embedded_gpui_util::Revocable;
 use gpui::{AnyView, App, Context, Entity, Window, div, prelude::*};
+use test_schema::{
+    Bump, ChameleonSnapshot, ChameleonSpec, CreateItem, FactorySnapshot, FactorySpec,
+    GatekeeperSnapshot, GatekeeperSpec, Guard, ItemSnapshot, ItemSpec, TestCounterSnapshot,
+    TestCounterSpec, TestIncrement, VaultSnapshot, VaultSpec,
+};
 
 /// Named shares borrow their entities (the sharer owns the lifetime), so the plugin must
 /// keep them alive; anonymous shares own theirs until released.

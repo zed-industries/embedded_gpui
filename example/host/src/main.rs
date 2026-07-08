@@ -3,13 +3,13 @@
 
 use std::path::{Path, PathBuf};
 
-use embedded_gpui::demo::{
-    CommandApiCaller as _, CommandSpec, CounterSnapshot, CounterSpec, Increment, PaletteSpec,
-    TextSpec, WorkspaceApi, WorkspaceSnapshot, WorkspaceSpec, register_workspace_api,
-};
 use embedded_gpui::{
     HandleShared, HostRemote, PluginHost, PluginInstance, PluginViewState, SharedEntitySource,
     SharedRef,
+};
+use example_schema::{
+    CommandApiCaller as _, CommandSpec, CounterSnapshot, CounterSpec, Increment, PaletteSpec,
+    TextSpec, WorkspaceApi, WorkspaceSnapshot, WorkspaceSpec, register_workspace_api,
 };
 use gpui::{
     App, Application, Bounds, Context, Entity, MouseButton, Pixels, WindowBounds, WindowOptions,

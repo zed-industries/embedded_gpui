@@ -1,0 +1,48 @@
+[package]
+name = "embedded_gpui"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+description = "GPUI running inside a Wasm component, embedded back into a native GPUI app"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/embedded_gpui.rs"
+
+# The schema layer (shared specs, messages, receipts, SharedCaller) is common; the host
+# runtime compiles only natively and the guest platform compiles only for wasm32, so one
+# crate serves both sides of the boundary.
+[dependencies]
+anyhow = "1.0"
+futures = "0.3"
+# gpui is consumed straight from the zed repository. The branch carries the one
+# accessor the guest runtime needs (Application::run_embedded); switch to main once
+# https://github.com/zed-industries/zed/tree/gpui-embedded-in-gpui merges.
+gpui = { git = "https://github.com/zed-industries/zed.git", branch = "gpui-embedded-in-gpui", default-features = false }
+embedded_gpui_macros = { path = "../embedded_gpui_macros" }
+log = "0.4"
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = "1.0"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+gpui = { git = "https://github.com/zed-industries/zed.git", branch = "gpui-embedded-in-gpui" }
+image = "0.25"
+smallvec = { version = "1.6", features = ["union", "const_new"] }
+wasmtime = { version = "36", default-features = false, features = [
+    "async",
+    "demangle",
+    "runtime",
+    "cranelift",
+    "component-model",
+    "incremental-cache",
+    "parallel-compilation",
+] }
+wasmtime-wasi = "36"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+raw-window-handle = "0.6"
+uuid = "1"
+wit-bindgen = "0.41"

@@ -12,25 +12,25 @@ app alive and re-enter it whenever the external run loop yields control).
 
 ## Layout
 
-- `wit/plugin.wit` — the wire protocol (package `gpui:embedded`, world `plugin`). This is the
-  single source of truth both sides bind against.
-- `src/gpui_embedded.rs`, `src/shared_entities.rs`, `src/plugin_element.rs` — **host**:
-  wasmtime glue, host-side shared entities, and the element that replays guest display lists.
-- `src/main.rs` — host demo binary (`cargo run --bin gpui_embedded_demo`).
-- `shared/` — `gpui_embedded_shared`: schema traits, receipts, the `SharedCaller`
-  capability surface, and the `shared_schema!` macro used by both sides of the boundary.
-- `shared/macros/` — `gpui_embedded_shared_macros`: the `#[shared_interface]` proc macro
-  (trait in, complete typed interface out).
-- `utils/` — `embedded_gpui_utils`: side-agnostic OCAP patterns (`Revocable`, a generic
-  caretaker/membrane) built purely on `SharedCaller`.
-- `plugin/` — **guest platform** crate `gpui_plugin` (its own workspace, compiled to
-  `wasm32-wasip2`). Implements GPUI's `Platform`/`PlatformWindow`/
-  `PlatformDispatcher`/`PlatformTextSystem`/`PlatformAtlas` over the WIT boundary, plus the
-  guest half of shared entities.
-- `example_plugin/` — **guest demo** crate (own workspace): a small GPUI UI that runs inside
-  the plugin platform.
-- `test_plugin/` + `tests/` — a guest fixture and the host-driven integration tests for the
-  shared-entity protocol.
+- `embedded_gpui/` — **one crate, both sides of the boundary**:
+  - `wit/plugin.wit` — the wire protocol (package `gpui:embedded`, world `plugin`); the
+    single source of truth both sides bind against.
+  - `src/embedded_gpui.rs` — the always-compiled schema layer: specs, messages, receipts,
+    `SharedCaller`, and the `shared_schema!` macro.
+  - `src/host.rs` (+ `src/host/`) — native targets only: wasmtime glue, host-side shared
+    entities, and the element that replays guest display lists.
+  - `src/guest.rs` (+ `src/guest/`) — wasm32 targets only: GPUI's
+    `Platform`/`PlatformWindow`/`PlatformDispatcher`/`PlatformTextSystem`/`PlatformAtlas`
+    over the WIT boundary, `Plugin`/`register_plugin!`, and the guest half of shared
+    entities.
+- `embedded_gpui_macros/` — the `#[shared_interface]` proc macro.
+- `embedded_gpui_util/` — side-agnostic OCAP patterns (`Revocable`) built on
+  `SharedCaller`.
+- `example/` — the demo pair: `host/` (native window, `cargo run -p example_host`;
+  builds the plugin automatically) and `plugin/` (the wasm component, its own workspace
+  since it only compiles to `wasm32-wasip2`).
+- `tests/` — the host-driven integration tests for the shared-entity protocol, with
+  their guest fixture in `tests/test_plugin/`.
 
 ## Architecture (agreed invariants)
 
@@ -83,8 +83,7 @@ guest App. The release component (all of gpui + taffy, no fonts, no glyph raster
 Run it:
 
 ```sh
-./build_plugin.sh
-cargo run --bin gpui_embedded_demo
+cargo run -p example_host
 ```
 
 ## Shared entities

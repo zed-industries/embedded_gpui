@@ -12,10 +12,10 @@ changes; nothing here is a supported API yet.
 
 ## What works today
 
-- A guest-side GPUI platform (`plugin/`): windows, retained display lists,
+- A guest-side GPUI platform: windows, retained display lists,
   mouse and keyboard input, timers/async, SVG and image rendering, text via
   host-side shaping — all over a WIT protocol (`wit/plugin.wit`).
-- A host runtime (`src/`): loads a component with wasmtime, replays its display
+- A host runtime: loads a component with wasmtime, replays its display
   lists as native GPUI primitives (text hits the host's real rasterizer), and
   never calls into wasm from the frame path.
 - **Shared entities**: state lives on one side ("home"), the other side holds a
@@ -34,23 +34,33 @@ Requires the `wasm32-wasip2` target (`rustup target add wasm32-wasip2`; the
 pinned toolchain in `rust-toolchain.toml` installs it automatically).
 
 ```sh
-./build_plugin.sh                        # compile the example plugin to wasm
-cargo run --bin gpui_embedded_demo       # run the native host demo
+cargo run -p example_host
 ```
+
+(the demo builds its wasm plugin automatically on first run)
 
 The demo window shows two embedded plugin views (a counter button and a panel
 with text input, SVG, image, and an animated path) plus a native button — all
 three mutate the same shared counter entity.
 
 ```sh
-cargo test --test shared_entities -- --test-threads 1   # protocol tests
+cargo test -p tests -- --test-threads 1   # protocol tests
 ```
+
+## Layout
+
+- `embedded_gpui/` — the one crate both sides use: schema layer (always), host runtime
+  (native), guest platform (wasm32). The WIT protocol lives in `embedded_gpui/wit/`.
+- `embedded_gpui_macros/` — the `#[shared_interface]` proc macro.
+- `embedded_gpui_util/` — object-capability patterns (`Revocable`).
+- `example/` — the demo: `host/` (native window) and `plugin/` (the wasm component).
+- `tests/` — protocol integration tests plus their `test_plugin/` fixture.
 
 ## Reading order
 
 1. `DESIGN.md` — architecture and invariants.
-2. `wit/plugin.wit` — the wire protocol, heavily commented.
-3. `example_plugin/` — what plugin code looks like.
+2. `embedded_gpui/wit/plugin.wit` — the wire protocol, heavily commented.
+3. `example/plugin/` — what plugin code looks like.
 
 GPUI is consumed as a git dependency on the zed repository (the
 `gpui-embedded-in-gpui` branch until the small upstream hook it needs merges).

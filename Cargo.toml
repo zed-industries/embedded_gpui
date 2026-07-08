@@ -1,5 +1,11 @@
 [workspace]
-members = [".", "shared", "shared/macros", "utils"]
+members = [
+    "embedded_gpui",
+    "embedded_gpui_macros",
+    "embedded_gpui_util",
+    "example/host",
+    "tests",
+]
 resolver = "2"
 
 [workspace.lints.rust]
@@ -9,53 +15,6 @@ unexpected_cfgs = { level = "allow" }
 dbg_macro = "deny"
 todo = "deny"
 
-[package]
-name = "gpui_embedded"
-version = "0.1.0"
-edition = "2024"
-publish = false
-license = "Apache-2.0"
-description = "Experimental host for running GPUI-in-Wasm plugins embedded in a GPUI app"
-
-[lints]
-workspace = true
-
-[lib]
-path = "src/gpui_embedded.rs"
-
-[[bin]]
-name = "gpui_embedded_demo"
-path = "src/main.rs"
-
-[dependencies]
-anyhow = "1.0"
-env_logger = "0.11"
-futures = "0.3"
-# gpui is consumed straight from the zed repository. The branch carries the one
-# accessor the guest runtime needs (Application::app_cell); switch to main once
-# https://github.com/zed-industries/zed/tree/gpui-embedded-in-gpui merges.
-gpui = { git = "https://github.com/zed-industries/zed.git", branch = "gpui-embedded-in-gpui" }
-gpui_platform = { git = "https://github.com/zed-industries/zed.git", branch = "gpui-embedded-in-gpui", features = ["font-kit", "wayland", "x11"] }
-gpui_embedded_shared = { path = "shared" }
-image = "0.25"
-log = "0.4"
-serde = { version = "1.0", features = ["derive", "rc"] }
-smallvec = { version = "1.6", features = ["union", "const_new"] }
-wasmtime = { version = "36", default-features = false, features = [
-    "async",
-    "demangle",
-    "runtime",
-    "cranelift",
-    "component-model",
-    "incremental-cache",
-    "parallel-compilation",
-] }
-wasmtime-wasi = "36"
-
-[dev-dependencies]
-gpui = { git = "https://github.com/zed-industries/zed.git", branch = "gpui-embedded-in-gpui", features = ["test-support"] }
-rand = "0.9"
-
 # Wasm compilation is unusably slow when the compiler itself is unoptimized.
 [profile.dev.package.wasmtime]
 opt-level = 3
@@ -64,6 +23,7 @@ opt-level = 3
 [profile.dev.package.cranelift-codegen]
 opt-level = 3
 
+# Replicated from zed's workspace: patches do not propagate through git dependencies.
 [patch.crates-io]
 async-task = { git = "https://github.com/smol-rs/async-task.git", rev = "b4486cd71e4e94fbda54ce6302444de14f4d190e" }
 calloop = { git = "https://github.com/zed-industries/calloop" }

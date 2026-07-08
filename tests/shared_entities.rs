@@ -5,13 +5,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gpui::{App, AppContext as _, Context, Entity, Task, TestAppContext};
-use gpui_embedded::{HandleSharedAsync, PluginHost, PluginInstance, SharedEntitySource};
-use gpui_embedded_shared::encode;
-use gpui_embedded_shared::test_schema::{
+use embedded_gpui::encode;
+use embedded_gpui::test_schema::{
     Bump, ChameleonSpec, CreateItem, FactorySpec, GatekeeperSpec, Guard, ReadSecret,
     TestCounterSpec, TestIncrement, VaultSnapshot, VaultSpec,
 };
+use embedded_gpui::{HandleSharedAsync, PluginHost, PluginInstance, SharedEntitySource};
+use gpui::{App, AppContext as _, Context, Entity, Task, TestAppContext};
 use rand::prelude::*;
 
 /// Builds the test plugin once per process and returns the component path.

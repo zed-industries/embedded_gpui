@@ -1,0 +1,19 @@
+[package]
+name = "embedded_gpui_macros"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+description = "Proc macros for embedded_gpui shared-entity schemas"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/embedded_gpui_macros.rs"
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }

@@ -52,7 +52,18 @@ a later optimization.
   list from a previous session would replay wrong glyphs).
 - [ ] **Multi-plugin routing**: several stores behind one host, with the host
   routing shared-entity traffic between plugins (the id spaces already
-  anticipate this: guest-homed ids carry a high bit).
+  anticipate this: guest-homed ids carry a high bit; loopback routing is the
+  single-store special case of the same reflection logic). This is also the
+  inter-plugin API story: plugins never share memory, only routed messages.
+  Discovery is a host-homed registry entity - Wayland-style, its snapshot
+  lists (plugin, interface, version, ref) - and being listed is opt-in, so
+  discoverability is itself a capability. The only contract between two
+  cooperating plugins is a shared schema crate they both compiled against;
+  the host never needs to know the interface exists. Routing through the
+  host makes it the policy chokepoint: per-grant membranes, cross-plugin
+  audit, or powerbox-style user consent before a ref is forwarded. Depends
+  on tagged refs (id rewriting across plugin id-spaces, grant tracking) and
+  multi-subscriber homes.
 
 ## Advanced OCAPs
 

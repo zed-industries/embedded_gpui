@@ -28,6 +28,9 @@ changes; nothing here is a supported API yet.
   caretaker/membrane that wraps any capability with pass-through snapshots,
   method forwarding, and revocation.
 
+<img width="750" height="643" alt="Screenshot 2026-07-08 at 12 12 14 AM" src="https://github.com/user-attachments/assets/81d10dfa-bad7-4fb2-9385-5629880c11ca" />
+
+
 ## Embedding
 
 ```rust

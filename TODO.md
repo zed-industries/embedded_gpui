@@ -4,6 +4,31 @@ What's deliberately not built yet, in rough priority order. The spike's goal is
 to prove the architecture; these are the known gaps between "proven" and
 "product".
 
+## Views as replicated objects (the next big design step)
+
+Today views are addressed by name (`host.view("panel")`) over a dedicated
+scene channel. That has the same weakness names always have: surfaces that are
+*data* — a widget per buffer line, a decoration per diagnostic — can't be a
+naming convention. The unification: **renderability becomes a feature of a
+shared entity**. A home entity that implements `Render` replicates its display
+list the way snapshots replicate state, so its projection on the other side
+also implements `Render` and can be mounted anywhere in the element tree.
+
+- `view("panel")` dissolves into `remote::<PanelSpec>("panel")`; the named form
+  is just the named-mount special case.
+- Inline surfaces are anonymous renderable refs traveling in payloads:
+  `Vec<(BufferRow, SharedRef<InlayWidget>)>`, materialized and mounted by the
+  host wherever its own layout puts them.
+- Input flows backward along the same identity: mouse/key messages addressed to
+  the entity, not a view id. Each mount drives resize like a window, as today.
+- Composes with the OCAP layer for free: revoking a renderable ref unmounts it
+  everywhere; attenuating away input methods yields a render-only capability.
+
+Implementation notes for later: display lists want their own lane or delta
+encoding (they're big; don't ride the snapshot channel naively), the guest's
+one-window-per-view machinery needs a lighter "virtual window" for potentially
+hundreds of small surfaces, and focus routing across many mounts needs thought.
+
 ## Platform completeness
 
 - [ ] **Resource limits**: wasmtime epoch interruption for runaway plugins, store

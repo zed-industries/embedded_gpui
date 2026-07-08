@@ -36,9 +36,10 @@ pub(crate) use guest::{dispatcher, platform, text_system, window, wit};
 
 use serde::{Serialize, de::DeserializeOwned};
 
+#[doc(hidden)]
+pub use anyhow;
 pub use embedded_gpui_macros::shared_interface;
 pub use gpui;
-#[doc(hidden)]
 pub use serde;
 
 /// Identifies a kind of shared entity: a stable wire name plus the snapshot type its home

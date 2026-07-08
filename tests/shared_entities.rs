@@ -6,13 +6,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use embedded_gpui::encode;
-use embedded_gpui::{HandleSharedAsync, PluginHost, PluginInstance, SharedEntitySource, decode};
+use embedded_gpui::{PluginHost, PluginInstance, SharedEntitySource, decode};
 use embedded_gpui_util::{Attenuated, Audited};
 use gpui::{App, AppContext as _, Context, Entity, Task, TestAppContext};
 use rand::prelude::*;
 use test_schema::{
     Bump, ChameleonSpec, CreateItem, FactorySpec, GatekeeperSpec, Guard, ItemSnapshot, ItemSpec,
-    ProbeRequest, ReadSecret, TestCounterSpec, TestIncrement, VaultSnapshot, VaultSpec,
+    ProbeRequest, TestCounterSpec, TestIncrement, VaultApi, VaultApiCaller as _, VaultSnapshot,
+    VaultSpec, register_vault_api,
 };
 
 /// Builds the test plugin once per process and returns the component path.
@@ -163,12 +164,8 @@ impl SharedEntitySource<VaultSpec> for Vault {
     }
 }
 
-impl HandleSharedAsync<ReadSecret> for Vault {
-    fn handle(
-        &mut self,
-        _message: ReadSecret,
-        cx: &mut Context<Self>,
-    ) -> Task<anyhow::Result<String>> {
+impl VaultApi for Vault {
+    fn read(&mut self, cx: &mut Context<Self>) -> Task<anyhow::Result<String>> {
         let secret = self.secret.clone();
         cx.spawn(async move |_, cx| {
             cx.background_executor()
@@ -190,13 +187,7 @@ async fn test_caretaker_membrane_forwards_and_revokes(cx: &mut TestAppContext) {
         secret: "swordfish".to_string(),
     });
     let vault_ref = host.update(cx, |host, cx| {
-        host.share_anonymous::<VaultSpec, _>(
-            &vault,
-            |methods| {
-                methods.on_async::<ReadSecret>();
-            },
-            cx,
-        )
+        host.share_anonymous::<VaultSpec, _>(&vault, register_vault_api, cx)
     });
 
     // Hand the vault capability to the guest's gatekeeper; it wraps it in a caretaker
@@ -222,7 +213,7 @@ async fn test_caretaker_membrane_forwards_and_revokes(cx: &mut TestAppContext) {
 
     // A read crosses the boundary four times: host -> caretaker (guest) -> vault (host),
     // resolves in the vault's async handler, and unwinds back through the caretaker.
-    let read = cx.update(|cx| guarded.call(ReadSecret {}, cx));
+    let read = cx.update(|cx| guarded.read(cx));
     settle(cx);
     assert_eq!(read.await.expect("read through membrane"), "swordfish");
 
@@ -233,7 +224,7 @@ async fn test_caretaker_membrane_forwards_and_revokes(cx: &mut TestAppContext) {
     settle(cx);
     revoked.await.expect("revoke");
 
-    let read = cx.update(|cx| guarded.call(ReadSecret {}, cx));
+    let read = cx.update(|cx| guarded.read(cx));
     settle(cx);
     let error = read.await.expect_err("reads after revocation must fail");
     assert!(

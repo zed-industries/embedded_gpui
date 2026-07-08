@@ -27,8 +27,13 @@ use syn::{Expr, FnArg, Ident, ItemTrait, LitStr, MetaNameValue, Token, TraitItem
 ///   handlers that forward to the trait implementation.
 ///
 /// Method shape: `&mut self`, any number of serde-serializable arguments, and a final
-/// `cx: &mut Context<Self>` parameter. Async handlers still register manually via
-/// `Methods::on_async`.
+/// `cx: &mut Context<Self>` parameter.
+///
+/// Methods may be declared `async fn name(...) -> R`. The emitted trait method is
+/// rewritten to return `gpui::Task<anyhow::Result<R>>` (which is what implementors
+/// write and what `cx.spawn` produces); the response is sent when the task resolves,
+/// so the handler can await calls on other capabilities in between. Callers see the
+/// same `CallReceipt<R>` either way.
 #[proc_macro_attribute]
 pub fn shared_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = syn::parse_macro_input!(
@@ -48,6 +53,7 @@ struct Method {
     field_names: Vec<Ident>,
     field_types: Vec<Type>,
     response: proc_macro2::TokenStream,
+    is_async: bool,
 }
 
 fn expand(
@@ -91,17 +97,12 @@ fn expand(
     let trait_ident = item_trait.ident.clone();
 
     let mut methods = Vec::new();
-    for item in &item_trait.items {
+    for item in &mut item_trait.items {
         let TraitItem::Fn(function) = item else {
             continue;
         };
-        let sig = &function.sig;
-        if sig.asyncness.is_some() {
-            return Err(syn::Error::new(
-                sig.span(),
-                "async methods are not supported; register with Methods::on_async instead",
-            ));
-        }
+        let sig = &mut function.sig;
+        let is_async = sig.asyncness.take().is_some();
         let mut inputs = sig.inputs.iter();
         match inputs.next() {
             Some(FnArg::Receiver(receiver)) if receiver.mutability.is_some() => {}
@@ -140,6 +141,13 @@ fn expand(
             syn::ReturnType::Default => quote!(()),
             syn::ReturnType::Type(_, ty) => quote!(#ty),
         };
+        if is_async {
+            // The trait the implementor sees returns a task; asynchrony is explicit.
+            let output: Type = syn::parse_quote!(
+                embedded_gpui::gpui::Task<embedded_gpui::anyhow::Result<#response>>
+            );
+            sig.output = syn::parse_quote!(-> #output);
+        }
         let method_name = sig.ident.to_string();
         methods.push(Method {
             ident: sig.ident.clone(),
@@ -148,6 +156,7 @@ fn expand(
             field_names,
             field_types,
             response,
+            is_async,
         });
     }
 
@@ -201,16 +210,37 @@ fn expand(
             message_ident,
             method_name,
             field_names,
+            is_async,
             ..
         } = method;
-        quote! {
-            methods.on_raw(#method_name, |entity, _method, payload, cx| {
-                let message: #message_ident = embedded_gpui::decode(payload)?;
-                let response = entity.update(cx, |this, cx| {
-                    <T as #trait_ident>::#ident(this, #(message.#field_names,)* cx)
+        if *is_async {
+            quote! {
+                methods.on_raw_async(#method_name, |entity, _method, payload, cx| {
+                    let task = (|| {
+                        let message: #message_ident = embedded_gpui::decode(payload)?;
+                        embedded_gpui::anyhow::Ok(entity.update(cx, |this, cx| {
+                            <T as #trait_ident>::#ident(this, #(message.#field_names,)* cx)
+                        }))
+                    })();
+                    match task {
+                        Ok(task) => cx.spawn(async move |_| {
+                            let response = task.await?;
+                            embedded_gpui::encode(&response)
+                        }),
+                        Err(error) => embedded_gpui::gpui::Task::ready(Err(error)),
+                    }
                 });
-                embedded_gpui::encode(&response)
-            });
+            }
+        } else {
+            quote! {
+                methods.on_raw(#method_name, |entity, _method, payload, cx| {
+                    let message: #message_ident = embedded_gpui::decode(payload)?;
+                    let response = entity.update(cx, |this, cx| {
+                        <T as #trait_ident>::#ident(this, #(message.#field_names,)* cx)
+                    });
+                    embedded_gpui::encode(&response)
+                });
+            }
         }
     });
 

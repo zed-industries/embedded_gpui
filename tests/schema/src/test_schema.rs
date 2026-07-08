@@ -23,11 +23,17 @@ embedded_gpui::shared_schema! {
     }
 }
 
-embedded_gpui::shared_schema! {
-    entity VaultSpec as "test.vault" {
-        snapshot VaultSnapshot { label: String }
-        message "read" ReadSecret {} -> String
-    }
+#[derive(Clone, Debug, embedded_gpui::serde::Serialize, embedded_gpui::serde::Deserialize)]
+#[serde(crate = "embedded_gpui::serde")]
+pub struct VaultSnapshot {
+    pub label: String,
+}
+
+/// Declared with an `async fn`: the macro rewrites the trait method to return a
+/// `Task<Result<String>>`, and the response flows when the task resolves.
+#[embedded_gpui::shared_interface(spec = VaultSpec, type_name = "test.vault", snapshot = VaultSnapshot)]
+pub trait VaultApi {
+    async fn read(&mut self, cx: &mut gpui::Context<Self>) -> String;
 }
 
 embedded_gpui::shared_schema! {

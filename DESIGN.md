@@ -88,6 +88,39 @@ Run it:
 cargo run -p example_host
 ```
 
+## Why two type systems? (WIT and the object model)
+
+A fair question: the WIT interface is a type system, and the shared-entity schema layer
+is another. Why both? Because they type different things, with opposite change profiles:
+
+- **WIT is the syscall boundary** — display lists, input, text shaping, scheduling, and
+  the handful of functions that move opaque entity traffic. It changes when the
+  *platform* changes: rarely, owned by one team, with hard commitments (a signature
+  mismatch fails instantiation outright). That hardness is right for the substrate and
+  wrong for an app API. Note the WIT here is already almost entirely machine protocol;
+  the whole object model rides on eight small functions with opaque payloads.
+- **The object model is userspace** — the evolving semantic surface (what a host app
+  exposes, what plugins expose to each other), with soft, runtime-negotiated
+  commitments: unknown methods fail as handleable errors, new snapshot fields default,
+  a plugin built against an old schema degrades at specific calls instead of failing to
+  load. Evolution is a library release, not a flag day: old and new methods are just
+  entries in the same dispatch table. Wayland-style version negotiation is expressible
+  as a plain shared entity (a registry whose snapshot lists interface/version/ref) —
+  the two Wayland primitives already exist here as names (globals) and refs (objects).
+
+Two things the static layer structurally cannot express, which is why "just put it all
+in WIT" loses: **capability semantics** (WIT imports are ambient and identical for every
+plugin; per-plugin grants, attenuation, revocation, and refs minted at runtime require
+the dynamic layer) and **ecosystem growth** (two plugins agreeing on a new interface via
+a shared schema crate, without the host knowing or any world recompilation).
+
+The honest trade: dynamic calls are slower than generated WIT functions (serde plus
+string dispatch). The split encodes the rule — hot or foundational goes in WIT (display
+lists, input, text: already there), evolving semantics go through objects — and since
+the object wire is just bytes, encodings are swappable and any method that gets hot can
+be promoted into WIT. Precedents for the two-layer shape: syscalls vs. D-Bus, TCP vs.
+HTTP APIs, Wayland's fixed wire vs. versioned interfaces.
+
 ## Shared entities
 
 Entities cannot literally cross the boundary (separate linear memories, separately compiled

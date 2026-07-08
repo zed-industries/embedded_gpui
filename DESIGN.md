@@ -121,6 +121,30 @@ the object wire is just bytes, encodings are swappable and any method that gets 
 be promoted into WIT. Precedents for the two-layer shape: syscalls vs. D-Bus, TCP vs.
 HTTP APIs, Wayland's fixed wire vs. versioned interfaces.
 
+## Performance philosophy
+
+The design picks slow-and-flexible only where humans are the clock, and
+fast-and-static where the GPU is the clock:
+
+- **The frame path contains none of the flexible machinery.** A quiescent plugin costs
+  ~nothing per frame: the host replays a retained display list through gpui's normal
+  paint path — no wasm call, no serialization, no dispatch. Animating views cost one
+  wasm render plus one binary display-list ship per *dirty* frame. Pixels, text, and
+  input never touch JSON or string dispatch.
+- **The control path is slow only by hot-loop standards.** A shared-entity call is
+  serde_json on a small payload, a HashMap method lookup, and a few executor turns of
+  queueing — unmeasurable at human interaction rates, and far cheaper than the
+  inter-process JSON-RPC that the largest existing extension ecosystem (VS Code) runs
+  on without anyone feeling it.
+- **Every flexible choice has a named escape hatch.** The wire is bytes, so the payload
+  encoding is swappable per schema (bincode when JSON shows up in a profile); chatty
+  state gets delta sync (see TODO); anything genuinely hot can be promoted into a WIT
+  function; large surfaces get per-region damage tracking. Flexibility was never bought
+  in a way that forecloses speed.
+- **Known risks, ranked**: display-list volume for large animated views, serde_json
+  under chatty state, and turn-taking latency in deep synchronous call chains. All are
+  "optimize when observed"; none are architectural.
+
 ## Shared entities
 
 Entities cannot literally cross the boundary (separate linear memories, separately compiled

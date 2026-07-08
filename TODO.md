@@ -58,8 +58,11 @@ a later optimization.
   so the wire grows one flag (`Full | Delta`, Full on subscribe/desync) and
   schemas grow an opt-in delta representation — with keyed-collection sugar
   (`SharedCollection<K, V>` with per-key patches) covering most real cases
-  instead of a general diff trait. Read-your-writes is untouched. Buffer-like
-  shared state would need op-based sync instead, as a dedicated interface.
+  instead of a general diff trait. Read-your-writes is untouched. Note that
+  state-diffs self-coalesce: diffing against the last *acked* state means one
+  delta regardless of how many notifies elapsed, so there is no N-deltas
+  backlog problem; only op-log sync (the buffer-like case, a dedicated
+  interface if ever needed) accumulates and would want streaming.
 - [ ] **Multi-plugin routing**: several stores behind one host, with the host
   routing shared-entity traffic between plugins (the id spaces already
   anticipate this: guest-homed ids carry a high bit; loopback routing is the

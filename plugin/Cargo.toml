@@ -1,0 +1,27 @@
+[package]
+name = "gpui_plugin"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+description = "Guest-side GPUI platform that renders over the gpui:embedded WIT protocol"
+
+# Deliberately not part of the root workspace: this crate is only meaningful when compiled
+# to wasm32-wasip2 as part of a plugin component.
+[workspace]
+
+[lib]
+path = "src/gpui_plugin.rs"
+
+[dependencies]
+anyhow = "1.0"
+futures = "0.3"
+gpui = { git = "https://github.com/zed-industries/zed.git", branch = "gpui-embedded-in-gpui", default-features = false }
+gpui_embedded_shared = { path = "../shared" }
+log = "0.4"
+raw-window-handle = "0.6"
+uuid = "1"
+wit-bindgen = "0.41"
+
+[patch.crates-io]
+async-task = { git = "https://github.com/smol-rs/async-task.git", rev = "b4486cd71e4e94fbda54ce6302444de14f4d190e" }

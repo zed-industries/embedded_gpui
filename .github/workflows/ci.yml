@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: Check, lint, and test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      # rustup installs the toolchain + targets pinned in rust-toolchain.toml
+      - name: Install toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            example/plugin
+            tests/test_plugin
+      - name: Format
+        run: |
+          cargo fmt --all --check
+          cargo fmt --check --manifest-path example/plugin/Cargo.toml
+          cargo fmt --check --manifest-path tests/test_plugin/Cargo.toml
+      - name: Clippy (native)
+        run: cargo clippy --workspace --all-targets -- --deny warnings
+      - name: Clippy (wasm)
+        run: |
+          cargo clippy -p embedded_gpui --target wasm32-wasip2 -- --deny warnings
+          cargo clippy --manifest-path example/plugin/Cargo.toml --target wasm32-wasip2 -- --deny warnings
+          cargo clippy --manifest-path tests/test_plugin/Cargo.toml --target wasm32-wasip2 -- --deny warnings
+      - name: Test
+        run: cargo test -p tests -- --test-threads 1

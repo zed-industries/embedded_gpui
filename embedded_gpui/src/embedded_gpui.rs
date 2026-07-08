@@ -18,6 +18,7 @@
 extern crate self as embedded_gpui;
 
 /// Guest-homed entity ids set the high bit so the two sides' id spaces never collide.
+#[cfg(target_arch = "wasm32")]
 pub(crate) const GUEST_HOME_BIT: u64 = 1 << 63;
 
 #[cfg(not(target_arch = "wasm32"))]

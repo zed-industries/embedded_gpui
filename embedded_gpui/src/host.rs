@@ -15,6 +15,8 @@ use crate::{
     SharedEntitySource, SharedMessage, SharedProjection, SharedRef, SharedSpec,
 };
 use anyhow::{Context as _, Result};
+use futures::StreamExt as _;
+use futures::channel::mpsc;
 use gpui::{
     AppContext as _, Context, Entity, Pixels, PlatformTextSystem, Size, Task, WeakEntity, px,
 };
@@ -601,8 +603,69 @@ fn extent_from_size(size: Size<Pixels>) -> bindings::Extent {
 /// Images shipped by the guest, cached per instance and shared by all of its views.
 pub type PluginImages = Rc<RefCell<HashMap<u64, Arc<gpui::RenderImage>>>>;
 
+/// One call into the guest, queued for the background worker that owns the store.
+enum PluginRequest {
+    Init,
+    CreateView {
+        view_id: u32,
+        size: Size<Pixels>,
+        scale: f32,
+    },
+    ResizeView {
+        view_id: u32,
+        size: Size<Pixels>,
+        scale: f32,
+    },
+    HandleMouse {
+        view_id: u32,
+        event: bindings::MouseEvent,
+    },
+    HandleKey {
+        view_id: u32,
+        event: bindings::KeyEvent,
+    },
+    Tick,
+    AnnounceSharedEntity(bindings::SharedEntityAnnouncement),
+    DeliverSharedMessage(bindings::SharedMessage),
+    DeliverSharedSnapshot(bindings::SharedSnapshot),
+    DeliverSharedResponse(bindings::SharedResponse),
+}
+
+impl PluginInstance {
+    fn handle(&mut self, request: PluginRequest) -> Result<Effects> {
+        match request {
+            PluginRequest::Init => self.init(),
+            PluginRequest::CreateView {
+                view_id,
+                size,
+                scale,
+            } => self.create_view(view_id, size, scale),
+            PluginRequest::ResizeView {
+                view_id,
+                size,
+                scale,
+            } => self.resize_view(view_id, size, scale),
+            PluginRequest::HandleMouse { view_id, event } => self.handle_mouse(view_id, event),
+            PluginRequest::HandleKey { view_id, event } => self.handle_key(view_id, event),
+            PluginRequest::Tick => self.tick(),
+            PluginRequest::AnnounceSharedEntity(announcement) => {
+                self.announce_shared_entity(&announcement)
+            }
+            PluginRequest::DeliverSharedMessage(message) => self.deliver_shared_message(&message),
+            PluginRequest::DeliverSharedSnapshot(snapshot) => {
+                self.deliver_shared_snapshot(&snapshot)
+            }
+            PluginRequest::DeliverSharedResponse(response) => {
+                self.deliver_shared_response(&response)
+            }
+        }
+    }
+}
+
 pub struct PluginHost {
-    instance: Rc<RefCell<PluginInstance>>,
+    /// Requests to the background worker that owns the wasmtime store. FIFO: the worker
+    /// processes one call at a time, and each call's effects come back in order.
+    requests: mpsc::UnboundedSender<PluginRequest>,
     views: HashMap<u32, Entity<PluginViewState>>,
     images: PluginImages,
     shared: shared_entities::HostShared,
@@ -611,12 +674,45 @@ pub struct PluginHost {
     pending_releases: Rc<RefCell<Vec<String>>>,
     release_guards: HashMap<String, std::rc::Weak<HostReleaseGuard>>,
     scheduled_tick: Option<Task<()>>,
+    _worker: Task<()>,
+    _pump: Task<()>,
 }
 
 impl PluginHost {
-    pub fn new(instance: PluginInstance) -> Self {
+    /// Move `instance` onto a background worker and wire the effect pump. A slow or
+    /// misbehaving guest can no longer stall the UI thread: calls into wasm happen on
+    /// the worker, strictly one at a time, and their effects are applied back on the
+    /// foreground in the same order.
+    pub fn new(mut instance: PluginInstance, cx: &mut Context<Self>) -> Self {
+        let (requests, mut request_rx) = mpsc::unbounded::<PluginRequest>();
+        let (effects_tx, mut effects_rx) = mpsc::unbounded::<Effects>();
+
+        let worker = cx.background_spawn(async move {
+            while let Some(request) = request_rx.next().await {
+                match instance.handle(request) {
+                    Ok(effects) => {
+                        if effects_tx.unbounded_send(effects).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => log::error!("embedded_gpui: plugin call failed: {error:#}"),
+                }
+            }
+        });
+
+        let pump = cx.spawn(async move |host, cx| {
+            while let Some(effects) = effects_rx.next().await {
+                if host
+                    .update(cx, |host, cx| host.apply_effects(effects, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
         Self {
-            instance: Rc::new(RefCell::new(instance)),
+            requests,
             views: HashMap::new(),
             images: PluginImages::default(),
             shared: shared_entities::HostShared::default(),
@@ -624,6 +720,14 @@ impl PluginHost {
             pending_releases: Rc::default(),
             release_guards: HashMap::new(),
             scheduled_tick: None,
+            _worker: worker,
+            _pump: pump,
+        }
+    }
+
+    fn enqueue(&self, request: PluginRequest) {
+        if self.requests.unbounded_send(request).is_err() {
+            log::error!("embedded_gpui: plugin worker is gone; dropping request");
         }
     }
 
@@ -675,17 +779,7 @@ impl PluginHost {
             type_name: S::TYPE_NAME.to_string(),
             name,
         };
-        let result = self
-            .instance
-            .borrow_mut()
-            .announce_shared_entity(&announcement);
-        match result {
-            Ok(effects) => self.apply_effects(effects, cx),
-            Err(error) => log::error!(
-                "embedded_gpui: announcing shared entity {:?} failed: {error:#}",
-                announcement.name
-            ),
-        }
+        self.enqueue(PluginRequest::AnnounceSharedEntity(announcement));
         self.publish_home(entity_id, cx);
     }
 
@@ -895,19 +989,13 @@ impl PluginHost {
             let snapshot_fn = home.snapshot_fn.clone();
             match snapshot_fn(cx) {
                 Ok(payload) => {
-                    let result = self.instance.borrow_mut().deliver_shared_snapshot(
-                        &bindings::SharedSnapshot {
+                    self.enqueue(PluginRequest::DeliverSharedSnapshot(
+                        bindings::SharedSnapshot {
                             entity_id,
                             acked_sequence,
                             payload,
                         },
-                    );
-                    match result {
-                        Ok(effects) => self.apply_effects(effects, cx),
-                        Err(error) => log::error!(
-                            "embedded_gpui: delivering shared snapshot failed: {error:#}"
-                        ),
-                    }
+                    ));
                 }
                 Err(error) => {
                     log::error!("embedded_gpui: failed to encode shared snapshot: {error:#}")
@@ -932,22 +1020,17 @@ impl PluginHost {
         &mut self,
         entity_id: u64,
         send: shared_entities::PendingSend,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) {
-        let result = self
-            .instance
-            .borrow_mut()
-            .deliver_shared_message(&bindings::SharedMessage {
+        self.enqueue(PluginRequest::DeliverSharedMessage(
+            bindings::SharedMessage {
                 entity_id,
                 sequence: send.sequence,
                 request_id: send.request_id,
                 method: send.method,
                 payload: send.payload,
-            });
-        match result {
-            Ok(effects) => self.apply_effects(effects, cx),
-            Err(error) => log::error!("embedded_gpui: delivering shared message failed: {error:#}"),
-        }
+            },
+        ));
     }
 
     fn send_to_guest(
@@ -987,12 +1070,8 @@ impl PluginHost {
         }
     }
 
-    pub fn init(&mut self, cx: &mut Context<Self>) {
-        let result = self.instance.borrow_mut().init();
-        match result {
-            Ok(effects) => self.apply_effects(effects, cx),
-            Err(error) => log::error!("embedded_gpui: plugin init failed: {error:#}"),
-        }
+    pub fn init(&mut self, _cx: &mut Context<Self>) {
+        self.enqueue(PluginRequest::Init);
     }
 
     pub fn create_view(
@@ -1006,12 +1085,11 @@ impl PluginHost {
         let images = self.images.clone();
         let view = cx.new(|cx| PluginViewState::new(view_id, size, host, images, cx));
         self.views.insert(view_id, view.clone());
-
-        let result = self.instance.borrow_mut().create_view(view_id, size, scale);
-        match result {
-            Ok(effects) => self.apply_effects(effects, cx),
-            Err(error) => log::error!("embedded_gpui: create_view({view_id}) failed: {error:#}"),
-        }
+        self.enqueue(PluginRequest::CreateView {
+            view_id,
+            size,
+            scale,
+        });
         view
     }
 
@@ -1020,42 +1098,30 @@ impl PluginHost {
         view_id: u32,
         size: Size<Pixels>,
         scale: f32,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) {
-        let result = self.instance.borrow_mut().resize_view(view_id, size, scale);
-        match result {
-            Ok(effects) => self.apply_effects(effects, cx),
-            Err(error) => log::error!("embedded_gpui: resize_view({view_id}) failed: {error:#}"),
-        }
+        self.enqueue(PluginRequest::ResizeView {
+            view_id,
+            size,
+            scale,
+        });
     }
 
     pub fn handle_mouse(
         &mut self,
         view_id: u32,
         event: bindings::MouseEvent,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) {
-        let result = self.instance.borrow_mut().handle_mouse(view_id, event);
-        match result {
-            Ok(effects) => self.apply_effects(effects, cx),
-            Err(error) => log::error!("embedded_gpui: handle_mouse({view_id}) failed: {error:#}"),
-        }
+        self.enqueue(PluginRequest::HandleMouse { view_id, event });
     }
 
-    pub fn handle_key(&mut self, view_id: u32, event: bindings::KeyEvent, cx: &mut Context<Self>) {
-        let result = self.instance.borrow_mut().handle_key(view_id, event);
-        match result {
-            Ok(effects) => self.apply_effects(effects, cx),
-            Err(error) => log::error!("embedded_gpui: handle_key({view_id}) failed: {error:#}"),
-        }
+    pub fn handle_key(&mut self, view_id: u32, event: bindings::KeyEvent, _cx: &mut Context<Self>) {
+        self.enqueue(PluginRequest::HandleKey { view_id, event });
     }
 
-    fn tick(&mut self, cx: &mut Context<Self>) {
-        let result = self.instance.borrow_mut().tick();
-        match result {
-            Ok(effects) => self.apply_effects(effects, cx),
-            Err(error) => log::error!("embedded_gpui: tick failed: {error:#}"),
-        }
+    fn tick(&mut self, _cx: &mut Context<Self>) {
+        self.enqueue(PluginRequest::Tick);
     }
 
     fn apply_effects(&mut self, effects: Effects, cx: &mut Context<Self>) {
@@ -1115,13 +1181,10 @@ impl PluginHost {
                                 host.publish_home(entity_id, cx);
                             }
                             if let Some(request_id) = request_id {
-                                host.deliver_response_to_guest(
-                                    bindings::SharedResponse {
-                                        request_id,
-                                        outcome,
-                                    },
-                                    cx,
-                                );
+                                host.deliver_response_to_guest(bindings::SharedResponse {
+                                    request_id,
+                                    outcome,
+                                });
                             }
                         })
                         .ok();
@@ -1153,14 +1216,11 @@ impl PluginHost {
             if let Some(request_id) = message.request_id {
                 let host = cx.weak_entity();
                 cx.defer(move |cx| {
-                    host.update(cx, |host, cx| {
-                        host.deliver_response_to_guest(
-                            bindings::SharedResponse {
-                                request_id,
-                                outcome,
-                            },
-                            cx,
-                        );
+                    host.update(cx, |host, _cx| {
+                        host.deliver_response_to_guest(bindings::SharedResponse {
+                            request_id,
+                            outcome,
+                        });
                     })
                     .ok();
                 });
@@ -1198,21 +1258,8 @@ impl PluginHost {
         }
     }
 
-    fn deliver_response_to_guest(
-        &mut self,
-        response: bindings::SharedResponse,
-        cx: &mut Context<Self>,
-    ) {
-        let result = self
-            .instance
-            .borrow_mut()
-            .deliver_shared_response(&response);
-        match result {
-            Ok(effects) => self.apply_effects(effects, cx),
-            Err(error) => {
-                log::error!("embedded_gpui: delivering shared response failed: {error:#}")
-            }
-        }
+    fn deliver_response_to_guest(&mut self, response: bindings::SharedResponse) {
+        self.enqueue(PluginRequest::DeliverSharedResponse(response));
     }
 
     fn apply_guest_snapshot(&mut self, snapshot: bindings::SharedSnapshot, cx: &mut Context<Self>) {

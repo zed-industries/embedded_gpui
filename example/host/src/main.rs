@@ -104,7 +104,7 @@ fn main() {
                     accent_hue: 0.58,
                     last_toast: None,
                 });
-                let host = cx.new(|_| PluginHost::new(instance));
+                let host = cx.new(|cx| PluginHost::new(instance, cx));
                 let (view0, view1, typed_text, palette) = host.update(cx, |host, cx| {
                     host.init(cx);
                     host.share(

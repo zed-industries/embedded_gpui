@@ -37,9 +37,11 @@ app alive and re-enter it whenever the external run loop yields control).
 1. **The host never calls into the guest synchronously from the frame path.** The guest
    renders when *it* is ticked; output is a retained display list the host caches in an
    entity and replays cheaply every host frame.
-2. **All calls into the guest happen from host foreground tasks or event handlers** (spike
-   simplification; a real integration would move the store to a background thread like
-   `extension_host` does). Guest calls are cheap; the guest must not block.
+2. **The wasmtime store lives on a background worker.** The host never calls wasm from
+   the UI thread: every interaction is a queued request to the worker that owns the
+   store (strictly one call at a time), and each call's effects are applied back on the
+   foreground in the same order. A slow or hung plugin cannot stall the UI; FIFO
+   request/effect pairing preserves all ordering guarantees below.
 3. **Re-entrancy is forbidden by the component model.** Guest imports (`request-tick`,
    `update-scene`, …) must NOT call back into the guest. Host import implementations only
    mutate state on the wasmtime `Store`'s data; the host drains that pending state after

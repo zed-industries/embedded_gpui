@@ -46,7 +46,7 @@ fn setup(cx: &mut TestAppContext) -> Entity<PluginHost> {
         PluginInstance::new(&path, Arc::new(gpui::NoopTextSystem::new()))
             .expect("failed to instantiate test plugin")
     });
-    let host = cx.new(|_| PluginHost::new(instance));
+    let host = cx.new(|cx| PluginHost::new(instance, cx));
     host.update(cx, |host, cx| host.init(cx));
     host
 }

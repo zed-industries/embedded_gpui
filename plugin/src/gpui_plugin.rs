@@ -22,10 +22,10 @@ pub(crate) mod wit {
 }
 
 use gpui::{
-    AnyView, App, AppCell, Application, AssetSource, AsyncApp, Bounds, KeyDownEvent, KeyUpEvent,
-    Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput, Point,
-    Render, ScrollDelta, ScrollWheelEvent, SharedString, Window, WindowBounds, WindowOptions, div,
-    point, prelude::*, px, size,
+    AnyView, App, Application, ApplicationHandle, AssetSource, AsyncApp, Bounds, KeyDownEvent,
+    KeyUpEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    PlatformInput, Point, Render, ScrollDelta, ScrollWheelEvent, SharedString, Window,
+    WindowBounds, WindowOptions, div, point, prelude::*, px, size,
 };
 use platform::PluginPlatform;
 use std::cell::RefCell;
@@ -67,7 +67,7 @@ macro_rules! register_plugin {
 struct Runtime {
     // Keeps the guest App alive: PluginPlatform::run returns immediately, so unlike native
     // platforms nothing on the stack owns the app after launch.
-    _app_cell: Rc<AppCell>,
+    _app: ApplicationHandle,
     async_app: AsyncApp,
     platform: Rc<PluginPlatform>,
     plugin: SharedPlugin,
@@ -102,17 +102,26 @@ pub fn initialize(
     if let Some(assets) = assets {
         application = application.with_assets(PluginAssets(assets));
     }
-    let app_cell = application.app_cell();
     let platform_for_runtime = platform.clone();
-    application.run(move |cx| {
-        let plugin = build_plugin(cx);
-        RUNTIME.with(|slot| {
-            *slot.borrow_mut() = Some(Runtime {
-                _app_cell: app_cell,
-                async_app: cx.to_async(),
-                platform: platform_for_runtime,
-                plugin: Rc::new(RefCell::new(plugin)),
-            });
+    let plugin_slot: Rc<RefCell<Option<SharedPlugin>>> = Rc::default();
+    let handle = application.run_embedded({
+        let plugin_slot = plugin_slot.clone();
+        move |cx| {
+            let plugin = build_plugin(cx);
+            *plugin_slot.borrow_mut() = Some(Rc::new(RefCell::new(plugin)));
+        }
+    });
+    let async_app = handle.to_async();
+    let plugin = plugin_slot
+        .borrow_mut()
+        .take()
+        .expect("Platform::run must invoke the launch callback synchronously");
+    RUNTIME.with(|slot| {
+        *slot.borrow_mut() = Some(Runtime {
+            _app: handle,
+            async_app,
+            platform: platform_for_runtime,
+            plugin,
         });
     });
 }

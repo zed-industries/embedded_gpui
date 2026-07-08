@@ -11,7 +11,9 @@ use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn to_wit_glyph_params(params: &RenderGlyphParams) -> wit::GlyphParams {
@@ -265,7 +267,10 @@ impl PluginAtlas {
 
     /// The wire payload id for a full-color bitmap tile.
     pub fn bitmap_payload(&self, tile_id: u32) -> Option<u64> {
-        lock(&self.state).bitmaps.get(&tile_id).map(|tile| tile.payload_id)
+        lock(&self.state)
+            .bitmaps
+            .get(&tile_id)
+            .map(|tile| tile.payload_id)
     }
 
     /// The wire payload id for an alpha-mask tile tinted with `color`. The first request per
@@ -311,7 +316,11 @@ impl PluginAtlas {
     }
 }
 
-fn fabricate_tile(state: &mut AtlasState, kind: AtlasTextureKind, size: Size<DevicePixels>) -> AtlasTile {
+fn fabricate_tile(
+    state: &mut AtlasState,
+    kind: AtlasTextureKind,
+    size: Size<DevicePixels>,
+) -> AtlasTile {
     let sequence = state.next_id;
     state.next_id += 1;
     AtlasTile {

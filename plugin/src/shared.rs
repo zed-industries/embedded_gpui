@@ -174,9 +174,9 @@ pub fn remote_from_ref<S: SharedSpec>(reference: SharedRef<S>, cx: &mut App) -> 
                     _guard: Some(guard),
                 };
             }
-            Err(_) => log::error!(
-                "gpui_plugin: ref {entity_id} materialized twice with different specs"
-            ),
+            Err(_) => {
+                log::error!("gpui_plugin: ref {entity_id} materialized twice with different specs")
+            }
         }
     }
 
@@ -549,7 +549,10 @@ pub(crate) fn snapshot_delivered(snapshot: wit::SharedSnapshot, cx: &mut AsyncAp
     });
     let result = match apply_snapshot {
         Some(apply_snapshot) => apply_snapshot(&snapshot.payload, cx),
-        None => Err(anyhow!("snapshot for unknown entity {}", snapshot.entity_id)),
+        None => Err(anyhow!(
+            "snapshot for unknown entity {}",
+            snapshot.entity_id
+        )),
     };
     if let Err(error) = result {
         log::error!("gpui_plugin: failed to apply shared snapshot: {error:#}");
@@ -560,7 +563,10 @@ pub(crate) fn snapshot_delivered(snapshot: wit::SharedSnapshot, cx: &mut AsyncAp
     // the update above is what makes awaiting a send read-your-writes.
     let acked = REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
-        let name = registry.names_by_entity_id.get(&snapshot.entity_id)?.clone();
+        let name = registry
+            .names_by_entity_id
+            .get(&snapshot.entity_id)?
+            .clone();
         let entry = registry.projections_by_name.get_mut(&name)?;
         let mut acked = Vec::new();
         entry.pending_acks.retain_mut(|(sequence, sender)| {

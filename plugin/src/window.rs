@@ -260,10 +260,7 @@ impl PlatformWindow for PluginWindow {
 
     fn on_should_close(&self, _callback: Box<dyn FnMut() -> bool>) {}
 
-    fn on_hit_test_window_control(
-        &self,
-        _callback: Box<dyn FnMut() -> Option<WindowControlArea>>,
-    ) {
+    fn on_hit_test_window_control(&self, _callback: Box<dyn FnMut() -> Option<WindowControlArea>>) {
     }
 
     fn on_close(&self, _callback: Box<dyn FnOnce()>) {}
@@ -351,10 +348,10 @@ fn serialize_scene(scene: &Scene, scale_factor: f32, atlas: &PluginAtlas) -> wit
             );
             continue;
         }
-        let offset_x = (shadow.bounds.center().x.0 - shadow.element_bounds.center().x.0)
-            * inverse_scale;
-        let offset_y = (shadow.bounds.center().y.0 - shadow.element_bounds.center().y.0)
-            * inverse_scale;
+        let offset_x =
+            (shadow.bounds.center().x.0 - shadow.element_bounds.center().x.0) * inverse_scale;
+        let offset_y =
+            (shadow.bounds.center().y.0 - shadow.element_bounds.center().y.0) * inverse_scale;
         let spread = ((shadow.bounds.size.width.0 - shadow.element_bounds.size.width.0) / 2.0
             - shadow.blur_radius.0)
             * inverse_scale;
@@ -418,8 +415,7 @@ fn serialize_scene(scene: &Scene, scale_factor: f32, atlas: &PluginAtlas) -> wit
             // A monochrome non-glyph sprite is a guest-rasterized SVG alpha mask: bake the
             // tint color in and ship it as an image.
             Some(TileContent::AlphaMask) => {
-                if let Some(payload_id) =
-                    atlas.tinted_payload(sprite.tile.tile_id.0, sprite.color)
+                if let Some(payload_id) = atlas.tinted_payload(sprite.tile.tile_id.0, sprite.color)
                 {
                     primitives.push(wit::PlacedPrimitive {
                         order: sprite.order,

@@ -50,6 +50,16 @@ a later optimization.
 - [ ] **Atlas hygiene**: image/SVG payloads are cached per instance and never
   evicted; `FontId`s are host-global and session-scoped (a persisted display
   list from a previous session would replay wrong glyphs).
+- [ ] **Delta sync**: snapshots ship whole-state per notify — right for small
+  states (idempotent, self-healing, zero per-type work), wasteful for large
+  collections with small churn and for the renderable-entity display lists.
+  The upgrade is cheap when needed: `published_ack` already tells the home
+  exactly which state the replica holds (the hard part of diffing safely),
+  so the wire grows one flag (`Full | Delta`, Full on subscribe/desync) and
+  schemas grow an opt-in delta representation — with keyed-collection sugar
+  (`SharedCollection<K, V>` with per-key patches) covering most real cases
+  instead of a general diff trait. Read-your-writes is untouched. Buffer-like
+  shared state would need op-based sync instead, as a dedicated interface.
 - [ ] **Multi-plugin routing**: several stores behind one host, with the host
   routing shared-entity traffic between plugins (the id spaces already
   anticipate this: guest-homed ids carry a high bit; loopback routing is the

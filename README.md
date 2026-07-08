@@ -54,3 +54,7 @@ cargo test --test shared_entities -- --test-threads 1   # protocol tests
 
 GPUI is consumed as a git dependency on the zed repository (the
 `gpui-embedded-in-gpui` branch until the small upstream hook it needs merges).
+
+## License
+
+Apache 2.0, like GPUI itself — see [LICENSE-APACHE](LICENSE-APACHE).

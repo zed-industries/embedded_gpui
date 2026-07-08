@@ -15,7 +15,7 @@ use std::rc::{Rc, Weak};
 
 pub use gpui_embedded_shared::{
     CallReceipt, HandleShared, HandleSharedAsync, Methods, RawCallReceipt, SendReceipt,
-    SharedEntitySource, SharedProjection, SharedRef,
+    SharedCaller, SharedEntitySource, SharedProjection, SharedRef,
 };
 
 /// Guest-homed entity ids have the high bit set so they can never collide with host-minted
@@ -274,6 +274,35 @@ impl<S: SharedSpec> Remote<S> {
                 CallReceipt::dropped()
             }
         }
+    }
+}
+
+// The guest's registry is thread-local, so no context is needed; the `cx` parameters
+// exist for signature parity with the host side.
+impl<S: SharedSpec> SharedCaller<S> for Remote<S> {
+    fn shared_replica(&self) -> &Entity<SharedProjection<S::Snapshot>> {
+        self.replica()
+    }
+
+    fn send_shared<M: SharedMessage<Spec = S>>(&self, message: M, _cx: &mut App) -> SendReceipt {
+        self.send(message)
+    }
+
+    fn call_shared<M: SharedMessage<Spec = S>>(
+        &self,
+        message: M,
+        _cx: &mut App,
+    ) -> CallReceipt<M::Response> {
+        self.call(message)
+    }
+
+    fn forward_shared(
+        &self,
+        method: &str,
+        payload: Vec<u8>,
+        _cx: &mut App,
+    ) -> RawCallReceipt {
+        self.forward(method, payload)
     }
 }
 

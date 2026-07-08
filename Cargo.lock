@@ -1785,6 +1785,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
 
 [[package]]
+name = "embedded_gpui_utils"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gpui",
+ "gpui_embedded_shared",
+]
+
+[[package]]
 name = "encoding_rs"
 version = "0.8.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2529,8 +2538,18 @@ dependencies = [
  "anyhow",
  "futures",
  "gpui",
+ "gpui_embedded_shared_macros",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "gpui_embedded_shared_macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

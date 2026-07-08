@@ -18,6 +18,8 @@ use serde::{Serialize, de::DeserializeOwned};
 
 #[doc(hidden)]
 pub use serde;
+pub use gpui;
+pub use gpui_embedded_shared_macros::shared_interface;
 
 /// Identifies a kind of shared entity: a stable wire name plus the snapshot type its home
 /// publishes to projections.
@@ -229,6 +231,35 @@ impl std::future::Future for SendReceipt {
 
 /// The sending half backing a [`CallReceipt`]: the serialized response or an error string.
 pub type ResponseSender = futures::channel::oneshot::Sender<Result<Vec<u8>, String>>;
+
+/// The uniform capability surface over both sides' remote handles: `Remote<S>` in the
+/// guest and `HostRemote<S>` on the host implement this, so schema-generated caller
+/// traits (see [`shared_interface`]) and generic wrappers such as
+/// `embedded_gpui_utils::Revocable` work identically on either side of the boundary.
+pub trait SharedCaller<S: SharedSpec>: 'static + Clone {
+    /// The local replica entity, for `cx.observe` and reads.
+    fn shared_replica(&self) -> &gpui::Entity<SharedProjection<S::Snapshot>>;
+
+    /// Send a typed message to the entity's home; await the receipt for read-your-writes.
+    fn send_shared<M: SharedMessage<Spec = S>>(
+        &self,
+        message: M,
+        cx: &mut gpui::App,
+    ) -> SendReceipt;
+
+    /// Call a typed method on the entity's home, resolving with its return value after
+    /// the local replica reflects the mutation.
+    fn call_shared<M: SharedMessage<Spec = S>>(
+        &self,
+        message: M,
+        cx: &mut gpui::App,
+    ) -> CallReceipt<M::Response>;
+
+    /// Call a method by name with a pre-encoded payload, resolving with the raw response
+    /// bytes. The forwarding primitive: a caretaker pipes these straight through.
+    fn forward_shared(&self, method: &str, payload: Vec<u8>, cx: &mut gpui::App)
+    -> RawCallReceipt;
+}
 
 /// A call receipt that resolves with the raw response bytes, undecoded — the forwarding
 /// primitive: a caretaker pipes these straight through to its own caller.
@@ -452,6 +483,8 @@ macro_rules! shared_schema {
 /// Schemas for the demo: a click counter homed on the host and projected into the plugin,
 /// and the plugin's input-line text homed in the guest and projected into the host.
 pub mod demo {
+    use crate::{SharedRef, shared_interface};
+
     crate::shared_schema! {
         entity CounterSpec as "gpui-embedded.demo.counter" {
             snapshot CounterSnapshot { clicks: u32 }
@@ -463,6 +496,37 @@ pub mod demo {
         entity TextSpec as "gpui-embedded.demo.text" {
             snapshot TextSnapshot { text: String }
         }
+    }
+
+    crate::shared_schema! {
+        entity PaletteSpec as "demo.palette" {
+            snapshot PaletteSnapshot { commands: Vec<PaletteEntry> }
+        }
+    }
+
+    /// One entry in the plugin's published command palette: a label the host can render
+    /// natively, and the capability to invoke the command. The ref is the authority —
+    /// holding the snapshot is holding the right to run every command in it.
+    #[derive(Clone, Debug, crate::serde::Serialize, crate::serde::Deserialize)]
+    #[serde(crate = "gpui_embedded_shared::serde")]
+    pub struct PaletteEntry {
+        pub label: String,
+        pub command: SharedRef<CommandSpec>,
+    }
+
+    #[derive(Clone, Debug, crate::serde::Serialize, crate::serde::Deserialize)]
+    #[serde(crate = "gpui_embedded_shared::serde")]
+    pub struct CommandSnapshot {
+        pub label: String,
+        pub detail: String,
+    }
+
+    /// A command the host can invoke on the plugin. Defined with [`shared_interface`],
+    /// which generates the spec, the `Invoke` message, the `CommandApiCaller` extension
+    /// trait for remotes on either side, and `register_command_api`.
+    #[shared_interface(spec = CommandSpec, type_name = "demo.command", snapshot = CommandSnapshot)]
+    pub trait CommandApi {
+        fn invoke(&mut self, cx: &mut gpui::Context<Self>) -> String;
     }
 }
 

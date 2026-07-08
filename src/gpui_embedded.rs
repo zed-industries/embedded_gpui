@@ -33,7 +33,7 @@ mod shared_entities;
 
 pub use gpui_embedded_shared::{
     CallReceipt, HandleShared, HandleSharedAsync, Methods, RawCallReceipt, SendReceipt,
-    SharedEntitySource, SharedRef,
+    SharedCaller, SharedEntitySource, SharedRef,
 };
 pub use plugin_element::PluginViewState;
 
@@ -55,6 +55,37 @@ impl<S: SharedSpec> Clone for HostRemote<S> {
             host: self.host.clone(),
             _guard: self._guard.clone(),
         }
+    }
+}
+
+impl<S: SharedSpec> gpui_embedded_shared::SharedCaller<S> for HostRemote<S> {
+    fn shared_replica(&self) -> &Entity<SharedProjection<S::Snapshot>> {
+        self.replica()
+    }
+
+    fn send_shared<M: SharedMessage<Spec = S>>(
+        &self,
+        message: M,
+        cx: &mut gpui::App,
+    ) -> SendReceipt {
+        self.send(message, cx)
+    }
+
+    fn call_shared<M: SharedMessage<Spec = S>>(
+        &self,
+        message: M,
+        cx: &mut gpui::App,
+    ) -> CallReceipt<M::Response> {
+        self.call(message, cx)
+    }
+
+    fn forward_shared(
+        &self,
+        method: &str,
+        payload: Vec<u8>,
+        cx: &mut gpui::App,
+    ) -> RawCallReceipt {
+        self.forward(method, payload, cx)
     }
 }
 

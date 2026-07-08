@@ -232,10 +232,11 @@ async fn test_caretaker_membrane_forwards_and_revokes(cx: &mut TestAppContext) {
         error.to_string().contains("capability revoked"),
         "unexpected error: {error:#}"
     );
+    // Revocable freezes the last observed snapshot for remaining subscribers.
     let label = guarded
         .replica()
         .read_with(cx, |replica, _| replica.state.as_ref().map(|s| s.label.clone()));
-    assert_eq!(label.as_deref(), Some("revoked"));
+    assert_eq!(label.as_deref(), Some("prod"));
 
     // With the caretaker's handle released and ours dropped, nothing keeps the vault
     // alive: revocation reclaims the entity itself.

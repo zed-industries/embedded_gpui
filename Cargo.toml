@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "shared"]
+members = [".", "shared", "shared/macros", "utils"]
 resolver = "2"
 
 [workspace.lints.rust]

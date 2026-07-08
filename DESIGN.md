@@ -6,7 +6,9 @@ extensions" system for Zed and exists to hammer out the guest-side `gpui_plugin`
 
 This repository is standalone: it consumes `gpui` and `gpui_platform` as git dependencies
 on the zed repository (currently the `gpui-embedded-in-gpui` branch, which carries the one
-upstream hook the guest runtime needs: `Application::app_cell`).
+upstream hook the guest runtime needs: `Application::run_embedded`, which returns an
+`ApplicationHandle` so an embedder whose `Platform::run` returns immediately can keep the
+app alive and re-enter it whenever the external run loop yields control).
 
 ## Layout
 
@@ -15,8 +17,12 @@ upstream hook the guest runtime needs: `Application::app_cell`).
 - `src/gpui_embedded.rs`, `src/shared_entities.rs`, `src/plugin_element.rs` — **host**:
   wasmtime glue, host-side shared entities, and the element that replays guest display lists.
 - `src/main.rs` — host demo binary (`cargo run --bin gpui_embedded_demo`).
-- `shared/` — `gpui_embedded_shared`: schema traits, receipts, and the `shared_schema!`
-  macro used by both sides of the boundary.
+- `shared/` — `gpui_embedded_shared`: schema traits, receipts, the `SharedCaller`
+  capability surface, and the `shared_schema!` macro used by both sides of the boundary.
+- `shared/macros/` — `gpui_embedded_shared_macros`: the `#[shared_interface]` proc macro
+  (trait in, complete typed interface out).
+- `utils/` — `embedded_gpui_utils`: side-agnostic OCAP patterns (`Revocable`, a generic
+  caretaker/membrane) built purely on `SharedCaller`.
 - `plugin/` — **guest platform** crate `gpui_plugin` (its own workspace, compiled to
   `wasm32-wasip2`). Implements GPUI's `Platform`/`PlatformWindow`/
   `PlatformDispatcher`/`PlatformTextSystem`/`PlatformAtlas` over the WIT boundary, plus the
@@ -77,9 +83,8 @@ guest App. The release component (all of gpui + taffy, no fonts, no glyph raster
 Run it:
 
 ```sh
-rustup target add wasm32-wasip2
-build_plugin.sh
-cargo run -p gpui_embedded --bin gpui_embedded_demo
+./build_plugin.sh
+cargo run --bin gpui_embedded_demo
 ```
 
 ## Shared entities
@@ -121,6 +126,12 @@ Sends to a not-yet-announced entity queue in order and flush on binding — whic
 pipelining in miniature: messages addressed "through" an unresolved reference are ordered
 behind its resolution, never lost or reordered.
 
+**Calls** are messages with a `request-id`: the home handler's return value flows back as
+a response, decoded by a typed `CallReceipt<R>` (`remote.call(Increment { by: 1 }).await
+-> u32`). Responses are delivered strictly *after* the snapshot acking their call, on both
+sides — so when a call resolves, the local replica already reflects it. Handler errors
+arrive as `Err`, crossing the boundary as strings.
+
 ### Symmetry
 
 Both directions are implemented: host-homed entities with guest projections (the demo's
@@ -128,25 +139,72 @@ click counter — mutated by a native button and the wasm button, observed every
 guest-homed entities with host projections (the demo input line's text, mirrored live in
 the native header). Guest-homed ids set the high bit so the two sides' ids never collide.
 
-### Names, references, and where this goes (OCAP)
+### References and capabilities (OCAP)
 
-Well-known names are only the *bootstrap* namespace — the rendezvous roots, like mounts in
-a filesystem or globals in the Wayland registry. The planned fix for name-proliferation
-(lists of dynamic children, etc.) is `SharedRef<S>`: a serializable entity reference that
-travels *inside* snapshot and message payloads. A home shares a child anonymously, embeds
-its ref in the parent's snapshot, and the projection side materializes a `Remote` from the
-ref — no name involved. Names then only ever denote roots; everything else is reachable by
-reference, capability-style, and the FIFO+sequence machinery above already gives sends
-through freshly received refs sane ordering.
+Well-known names are only the *bootstrap* namespace — rendezvous roots, like mounts in a
+filesystem or globals in the Wayland registry. Everything else moves by reference:
+`SharedRef<S>` is a serializable entity reference (a bare id on the wire) that travels
+*inside* snapshot and message payloads. A home shares an entity anonymously
+(`share_anonymous` returns the ref), embeds the ref wherever it likes, and the receiving
+side materializes a remote from it (`remote_from_ref`) — no name involved. The demo's
+command palette works this way: the plugin publishes `[(label, SharedRef<CommandSpec>)]`
+in a snapshot, the host renders native buttons for the labels, and clicking one invokes
+the ref. Holding a ref *is* the authority to use it.
 
-Planned sugar: a proc macro so an entity is declared once as a plain Rust struct
-(`#[derive(Shared)]` + `#[shared_methods] impl` — the struct is the snapshot, methods
-become messages plus typed projection-side senders). It compiles down to the trait layer
-(`shared_schema!` generates the same shape today), which compiles down to the dynamic wire.
+Lifetimes follow gpui's own model, stretched across the boundary. Named shares borrow
+their entity (the sharer owns the lifetime); anonymous shares own theirs. Remotes
+materialized from refs carry a refcounted guard shared by all clones: when the last clone
+drops, a `$release` control message tells the home to drop its strong handle. The guest
+releases from `Drop` directly; the host queues releases and flushes them on the next
+guest interaction (or `PluginHost::pump`). Materializing the same ref twice yields the
+same replica and the same guard.
 
-Not yet implemented: `SharedRef`, request/response calls (returns flowing back over the
-ack channel), the proc macro, and home transfer (if ever needed: a serialize-and-swap
-barrier message; FIFO ordering makes it race-free by construction).
+### Attenuation, revocation, and membranes
+
+Refs can be weakened and severed without any cooperation from the entity's author:
+
+- **Attenuation** (`remote.attenuate(&["read"])`) is a generic `$attenuate` control
+  method: the home clones the dispatch entry with the method table intersected against
+  the caller's own — monotonic, so a facet can only shrink. Facets alias the entity's
+  state; snapshots fan out to all of them.
+- **Revocation** is `embedded_gpui_utils::Revocable`: wrap any capability you hold in a
+  caretaker entity, share the wrapper, hand out *its* ref. Snapshots pass through, and a
+  wildcard handler forwards every method — including ones the wrapper has never heard
+  of — to the wrapped capability as raw bytes (`SharedCaller::forward_shared`).
+  `revoke()` drops the inner remote (auto-release cascades to its home), freezes the last
+  snapshot, and fails all further calls. Because it is generic over `SharedCaller`, the
+  same code runs in the guest and on the host; the integration tests drive a full
+  membrane (host vault → guest caretaker → host caller) through it.
+
+### Async handlers
+
+A handler can return work instead of a value: `HandlerResponse::Pending(Task<...>)`
+(registered via `Methods::on_async` / `on_raw_async`, or the `HandleSharedAsync` trait).
+The delivery machinery holds the ack and the response until the task resolves, preserving
+snapshot-before-response ordering — which is what lets an entity await calls on *other*
+refs while answering one. Forwarders, aggregators, and caretakers are all this pattern.
+
+### Typed interfaces: `#[shared_interface]`
+
+The wire stays dynamic; types are sugar, and the sugar is now one attribute:
+
+```rust
+#[shared_interface(spec = CommandSpec, type_name = "demo.command", snapshot = CommandSnapshot)]
+pub trait CommandApi {
+    fn invoke(&mut self, cx: &mut Context<Self>) -> String;
+}
+```
+
+generates the `SharedSpec`, one message struct per method, a `CommandApiCaller` extension
+trait blanket-implemented for every `SharedCaller<CommandSpec>` (so guest `Remote` and
+host `HostRemote` both get a typed `.invoke(cx) -> CallReceipt<String>`), and
+`register_command_api` to wire a trait implementation into a home's dispatch table. The
+trait itself is the home-side handler surface. `shared_schema!` remains for
+snapshot-plus-messages declarations without a trait.
+
+Not yet implemented: async methods in `#[shared_interface]` (register those manually via
+`Methods::on_async`), and home transfer (if ever needed: a serialize-and-swap barrier
+message; FIFO ordering makes it race-free by construction).
 
 ## Known spike limitations (intentional)
 

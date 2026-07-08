@@ -22,6 +22,11 @@ changes; nothing here is a supported API yet.
   live replica. Typed messages and calls with responses, read-your-writes
   ordering, capability references you can embed in payloads (`SharedRef`),
   attenuation, async handlers, and refcounted auto-release on drop.
+- **Typed interfaces**: declare a trait with `#[shared_interface]` and get the
+  schema, typed callers for both sides, and handler registration generated.
+- **OCAP utilities** (`embedded_gpui_utils`): `Revocable`, a generic
+  caretaker/membrane that wraps any capability with pass-through snapshots,
+  method forwarding, and revocation.
 
 ## Quick start
 

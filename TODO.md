@@ -25,9 +25,18 @@ also implements `Render` and can be mounted anywhere in the element tree.
   everywhere; attenuating away input methods yields a render-only capability.
 
 Implementation notes for later: display lists want their own lane or delta
-encoding (they're big; don't ride the snapshot channel naively), the guest's
-one-window-per-view machinery needs a lighter "virtual window" for potentially
-hundreds of small surfaces, and focus routing across many mounts needs thought.
+encoding (they're big; don't ride the snapshot channel naively). On surface
+overhead: don't make windows lighter, make fewer windows. A gpui `Window`
+carries real baseline weight (two retained frames, a Taffy arena, per-window
+frame pump) that's irrelevant for a handful of panels but wasteful for hundreds
+of widgets — while "one window, thousands of elements" is exactly gpui's design
+envelope. So the guest should mount all renderable entities as
+absolutely-positioned regions inside a single hidden composition window and
+slice the scene into per-region display lists at serialization (a serializer
+change, not a protocol change). Single-window focus matches the host's
+one-focus model; window-granular dirtiness (one animating widget redraws the
+composition) is fine at gpui's normal scale, with per-region damage tracking as
+a later optimization.
 
 ## Platform completeness
 

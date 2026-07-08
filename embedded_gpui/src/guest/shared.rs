@@ -587,7 +587,6 @@ pub(crate) fn message_delivered(message: wit::SharedMessage, cx: &mut AsyncApp) 
     enum Dispatch {
         Handler(MethodHandler),
         Control,
-        Failed(String),
         Unknown,
     }
     let dispatch = REGISTRY.with(|registry| {
@@ -638,7 +637,6 @@ pub(crate) fn message_delivered(message: wit::SharedMessage, cx: &mut AsyncApp) 
             }
         }
         Dispatch::Control => encode(&()).map_err(|error| format!("{error:#}")),
-        Dispatch::Failed(error) => Err(error),
         Dispatch::Unknown => Err(format!(
             "no handler for shared method {:?} on entity {}",
             message.method, message.entity_id

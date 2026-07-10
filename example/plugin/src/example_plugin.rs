@@ -3,7 +3,7 @@
 //! keyboard input. See `DESIGN.md`.
 
 use embedded_gpui::shared::{remote, share, share_anonymous};
-use embedded_gpui::{Plugin, Receipt, Remote, register_plugin, shared_home};
+use embedded_gpui::{Plugin, Receipt, Remote, register_plugin, shared};
 use embedded_gpui_util::Mirror;
 use example_schema::{
     Clicks, CommandApi, CounterApi, Increment, Milestone, PaletteApi, PaletteEntry, TextApi,
@@ -154,7 +154,7 @@ struct PanelCommand {
     action: CommandAction,
 }
 
-#[shared_home]
+#[shared]
 impl CommandApi for PanelCommand {
     fn invoke(&mut self, cx: &mut Context<Self>) -> String {
         match self.panel.upgrade() {
@@ -170,14 +170,14 @@ struct Palette {
     entries: Vec<PaletteEntry>,
 }
 
-#[shared_home]
+#[shared]
 impl PaletteApi for Palette {
     fn commands(&mut self, _cx: &mut Context<Self>) -> Vec<PaletteEntry> {
         self.entries.clone()
     }
 }
 
-#[shared_home]
+#[shared]
 impl TextApi for InputLine {
     fn text(&mut self, _cx: &mut Context<Self>) -> String {
         self.text.clone()

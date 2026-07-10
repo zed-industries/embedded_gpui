@@ -16,14 +16,14 @@ app alive and re-enter it whenever the external run loop yields control).
   - `wit/plugin.wit` — the wire protocol (package `gpui:embedded`, world `plugin`); the
     single source of truth both sides bind against.
   - `src/embedded_gpui.rs` — the always-compiled object layer: `Remote`, `Receipt`,
-    `SharedRef`, specs/messages/events, and the `SharedHome`/`SharedCaller` traits.
+    `SharedRef`, specs/messages/events, and the `Shared`/`SharedCaller` traits.
   - `src/host.rs` (+ `src/host/`) — native targets only: wasmtime glue, host-side shared
     entities, and the element that replays guest display lists.
   - `src/guest.rs` (+ `src/guest/`) — wasm32 targets only: GPUI's
     `Platform`/`PlatformWindow`/`PlatformDispatcher`/`PlatformTextSystem`/`PlatformAtlas`
     over the WIT boundary, `Plugin`/`register_plugin!`, and the guest half of shared
     entities.
-- `embedded_gpui_macros/` — the `#[shared_interface]` / `#[shared_home]` / `#[shared_data]`
+- `embedded_gpui_macros/` — the `#[shared_interface]` / `#[shared]` / `#[shared_data]`
   proc macros.
 - `embedded_gpui_util/` — side-agnostic OCAP patterns (`Revocable`, `Attenuated`,
   `Audited`, `Mirror`) built on `SharedCaller`.
@@ -254,7 +254,7 @@ projection and the same guard.
 
 Refs can be weakened and severed without any cooperation from the entity's author. All
 three wrappers below are generic over `SharedCaller` (so the same code runs in the guest
-and on the host, and wrappers wrap each other), and all implement `SharedHome` (so
+and on the host, and wrappers wrap each other), and all implement `Shared` (so
 sharing one is exactly like sharing any other entity):
 
 - **Attenuation** is a library pattern, not a protocol feature:
@@ -297,7 +297,7 @@ One name is the whole interface: hold a `Remote<CounterApi>`, reference a
 `SharedRef<CounterApi>`, and implement a home by keeping the same name on the impl block:
 
 ```rust
-#[shared_home]
+#[shared]
 impl CounterApi for Counter { ... }
 ```
 
@@ -305,10 +305,10 @@ Under the hood the trait syntax is consumed: it becomes the spec struct, one mes
 per method, `SharedEvent` wiring for each declared event, and a `CounterApiCaller`
 extension trait blanket-implemented for every `SharedCaller<CounterApi>` — so a
 `Remote<CounterApi>` and any wrapper around one get typed
-`.increment(by, cx) -> Receipt<u32>`. `#[shared_home]` turns the block's methods into
+`.increment(by, cx) -> Receipt<u32>`. `#[shared]` turns the block's methods into
 ordinary methods of the entity and registers each one through schema-generated functions
 taking checked function pointers — a signature mismatch against the schema is a compile
-error — then implements `SharedHome`, which is what `share` / `share_anonymous` need
+error — then implements `Shared`, which is what `share` / `share_anonymous` need
 (and what makes the spec inferable at share sites: no turbofish).
 
 Fully dynamic entities skip the schema: `share_with(&entity, "name", |methods| ...)`

@@ -4,8 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use embedded_gpui::{
-    PluginHost, PluginHostHandle as _, PluginOptions, PluginViewState, Remote, SharedRef,
-    shared_home,
+    PluginHost, PluginHostHandle as _, PluginOptions, PluginViewState, Remote, SharedRef, shared,
 };
 use embedded_gpui_util::Mirror;
 use example_schema::{
@@ -27,7 +26,7 @@ struct Counter {
 
 impl EventEmitter<Milestone> for Counter {}
 
-#[shared_home]
+#[shared]
 impl CounterApi for Counter {
     fn increment(&mut self, by: u32, cx: &mut Context<Self>) -> u32 {
         self.clicks += by;
@@ -53,7 +52,7 @@ struct Workspace {
     last_toast: Option<String>,
 }
 
-#[shared_home]
+#[shared]
 impl WorkspaceApi for Workspace {
     fn show_toast(&mut self, message: String, cx: &mut Context<Self>) -> String {
         self.last_toast = Some(message);

@@ -25,7 +25,7 @@ changes; nothing here is a supported API yet.
   on drop, and capability references you can embed in payloads (`SharedRef`).
 - **Typed interfaces**: one attribute on a trait (`#[shared_interface]`) makes
   one name the whole interface — `Remote<CounterApi>` for callers,
-  `#[shared_home] impl CounterApi for MyEntity` for the implementation, both
+  `#[shared] impl CounterApi for MyEntity` for the implementation, both
   compile-time checked against the same schema.
 - **OCAP utilities** (`embedded_gpui_util`): `Revocable` (caretaker/membrane),
   `Attenuated` (allowlist), `Audited` (call ledger), and `Mirror` (a local,
@@ -74,7 +74,7 @@ cargo test -p tests -- --test-threads 1   # protocol tests
 
 - `embedded_gpui/` — the one crate both sides use: schema layer (always), host runtime
   (native), guest platform (wasm32). The WIT protocol lives in `embedded_gpui/wit/`.
-- `embedded_gpui_macros/` — the `#[shared_interface]` / `#[shared_home]` /
+- `embedded_gpui_macros/` — the `#[shared_interface]` / `#[shared]` /
   `#[shared_data]` proc macros.
 - `embedded_gpui_util/` — object-capability patterns (`Revocable`, `Attenuated`,
   `Audited`, `Mirror`).

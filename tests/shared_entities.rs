@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use embedded_gpui::{
-    PluginHost, PluginHostHandle as _, PluginInstance, PluginOptions, decode, encode, shared_home,
+    PluginHost, PluginHostHandle as _, PluginInstance, PluginOptions, decode, encode, shared,
 };
 use embedded_gpui_util::{Attenuated, Audited, Mirror};
 use gpui::{AppContext as _, Context, Entity, Task, TestAppContext};
@@ -184,7 +184,7 @@ struct Vault {
     secret: String,
 }
 
-#[shared_home]
+#[shared]
 impl VaultApi for Vault {
     fn read(&mut self, cx: &mut Context<Self>) -> Task<anyhow::Result<String>> {
         let secret = self.secret.clone();

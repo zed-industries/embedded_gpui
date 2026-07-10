@@ -5,7 +5,7 @@
 use crate::wit;
 use embedded_gpui::{
     EventSink, HandlerResponse, MethodHandler, NOTIFY_EVENT, RELEASE_METHOD, RawSharedEvent,
-    RemoteSignal, ResponseSender, SUBSCRIBE_METHOD, SharedHome, SharedSpec, encode,
+    RemoteSignal, ResponseSender, SUBSCRIBE_METHOD, Shared, SharedSpec, encode,
 };
 use gpui::{AnyEntity, App, AppContext as _, AsyncApp, Entity, Subscription};
 use std::cell::RefCell;
@@ -211,12 +211,12 @@ pub(crate) fn response_delivered(response: wit::SharedResponse) {
 
 /// Share a guest entity with the host under a well-known name (a mount the host attaches
 /// to with `PluginHost::remote`). The guest becomes the home: the entity's
-/// `#[shared_home]` methods answer host messages, and its `cx.notify` / declared
+/// `#[shared]` methods answer host messages, and its `cx.notify` / declared
 /// `cx.emit` events reach every host remote.
 pub fn share<S, T>(entity: &Entity<T>, name: impl Into<String>, cx: &mut App)
 where
     S: SharedSpec,
-    T: SharedHome<S>,
+    T: Shared<S>,
 {
     let mut methods = Methods::new(entity.downgrade());
     T::methods(&mut methods);
@@ -232,7 +232,7 @@ where
 
 /// The dynamic escape hatch beneath [`share`]: register method handlers with a closure
 /// instead of a schema interface. `cx.notify` still crosses; typed events are not wired
-/// (implement [`SharedHome`] manually if you need both).
+/// (implement [`Shared`] manually if you need both).
 pub fn share_with<S, T>(
     entity: &Entity<T>,
     name: impl Into<String>,
@@ -259,7 +259,7 @@ pub fn share_with<S, T>(
 pub fn share_anonymous<S, T>(entity: &Entity<T>, cx: &mut App) -> SharedRef<S>
 where
     S: SharedSpec,
-    T: SharedHome<S>,
+    T: Shared<S>,
 {
     let mut methods = Methods::new(entity.downgrade());
     T::methods(&mut methods);

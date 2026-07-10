@@ -3,12 +3,12 @@
 //! Everything here is side-agnostic: the same code runs in the guest and on the host,
 //! because it only relies on the [`SharedCaller`] surface that `Remote` (and every
 //! wrapper here) implements. All three wrappers implement
-//! [`SharedHome`](embedded_gpui::SharedHome), so sharing one is exactly like sharing any
+//! [`Shared`](embedded_gpui::Shared), so sharing one is exactly like sharing any
 //! other entity: `share_anonymous(&wrapper, cx)`.
 
 use anyhow::anyhow;
 use embedded_gpui::{
-    EventSink, Methods, SharedCaller, SharedHome, SharedMessage, SharedSpec, WILDCARD_METHOD,
+    EventSink, Methods, Shared, SharedCaller, SharedMessage, SharedSpec, WILDCARD_METHOD,
 };
 use gpui::{App, AppContext as _, Context, Entity, Subscription, Task, WeakEntity};
 
@@ -99,7 +99,7 @@ impl<C: 'static> Revocable<C> {
     }
 }
 
-impl<S, C> SharedHome<S> for Revocable<C>
+impl<S, C> Shared<S> for Revocable<C>
 where
     S: SharedSpec,
     C: SharedCaller<S>,
@@ -189,7 +189,7 @@ impl<C: 'static> Attenuated<C> {
     }
 }
 
-impl<S, C> SharedHome<S> for Attenuated<C>
+impl<S, C> Shared<S> for Attenuated<C>
 where
     S: SharedSpec,
     C: SharedCaller<S>,
@@ -294,7 +294,7 @@ impl<C: 'static> Audited<C> {
     }
 }
 
-impl<S, C> SharedHome<S> for Audited<C>
+impl<S, C> Shared<S> for Audited<C>
 where
     S: SharedSpec,
     C: SharedCaller<S>,

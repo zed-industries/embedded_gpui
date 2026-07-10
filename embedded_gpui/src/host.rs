@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use crate::{
     EventSink, HandlerResponse, Methods, NOTIFY_EVENT, RELEASE_METHOD, RawSharedEvent, Remote,
-    RemoteSignal, ResponseSender, SUBSCRIBE_METHOD, SharedHome, SharedRef, SharedSpec, Transport,
+    RemoteSignal, ResponseSender, SUBSCRIBE_METHOD, Shared, SharedRef, SharedSpec, Transport,
 };
 use anyhow::{Context as _, Result};
 use futures::StreamExt as _;
@@ -642,7 +642,7 @@ impl PluginHost {
 
     /// Share a host entity with the guest under a well-known name (a mount the guest
     /// attaches to with `remote`). The entity becomes the *home* of the shared state:
-    /// its `#[shared_home]` methods answer guest messages, and its `cx.notify` /
+    /// its `#[shared]` methods answer guest messages, and its `cx.notify` /
     /// declared `cx.emit` events reach every guest remote.
     pub fn share<S, T>(
         &mut self,
@@ -651,7 +651,7 @@ impl PluginHost {
         cx: &mut Context<Self>,
     ) where
         S: SharedSpec,
-        T: SharedHome<S>,
+        T: Shared<S>,
     {
         let mut methods = Methods::new(entity.downgrade());
         T::methods(&mut methods);
@@ -671,7 +671,7 @@ impl PluginHost {
 
     /// The dynamic escape hatch beneath [`PluginHost::share`]: register method handlers
     /// with a closure instead of a schema interface. `cx.notify` still crosses; typed
-    /// events are not wired (implement [`SharedHome`] manually if you need both).
+    /// events are not wired (implement [`Shared`] manually if you need both).
     pub fn share_with<S, T>(
         &mut self,
         entity: &Entity<T>,
@@ -707,7 +707,7 @@ impl PluginHost {
     ) -> SharedRef<S>
     where
         S: SharedSpec,
-        T: SharedHome<S>,
+        T: Shared<S>,
     {
         let mut methods = Methods::new(entity.downgrade());
         T::methods(&mut methods);
@@ -1245,7 +1245,7 @@ impl PluginHost {
 /// `host.share(&entity, "name", cx)`, `host.remote::<CounterApi>("clicks", cx)`.
 pub trait PluginHostHandle {
     /// See [`PluginHost::share`].
-    fn share<S: SharedSpec, T: SharedHome<S>>(
+    fn share<S: SharedSpec, T: Shared<S>>(
         &self,
         entity: &Entity<T>,
         name: impl Into<String>,
@@ -1262,7 +1262,7 @@ pub trait PluginHostHandle {
     );
 
     /// See [`PluginHost::share_anonymous`].
-    fn share_anonymous<S: SharedSpec, T: SharedHome<S>>(
+    fn share_anonymous<S: SharedSpec, T: Shared<S>>(
         &self,
         entity: &Entity<T>,
         cx: &mut gpui::App,
@@ -1290,7 +1290,7 @@ pub trait PluginHostHandle {
 }
 
 impl PluginHostHandle for Entity<PluginHost> {
-    fn share<S: SharedSpec, T: SharedHome<S>>(
+    fn share<S: SharedSpec, T: Shared<S>>(
         &self,
         entity: &Entity<T>,
         name: impl Into<String>,
@@ -1309,7 +1309,7 @@ impl PluginHostHandle for Entity<PluginHost> {
         self.update(cx, |host, cx| host.share_with(entity, name, register, cx))
     }
 
-    fn share_anonymous<S: SharedSpec, T: SharedHome<S>>(
+    fn share_anonymous<S: SharedSpec, T: Shared<S>>(
         &self,
         entity: &Entity<T>,
         cx: &mut gpui::App,

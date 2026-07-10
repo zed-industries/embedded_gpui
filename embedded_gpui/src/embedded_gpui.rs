@@ -3,7 +3,7 @@
 //! One crate serves both sides of the boundary:
 //!
 //! - the **object layer** (this file, always compiled): [`Remote`], [`Receipt`],
-//!   [`SharedRef`], specs/messages/events, and [`SharedHome`]/[`SharedCaller`] — the
+//!   [`SharedRef`], specs/messages/events, and [`Shared`]/[`SharedCaller`] — the
 //!   typed veneer over the dynamic wire, where everything is
 //!   `(entity_id, method: string, payload: bytes)`;
 //! - the **host runtime** ([`PluginHost`] and friends; native targets only): wasmtime
@@ -42,7 +42,7 @@ use std::rc::Rc;
 
 #[doc(hidden)]
 pub use anyhow;
-pub use embedded_gpui_macros::{shared_data, shared_home, shared_interface};
+pub use embedded_gpui_macros::{shared, shared_data, shared_interface};
 pub use gpui;
 #[doc(hidden)]
 pub use log;
@@ -97,7 +97,7 @@ pub type MethodHandler = Rc<dyn Fn(&str, &[u8], &mut gpui::App) -> HandlerRespon
 pub const WILDCARD_METHOD: &str = "*";
 
 /// A dispatch table under construction: the dynamic escape hatch beneath the typed
-/// [`SharedHome`] registration. Entities that interpret method names at runtime (or
+/// [`Shared`] registration. Entities that interpret method names at runtime (or
 /// wrappers that forward them wholesale via [`WILDCARD_METHOD`]) register here.
 pub struct Methods<S: SharedSpec, T> {
     entity: gpui::WeakEntity<T>,
@@ -170,14 +170,14 @@ impl<S: SharedSpec, T: 'static> Methods<S, T> {
 }
 
 /// Forwards a home entity's typed events onto the wire; handed to
-/// [`SharedHome::events`] by the share machinery.
+/// [`Shared::events`] by the share machinery.
 pub type EventSink = Rc<dyn Fn(&str, Vec<u8>, &mut gpui::App)>;
 
 /// An entity type that can serve as the home of a shared entity of kind `S`: it knows how
 /// to register its method handlers and how to wire its GPUI events to the boundary.
-/// Implemented by putting [`macro@shared_home`] on the interface `impl` block; manual
+/// Implemented by putting [`macro@shared`] on the interface `impl` block; manual
 /// implementations are the escape hatch for fully dynamic entities and generic wrappers.
-pub trait SharedHome<S: SharedSpec>: 'static + Sized {
+pub trait Shared<S: SharedSpec>: 'static + Sized {
     /// Install this type's method handlers into the dispatch table.
     fn methods(methods: &mut Methods<S, Self>);
 

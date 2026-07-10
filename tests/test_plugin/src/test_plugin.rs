@@ -4,7 +4,7 @@
 
 use anyhow::anyhow;
 use embedded_gpui::shared::{connect, share, share_anonymous, share_anonymous_with, share_with};
-use embedded_gpui::{Plugin, SharedRef, decode, encode, register_plugin, shared_home};
+use embedded_gpui::{Plugin, SharedRef, decode, encode, register_plugin, shared};
 use embedded_gpui_util::Revocable;
 use gpui::{AnyView, App, Context, Entity, EventEmitter, Task, Window, div, prelude::*};
 use test_schema::{
@@ -101,7 +101,7 @@ struct Counter {
 
 impl EventEmitter<CounterMilestone> for Counter {}
 
-#[shared_home]
+#[shared]
 impl TestCounterApi for Counter {
     fn increment(&mut self, by: u32, cx: &mut Context<Self>) -> u32 {
         let tens_before = self.count / 10;
@@ -123,7 +123,7 @@ struct Item {
     bumps: u32,
 }
 
-#[shared_home]
+#[shared]
 impl ItemApi for Item {
     fn bump(&mut self, cx: &mut Context<Self>) -> u32 {
         self.bumps += 1;
@@ -143,7 +143,7 @@ struct Factory {
     created: u32,
 }
 
-#[shared_home]
+#[shared]
 impl FactoryApi for Factory {
     fn create(&mut self, label: String, cx: &mut Context<Self>) -> SharedRef<ItemApi> {
         self.created += 1;
@@ -157,7 +157,7 @@ struct Gatekeeper {
     guarded: u32,
 }
 
-#[shared_home]
+#[shared]
 impl GatekeeperApi for Gatekeeper {
     fn guard(&mut self, vault: SharedRef<VaultApi>, cx: &mut Context<Self>) -> SharedRef<VaultApi> {
         self.guarded += 1;

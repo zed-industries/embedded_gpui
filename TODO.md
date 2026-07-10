@@ -4,7 +4,59 @@ What's deliberately not built yet, in rough priority order. The spike's goal is
 to prove the architecture; these are the known gaps between "proven" and
 "product".
 
-## Views as replicated objects (the next big design step)
+## One root object per side: stringless discovery (do this first)
+
+Sequenced deliberately *before* views-as-objects: this deletes protocol
+machinery (announcements, name binding) that the views work would otherwise
+have to route around, and once both roots exist, "give me a surface" is just
+another typed method returning a renderable ref — the two designs snap
+together instead of being retrofitted.
+
+Well-known names were the bootstrap namespace; for Zed extensions they should
+not survive. Strings are ambient authority (any plugin that can spell
+"workspace" can attach to it) and a second identifier system living alongside
+refs. The replacement: **one starting object per side**. At init the host hands
+the plugin a single capability — the host root, whose typed methods return
+everything else (`fn workspace(&mut self, cx) -> SharedRef<WorkspaceApi>`) —
+and symmetrically the plugin's `Plugin::new` returns *its* root, through which
+the host reaches every plugin surface. Everything participates in one object
+system, and authority becomes reachability from your root.
+
+- `share(name)` / `remote(name)` and the whole announcement/name-binding
+  machinery (unclaimed announcements, `TYPE_NAME` checks at bind, name-keyed
+  projections) get deleted; the wire keeps only refs. Names retreat into
+  schema method names, where they belong — codegen, not identifiers (the same
+  place Wayland keeps its interface strings).
+- The root makes the policy chokepoint concrete and *total*: hand a plugin an
+  `Attenuated` root and its whole reachable world is attenuated; a deep
+  membrane around the root covers the entire API surface transitively;
+  powerbox-style consent is a root method that asks the user before minting a
+  ref. Per-plugin tailoring is just constructing different roots.
+- Discovery *is* the root schema: optional capabilities are methods returning
+  refs (or an error to degrade on); the plugin-to-plugin registry (see
+  multi-plugin routing) becomes an object reachable from the root, opt-in as
+  before.
+- Converges with views-as-objects below: `create_view(name)` is also a string
+  API. Renderable refs plus a root means the host asks the plugin's root for
+  surfaces, and no string identifiers remain anywhere in the protocol.
+- The deeper simplification: today the host provides an assortment of things
+  (view slots, shares, mounts) and the plugin provides an assortment of things
+  (named views, named entities), each with its own bespoke plumbing. With one
+  entry point per side, all of it becomes plain method calls: the host calls
+  the plugin root's methods to get the plugin's features, the plugin calls the
+  host root's methods to get the host's features, and the initial exchange of
+  the two roots is the *entire* bootstrap. The `Plugin` trait shrinks toward
+  "construct your root object"; the WIT world trends toward pure transport
+  (scenes, input, text, scheduling, one object channel) with every *feature*
+  living in the two root schemas, where it can be typed, versioned, attenuated,
+  and audited like everything else.
+- The caution: the root schema becomes the real compatibility surface for Zed
+  extensions — the de facto extension API crate. Unknown methods already fail
+  soft, but it wants explicit versioning discipline (a version method, or
+  probe-and-degrade conventions), because it can never break casually once
+  extensions ship against it.
+
+## Views as replicated objects (after the root object)
 
 Today views are addressed by name (`host.view("panel")`) over a dedicated
 scene channel. That has the same weakness names always have: surfaces that are
@@ -14,8 +66,9 @@ shared entity**. A home entity that implements `Render` streams its display
 list to the other side, where a remote to it can be mounted anywhere in the
 element tree.
 
-- `view("panel")` dissolves into `remote::<PanelApi>("panel")`; the named form
-  is just the named-mount special case.
+- `view("panel")` dissolves into a typed method on the plugin's root object
+  returning a renderable ref (see "one root object per side"); no view names,
+  no view ids.
 - Inline surfaces are anonymous renderable refs traveling in payloads:
   `Vec<(BufferRow, SharedRef<InlayWidget>)>`, connected and mounted by the
   host wherever its own layout puts them.
@@ -43,41 +96,6 @@ change, not a protocol change). Single-window focus matches the host's
 one-focus model; window-granular dirtiness (one animating widget redraws the
 composition) is fine at gpui's normal scale, with per-region damage tracking as
 a later optimization.
-
-## One root object per side: stringless discovery
-
-Well-known names were the bootstrap namespace; for Zed extensions they should
-not survive. Strings are ambient authority (any plugin that can spell
-"workspace" can attach to it) and a second identifier system living alongside
-refs. The replacement: **one starting object per side**. At init the host hands
-the plugin a single capability — the host root, whose typed methods return
-everything else (`fn workspace(&mut self, cx) -> SharedRef<WorkspaceApi>`) —
-and symmetrically the plugin's `Plugin::new` returns *its* root, through which
-the host reaches every plugin surface. Everything participates in one object
-system, and authority becomes reachability from your root.
-
-- `share(name)` / `remote(name)` and the whole announcement/name-binding
-  machinery (unclaimed announcements, `TYPE_NAME` checks at bind, name-keyed
-  projections) get deleted; the wire keeps only refs. Names retreat into
-  schema method names, where they belong — codegen, not identifiers (the same
-  place Wayland keeps its interface strings).
-- The root makes the policy chokepoint concrete and *total*: hand a plugin an
-  `Attenuated` root and its whole reachable world is attenuated; a deep
-  membrane around the root covers the entire API surface transitively;
-  powerbox-style consent is a root method that asks the user before minting a
-  ref. Per-plugin tailoring is just constructing different roots.
-- Discovery *is* the root schema: optional capabilities are methods returning
-  refs (or an error to degrade on); the plugin-to-plugin registry (see
-  multi-plugin routing) becomes an object reachable from the root, opt-in as
-  before.
-- Converges with views-as-objects above: `create_view(name)` is also a string
-  API. Renderable refs plus a root means the host asks the plugin's root for
-  surfaces, and no string identifiers remain anywhere in the protocol.
-- The caution: the root schema becomes the real compatibility surface for Zed
-  extensions — the de facto extension API crate. Unknown methods already fail
-  soft, but it wants explicit versioning discipline (a version method, or
-  probe-and-degrade conventions), because it can never break casually once
-  extensions ship against it.
 
 ## Platform completeness
 

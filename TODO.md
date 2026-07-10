@@ -39,6 +39,12 @@ system, and authority becomes reachability from your root.
 - Converges with views-as-objects below: `create_view(name)` is also a string
   API. Renderable refs plus a root means the host asks the plugin's root for
   surfaces, and no string identifiers remain anywhere in the protocol.
+- **Total symmetry is the goal**: both sides run their own copy of the exact
+  same code doing the exact same thing — the host is special only in owning
+  the compositor and the sandbox, not in API shape. Concretely that means
+  finishing what `Remote`'s transport closure started: one shared
+  home/projection registry implementation, host and guest differing only in
+  how bytes move.
 - The deeper simplification: today the host provides an assortment of things
   (view slots, shares, mounts) and the plugin provides an assortment of things
   (named views, named entities), each with its own bespoke plumbing. With one

@@ -1,6 +1,6 @@
 //! Schemas for the demo: the interfaces both sides compile against. Each
 //! `#[shared_interface]` is one name for the whole thing — hold a `Remote<CounterApi>`,
-//! reference a `SharedRef<CommandApi>`, implement `#[shared_home] impl CounterApi for ...`.
+//! reference a `SharedRef<CommandApi>`, implement `#[shared] impl CounterApi for ...`.
 
 use embedded_gpui::{SharedRef, shared_data, shared_interface};
 

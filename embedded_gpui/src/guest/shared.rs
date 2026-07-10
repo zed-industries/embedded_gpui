@@ -4,15 +4,14 @@
 
 use crate::wit;
 use embedded_gpui::{
-    EventSink, HandlerResponse, MethodHandler, NOTIFY_EVENT, RELEASE_METHOD, RawSharedEvent,
-    RemoteSignal, ResponseSender, SUBSCRIBE_METHOD, Shared, SharedSpec, encode,
+    EventSink, HandlerResponse, MethodHandler, Methods, NOTIFY_EVENT, RELEASE_METHOD,
+    RawSharedEvent, Remote, RemoteSignal, ResponseSender, SUBSCRIBE_METHOD, Shared, SharedRef,
+    SharedSpec, encode,
 };
 use gpui::{AnyEntity, App, AppContext as _, AsyncApp, Entity, Subscription};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
-
-pub use embedded_gpui::{Methods, Receipt, Remote, SharedCaller, SharedRef};
 
 use crate::GUEST_HOME_BIT;
 

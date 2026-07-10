@@ -2,8 +2,9 @@
 //! by the `embedded_gpui` host. The panel exercises text, SVGs, images, paths, and
 //! keyboard input. See `DESIGN.md`.
 
-use embedded_gpui::shared::{remote, share, share_anonymous};
-use embedded_gpui::{Plugin, Receipt, Remote, register_plugin, shared};
+use embedded_gpui::{
+    Plugin, Receipt, Remote, register_plugin, remote, share, share_anonymous, shared,
+};
 use embedded_gpui_util::Mirror;
 use example_schema::{
     Clicks, CommandApi, CounterApi, Increment, Milestone, PaletteApi, PaletteEntry, TextApi,

@@ -7,7 +7,9 @@
 
 pub(crate) mod dispatcher;
 pub(crate) mod platform;
-pub mod shared;
+mod shared;
+
+pub use shared::{connect, remote, share, share_anonymous, share_anonymous_with, share_with};
 pub(crate) mod text_system;
 pub(crate) mod window;
 

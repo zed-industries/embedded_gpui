@@ -16,7 +16,7 @@ app alive and re-enter it whenever the external run loop yields control).
   - `wit/plugin.wit` — the wire protocol (package `gpui:embedded`, world `plugin`); the
     single source of truth both sides bind against.
   - `src/embedded_gpui.rs` — the always-compiled object layer: `Remote`, `Receipt`,
-    `SharedRef`, specs/messages/events, and the `Shared`/`SharedCaller` traits.
+    `SharedRef`, specs/messages/events, and the `Shared` home trait.
   - `src/host.rs` (+ `src/host/`) — native targets only: wasmtime glue, host-side shared
     entities, and the element that replays guest display lists.
   - `src/guest.rs` (+ `src/guest/`) — wasm32 targets only: GPUI's
@@ -26,7 +26,7 @@ app alive and re-enter it whenever the external run loop yields control).
 - `embedded_gpui_macros/` — the `#[shared_interface]` / `#[shared]` / `#[shared_data]`
   proc macros.
 - `embedded_gpui_util/` — side-agnostic OCAP patterns (`Revocable`, `Attenuated`,
-  `Audited`, `Mirror`) built on `SharedCaller`.
+  `Audited`, `Mirror`) built on `Remote`.
 - `example/` — the demo pair: `host/` (native window, `cargo run -p example_host`;
   builds the plugin automatically) and `plugin/` (the wasm component, its own workspace
   since it only compiles to `wasm32-wasip2`).
@@ -171,7 +171,7 @@ types), so shared state is built on three rules:
    from within a render or another delivery.
 
 Identity is a well-known string binding (`host.share(&entity, "clicks", cx)` /
-`shared::remote::<CounterApi>("clicks", cx)`), type-checked at announcement time via
+`remote::<CounterApi>("clicks", cx)` in the guest), type-checked at announcement time via
 `SharedSpec::TYPE_NAME`.
 
 ### The `Entity<T>` analogy
@@ -253,9 +253,9 @@ projection and the same guard.
 ### Attenuation, revocation, and membranes
 
 Refs can be weakened and severed without any cooperation from the entity's author. All
-three wrappers below are generic over `SharedCaller` (so the same code runs in the guest
-and on the host, and wrappers wrap each other), and all implement `Shared` (so
-sharing one is exactly like sharing any other entity):
+three wrappers below hold a `Remote` (so the same code runs in the guest and on the
+host), and all implement `Shared` (so sharing one is exactly like sharing any other
+entity):
 
 - **Attenuation** is a library pattern, not a protocol feature:
   `embedded_gpui_util::Attenuated` wraps any capability you hold with an allowlist —
@@ -269,8 +269,8 @@ sharing one is exactly like sharing any other entity):
 - **Revocation** is `embedded_gpui_util::Revocable`: wrap any capability you hold in a
   caretaker entity, share the wrapper, hand out *its* ref. Notifies and events pass
   through, and a wildcard handler forwards every method — including ones the wrapper has
-  never heard of — to the wrapped capability as raw bytes
-  (`SharedCaller::forward_shared`). `revoke()` drops the inner remote (auto-release
+  never heard of — to the wrapped capability as raw bytes (`Remote::forward`).
+  `revoke()` drops the inner remote (auto-release
   cascades to its home) and fails all further calls. The integration tests drive a full
   membrane (host vault → guest caretaker → host caller) through it.
 
@@ -303,8 +303,7 @@ impl CounterApi for Counter { ... }
 
 Under the hood the trait syntax is consumed: it becomes the spec struct, one message type
 per method, `SharedEvent` wiring for each declared event, and a `CounterApiCaller`
-extension trait blanket-implemented for every `SharedCaller<CounterApi>` — so a
-`Remote<CounterApi>` and any wrapper around one get typed
+extension trait implemented for `Remote<CounterApi>`, giving remotes typed
 `.increment(by, cx) -> Receipt<u32>`. `#[shared]` turns the block's methods into
 ordinary methods of the entity and registers each one through schema-generated functions
 taking checked function pointers — a signature mismatch against the schema is a compile

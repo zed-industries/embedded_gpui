@@ -26,9 +26,8 @@ use syn::{FnArg, Ident, ItemImpl, ItemTrait, LitStr, Token, TraitItem, Type, bra
 /// - a `SharedEvent` impl for each type in `events`, so the home's ordinary
 ///   `cx.emit(Milestone { .. })` crosses the boundary to `Remote::subscribe`
 ///   (each event type must be an `EventEmitter` event of the home entity, as usual);
-/// - `pub trait CounterApiCaller: SharedCaller<CounterApi>` with a typed method per
-///   interface method returning a `Receipt`, blanket-implemented for every caller — a
-///   `Remote<CounterApi>` and any wrapper around one get `.increment(by, cx)`;
+/// - `pub trait CounterApiCaller`, implemented for `Remote<CounterApi>`: one typed
+///   method per interface method, so remotes get `.increment(by, cx) -> Receipt<u32>`;
 /// - hidden `CounterApi::register_increment(...)` functions taking a checked function
 ///   pointer per method, which is how `#[shared]` type-checks a home
 ///   implementation against this schema.
@@ -353,7 +352,23 @@ fn expand_interface(
     });
 
     let caller_ident = format_ident!("{spec_ident}Caller");
-    let caller_methods = methods.iter().map(|method| {
+    let caller_signatures = methods.iter().map(|method| {
+        let Method {
+            ident,
+            field_names,
+            field_types,
+            response,
+            ..
+        } = method;
+        quote! {
+            fn #ident(
+                &self,
+                #(#field_names: #field_types,)*
+                cx: &mut embedded_gpui::gpui::App,
+            ) -> embedded_gpui::Receipt<#response>;
+        }
+    });
+    let caller_implementations = methods.iter().map(|method| {
         let Method {
             ident,
             message_ident,
@@ -368,7 +383,7 @@ fn expand_interface(
                 #(#field_names: #field_types,)*
                 cx: &mut embedded_gpui::gpui::App,
             ) -> embedded_gpui::Receipt<#response> {
-                self.call_shared(#message_ident { #(#field_names,)* }, cx)
+                self.call(#message_ident { #(#field_names,)* }, cx)
             }
         }
     });
@@ -380,9 +395,9 @@ fn expand_interface(
         type_name.value()
     );
     let caller_doc = format!(
-        "Typed calls to a shared `{spec_ident}` entity, for any holder of a capability \
-         to one ([`SharedCaller`](embedded_gpui::SharedCaller)): a `Remote<{spec_ident}>` \
-         or any wrapper around one."
+        "Typed calls to a shared `{spec_ident}` entity: implemented for \
+         `Remote<{spec_ident}>`, one method per interface method, each returning a \
+         `Receipt`."
     );
 
     Ok(quote! {
@@ -419,11 +434,13 @@ fn expand_interface(
         #(#event_impls)*
 
         #[doc = #caller_doc]
-        #vis trait #caller_ident: embedded_gpui::SharedCaller<#spec_ident> {
-            #(#caller_methods)*
+        #vis trait #caller_ident {
+            #(#caller_signatures)*
         }
 
-        impl<C: embedded_gpui::SharedCaller<#spec_ident>> #caller_ident for C {}
+        impl #caller_ident for embedded_gpui::Remote<#spec_ident> {
+            #(#caller_implementations)*
+        }
     })
 }
 

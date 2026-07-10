@@ -3,8 +3,10 @@
 //! dispatch.
 
 use anyhow::anyhow;
-use embedded_gpui::shared::{connect, share, share_anonymous, share_anonymous_with, share_with};
-use embedded_gpui::{Plugin, SharedRef, decode, encode, register_plugin, shared};
+use embedded_gpui::{
+    Plugin, SharedRef, connect, decode, encode, register_plugin, share, share_anonymous,
+    share_anonymous_with, share_with, shared,
+};
 use embedded_gpui_util::Revocable;
 use gpui::{AnyView, App, Context, Entity, EventEmitter, Task, Window, div, prelude::*};
 use test_schema::{

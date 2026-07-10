@@ -3,14 +3,14 @@
 //! One crate serves both sides of the boundary:
 //!
 //! - the **object layer** (this file, always compiled): [`Remote`], [`Receipt`],
-//!   [`SharedRef`], specs/messages/events, and [`Shared`]/[`SharedCaller`] — the
-//!   typed veneer over the dynamic wire, where everything is
+//!   [`SharedRef`], specs/messages/events, and the [`Shared`] home trait — the typed
+//!   veneer over the dynamic wire, where everything is
 //!   `(entity_id, method: string, payload: bytes)`;
 //! - the **host runtime** ([`PluginHost`] and friends; native targets only): wasmtime
 //!   glue, display-list replay, and the host half of shared entities;
 //! - the **guest platform** (wasm32 targets only): a GPUI `Platform` implementation over
 //!   the WIT protocol, plus [`Plugin`], [`register_plugin!`], and the guest half of
-//!   shared entities in [`shared`].
+//!   shared entities (`share`, `remote`, `connect`, and friends).
 //!
 //! See `DESIGN.md` at the repository root for the architecture.
 
@@ -484,118 +484,6 @@ impl<S: SharedSpec> Remote<S> {
         cx.subscribe(&self.signal, move |_, event: &RawSharedEvent, cx| {
             callback(&event.name, &event.payload, cx)
         })
-    }
-}
-
-/// The uniform capability surface every generic wrapper builds on: [`Remote`] implements
-/// it, and so do the wrappers in `embedded_gpui_util` (`Revocable`, `Attenuated`, ...),
-/// which is what lets wrappers wrap each other. Schema-generated caller traits are
-/// blanket-implemented for every `SharedCaller`, so a wrapped capability exposes the
-/// same typed methods as the real one.
-pub trait SharedCaller<S: SharedSpec>: 'static + Clone {
-    /// Forward a raw method call to the capability; the primitive everything else is
-    /// sugar over.
-    fn forward_shared(
-        &self,
-        method: &str,
-        payload: Vec<u8>,
-        cx: &mut gpui::App,
-    ) -> Receipt<Vec<u8>>;
-
-    /// React to the capability's `cx.notify`.
-    fn observe_shared(
-        &self,
-        cx: &mut gpui::App,
-        callback: impl FnMut(&mut gpui::App) + 'static,
-    ) -> gpui::Subscription;
-
-    /// React to every event from the capability, undecoded; the primitive
-    /// [`SharedCaller::subscribe_shared`] is sugar over.
-    fn subscribe_shared_raw(
-        &self,
-        cx: &mut gpui::App,
-        callback: impl FnMut(&str, &[u8], &mut gpui::App) + 'static,
-    ) -> gpui::Subscription;
-
-    /// Send a typed message; await the receipt to know it was applied.
-    fn send_shared<M: SharedMessage<Spec = S>>(&self, message: M, cx: &mut gpui::App) -> Receipt {
-        match encode(&message) {
-            Ok(payload) => self.forward_shared(M::METHOD, payload, cx).acknowledged(),
-            Err(error) => {
-                log::error!(
-                    "embedded_gpui: failed to encode {}::{}: {error:#}",
-                    S::TYPE_NAME,
-                    M::METHOD
-                );
-                Receipt::dropped()
-            }
-        }
-    }
-
-    /// Call a typed method, resolving with its return value.
-    fn call_shared<M: SharedMessage<Spec = S>>(
-        &self,
-        message: M,
-        cx: &mut gpui::App,
-    ) -> Receipt<M::Response> {
-        match encode(&message) {
-            Ok(payload) => self.forward_shared(M::METHOD, payload, cx).decoded(),
-            Err(error) => {
-                log::error!(
-                    "embedded_gpui: failed to encode {}::{}: {error:#}",
-                    S::TYPE_NAME,
-                    M::METHOD
-                );
-                Receipt::dropped()
-            }
-        }
-    }
-
-    /// React to a typed event from the capability.
-    fn subscribe_shared<E: SharedEvent<Spec = S>>(
-        &self,
-        cx: &mut gpui::App,
-        mut callback: impl FnMut(&E, &mut gpui::App) + 'static,
-    ) -> gpui::Subscription {
-        self.subscribe_shared_raw(cx, move |name, payload, cx| {
-            if name == E::EVENT {
-                match decode::<E>(payload) {
-                    Ok(event) => callback(&event, cx),
-                    Err(error) => log::error!(
-                        "embedded_gpui: failed to decode {} event {:?}: {error:#}",
-                        S::TYPE_NAME,
-                        E::EVENT
-                    ),
-                }
-            }
-        })
-    }
-}
-
-impl<S: SharedSpec> SharedCaller<S> for Remote<S> {
-    fn forward_shared(
-        &self,
-        method: &str,
-        payload: Vec<u8>,
-        cx: &mut gpui::App,
-    ) -> Receipt<Vec<u8>> {
-        self.forward(method, payload, cx)
-    }
-
-    fn observe_shared(
-        &self,
-        cx: &mut gpui::App,
-        callback: impl FnMut(&mut gpui::App) + 'static,
-    ) -> gpui::Subscription {
-        self.observe(cx, callback)
-    }
-
-    fn subscribe_shared_raw(
-        &self,
-        cx: &mut gpui::App,
-        callback: impl FnMut(&str, &[u8], &mut gpui::App) + 'static,
-    ) -> gpui::Subscription {
-        self.subscribe_raw(cx, callback)
     }
 }
 

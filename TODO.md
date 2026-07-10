@@ -44,6 +44,41 @@ one-focus model; window-granular dirtiness (one animating widget redraws the
 composition) is fine at gpui's normal scale, with per-region damage tracking as
 a later optimization.
 
+## One root object per side: stringless discovery
+
+Well-known names were the bootstrap namespace; for Zed extensions they should
+not survive. Strings are ambient authority (any plugin that can spell
+"workspace" can attach to it) and a second identifier system living alongside
+refs. The replacement: **one starting object per side**. At init the host hands
+the plugin a single capability — the host root, whose typed methods return
+everything else (`fn workspace(&mut self, cx) -> SharedRef<WorkspaceApi>`) —
+and symmetrically the plugin's `Plugin::new` returns *its* root, through which
+the host reaches every plugin surface. Everything participates in one object
+system, and authority becomes reachability from your root.
+
+- `share(name)` / `remote(name)` and the whole announcement/name-binding
+  machinery (unclaimed announcements, `TYPE_NAME` checks at bind, name-keyed
+  projections) get deleted; the wire keeps only refs. Names retreat into
+  schema method names, where they belong — codegen, not identifiers (the same
+  place Wayland keeps its interface strings).
+- The root makes the policy chokepoint concrete and *total*: hand a plugin an
+  `Attenuated` root and its whole reachable world is attenuated; a deep
+  membrane around the root covers the entire API surface transitively;
+  powerbox-style consent is a root method that asks the user before minting a
+  ref. Per-plugin tailoring is just constructing different roots.
+- Discovery *is* the root schema: optional capabilities are methods returning
+  refs (or an error to degrade on); the plugin-to-plugin registry (see
+  multi-plugin routing) becomes an object reachable from the root, opt-in as
+  before.
+- Converges with views-as-objects above: `create_view(name)` is also a string
+  API. Renderable refs plus a root means the host asks the plugin's root for
+  surfaces, and no string identifiers remain anywhere in the protocol.
+- The caution: the root schema becomes the real compatibility surface for Zed
+  extensions — the de facto extension API crate. Unknown methods already fail
+  soft, but it wants explicit versioning discipline (a version method, or
+  probe-and-degrade conventions), because it can never break casually once
+  extensions ship against it.
+
 ## Platform completeness
 
 - [ ] **Resource limits**: wasmtime epoch interruption for runaway plugins, store
@@ -95,7 +130,8 @@ a later optimization.
 ## Zed integration
 
 - [ ] **Mount points**: where plugin views attach in the workspace (panels,
-  items, status bar) and how they're declared.
+  items, status bar) and how they're declared — as methods on the root
+  objects (see "stringless discovery"), not as a naming convention.
 - [ ] **Packaging**: shipping components through the extension registry;
   versioning the WIT protocol.
 - [ ] **Upstreaming**: `run_embedded`/`ApplicationHandle` is PR'd

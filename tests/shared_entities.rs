@@ -1,5 +1,9 @@
-//! End-to-end tests for shared entities: a real wasm32-wasip2 guest (see `test_plugin/`)
+//! End-to-end tests for shared entities: a real wasm32-wasip2 plugin (see `test_plugin/`)
 //! loaded into a wasmtime store, driven from GPUI's deterministic test executor.
+//!
+//! The bootstrap is symmetric and stringless: each end installs a root object at its
+//! id 0 (`share_root`), and every capability below is obtained by calling methods on
+//! the other end's root (`remote_root` + `connect`).
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -8,7 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use embedded_gpui::{
-    PluginHost, PluginHostHandle as _, PluginInstance, PluginOptions, decode, encode, shared,
+    PluginHost, PluginHostHandle as _, PluginInstance, PluginOptions, Remote, decode, encode,
+    shared,
 };
 use embedded_gpui_util::{Attenuated, Audited, Mirror};
 use gpui::{AppContext as _, Context, Entity, Task, TestAppContext};
@@ -16,7 +21,8 @@ use rand::prelude::*;
 use test_schema::{
     Bump, ChameleonApi, ChameleonState, Count, CounterMilestone, FactoryApi, FactoryApiCaller as _,
     GatekeeperApi, GatekeeperApiCaller as _, Increment, ItemApiCaller as _, TestCounterApi,
-    TestCounterApiCaller as _, VaultApi, VaultApiCaller as _,
+    TestCounterApiCaller as _, TestHost, TestPlugin, TestPluginCaller as _, VaultApi,
+    VaultApiCaller as _,
 };
 
 /// Builds the test plugin once per process and returns the component path.
@@ -42,7 +48,22 @@ fn test_plugin_path() -> PathBuf {
     plugin_dir.join("target/wasm32-wasip2/debug/test_plugin.wasm")
 }
 
-fn setup(cx: &mut TestAppContext) -> Entity<PluginHost> {
+/// The host's root object: what the plugin reaches through `remote_root`.
+struct HostRoot {
+    pings: u32,
+}
+
+#[shared]
+impl TestHost for HostRoot {
+    fn ping(&mut self, message: String, cx: &mut Context<Self>) -> String {
+        self.pings += 1;
+        cx.notify();
+        format!("pong: {message}")
+    }
+}
+
+/// A host without its root installed yet, for exercising the bootstrap race.
+fn setup_without_root(cx: &mut TestAppContext) -> Entity<PluginHost> {
     let path = test_plugin_path();
     let instance = cx.update(|_| {
         PluginInstance::new(
@@ -54,6 +75,15 @@ fn setup(cx: &mut TestAppContext) -> Entity<PluginHost> {
     cx.new(|cx| PluginHost::new(instance, cx))
 }
 
+fn setup(cx: &mut TestAppContext) -> Entity<PluginHost> {
+    let host = setup_without_root(cx);
+    cx.update(|cx| {
+        let root = cx.new(|_| HostRoot { pings: 0 });
+        host.share_root(&root, cx);
+    });
+    host
+}
+
 /// Flush deferred effects and host-scheduled ticks deterministically.
 fn settle(cx: &mut TestAppContext) {
     for _ in 0..5 {
@@ -63,10 +93,63 @@ fn settle(cx: &mut TestAppContext) {
     cx.executor().run_until_parked();
 }
 
+/// Call one of the plugin root's capability-returning methods and connect the result:
+/// the whole discovery story in one helper.
+macro_rules! from_root {
+    ($fn_name:ident -> $spec:ty) => {
+        async fn $fn_name(host: &Entity<PluginHost>, cx: &mut TestAppContext) -> Remote<$spec> {
+            let root = cx.update(|cx| host.remote_root::<TestPlugin>(cx));
+            let receipt = cx.update(|cx| root.$fn_name(cx));
+            settle(cx);
+            let reference = receipt.await.expect(concat!(stringify!($fn_name), " ref"));
+            cx.update(|cx| host.connect(reference, cx))
+        }
+    };
+}
+
+from_root!(counter -> TestCounterApi);
+from_root!(factory -> FactoryApi);
+from_root!(gatekeeper -> GatekeeperApi);
+from_root!(chameleon -> ChameleonApi);
+
+#[gpui::test]
+async fn test_roots_bootstrap_both_directions(cx: &mut TestAppContext) {
+    let host = setup(cx);
+
+    // Host -> plugin: the plugin's root answers like any object.
+    let root = cx.update(|cx| host.remote_root::<TestPlugin>(cx));
+
+    // Plugin -> host, from inside a handler: the plugin holds a remote to the host's
+    // root and calls it, so one receipt exercises both bootstraps.
+    let receipt = cx.update(|cx| root.ping_host("hello".to_string(), cx));
+    settle(cx);
+    assert_eq!(receipt.await.expect("ping_host"), "pong: hello");
+}
+
+#[gpui::test]
+async fn test_bootstraps_may_race(cx: &mut TestAppContext) {
+    // Let the plugin fully boot — its `remote_root` has already subscribed to a host
+    // root that does not exist yet. That traffic queues instead of failing.
+    let host = setup_without_root(cx);
+    settle(cx);
+
+    // Install the root late: the queued traffic drains, and the bootstrap completes
+    // as if the orders had never crossed.
+    cx.update(|cx| {
+        let root = cx.new(|_| HostRoot { pings: 0 });
+        host.share_root(&root, cx);
+    });
+
+    let plugin = cx.update(|cx| host.remote_root::<TestPlugin>(cx));
+    let receipt = cx.update(|cx| plugin.ping_host("late".to_string(), cx));
+    settle(cx);
+    assert_eq!(receipt.await.expect("ping_host"), "pong: late");
+}
+
 #[gpui::test]
 async fn test_send_is_read_your_writes_by_ordering(cx: &mut TestAppContext) {
     let host = setup(cx);
-    let counter = cx.update(|cx| host.remote::<TestCounterApi>("guest-counter", cx));
+    let counter = counter(&host, cx).await;
 
     let receipt = cx.update(|cx| counter.send(Increment { by: 3 }, cx));
     settle(cx);
@@ -81,7 +164,7 @@ async fn test_send_is_read_your_writes_by_ordering(cx: &mut TestAppContext) {
 #[gpui::test]
 async fn test_calls_resolve_with_responses_in_order(cx: &mut TestAppContext) {
     let host = setup(cx);
-    let counter = cx.update(|cx| host.remote::<TestCounterApi>("guest-counter", cx));
+    let counter = counter(&host, cx).await;
 
     let first = cx.update(|cx| counter.increment(2, cx));
     let second = cx.update(|cx| counter.increment(5, cx));
@@ -95,7 +178,7 @@ async fn test_calls_resolve_with_responses_in_order(cx: &mut TestAppContext) {
 #[gpui::test]
 async fn test_mirror_keeps_an_observable_local_copy(cx: &mut TestAppContext) {
     let host = setup(cx);
-    let counter = cx.update(|cx| host.remote::<TestCounterApi>("guest-counter", cx));
+    let counter = counter(&host, cx).await;
 
     // A mirror is snapshots-as-a-library: it refetches `count` on every notify from the
     // home, starting with the notify that answers the subscription.
@@ -121,7 +204,7 @@ async fn test_mirror_keeps_an_observable_local_copy(cx: &mut TestAppContext) {
 #[gpui::test]
 async fn test_events_cross_the_boundary(cx: &mut TestAppContext) {
     let host = setup(cx);
-    let counter = cx.update(|cx| host.remote::<TestCounterApi>("guest-counter", cx));
+    let counter = counter(&host, cx).await;
 
     let milestones: Rc<RefCell<Vec<u32>>> = Rc::default();
     let _subscription = cx.update(|cx| {
@@ -152,7 +235,7 @@ async fn test_events_cross_the_boundary(cx: &mut TestAppContext) {
 #[gpui::test]
 async fn test_shared_refs_build_object_graphs(cx: &mut TestAppContext) {
     let host = setup(cx);
-    let factory = cx.update(|cx| host.remote::<FactoryApi>("factory", cx));
+    let factory = factory(&host, cx).await;
 
     // A call whose response is a capability reference to a freshly shared child.
     let created = cx.update(|cx| factory.create("alpha".to_string(), cx));
@@ -206,11 +289,11 @@ async fn test_caretaker_membrane_forwards_and_revokes(cx: &mut TestAppContext) {
     let vault = cx.new(|_| Vault {
         secret: "swordfish".to_string(),
     });
-    let vault_ref = cx.update(|cx| host.share_anonymous(&vault, cx));
+    let vault_ref = cx.update(|cx| host.share(&vault, cx));
 
-    // Hand the vault capability to the guest's gatekeeper; it wraps it in a caretaker
+    // Hand the vault capability to the plugin's gatekeeper; it wraps it in a caretaker
     // and returns a ref to *that*. The caller can't tell the difference.
-    let gatekeeper = cx.update(|cx| host.remote::<GatekeeperApi>("gatekeeper", cx));
+    let gatekeeper = gatekeeper(&host, cx).await;
     let guarded = cx.update(|cx| gatekeeper.guard(vault_ref, cx));
     settle(cx);
     let guarded_ref = guarded.await.expect("guard should respond with a ref");
@@ -252,7 +335,7 @@ async fn test_caretaker_membrane_forwards_and_revokes(cx: &mut TestAppContext) {
 #[gpui::test]
 async fn test_dropping_last_remote_releases_the_capability(cx: &mut TestAppContext) {
     let host = setup(cx);
-    let factory = cx.update(|cx| host.remote::<FactoryApi>("factory", cx));
+    let factory = factory(&host, cx).await;
 
     let created = cx.update(|cx| factory.create("ephemeral".to_string(), cx));
     settle(cx);
@@ -292,7 +375,7 @@ async fn test_dropping_last_remote_releases_the_capability(cx: &mut TestAppConte
 #[gpui::test]
 async fn test_attenuation_is_a_library_pattern(cx: &mut TestAppContext) {
     let host = setup(cx);
-    let factory = cx.update(|cx| host.remote::<FactoryApi>("factory", cx));
+    let factory = factory(&host, cx).await;
 
     // Start from a FULL capability to a guest-homed item...
     let created = cx.update(|cx| factory.create("gamma".to_string(), cx));
@@ -304,12 +387,12 @@ async fn test_attenuation_is_a_library_pattern(cx: &mut TestAppContext) {
     // with an empty allowlist, share the wrapper, and hand out ITS ref. No core
     // protocol support involved, and no cooperation from the item's author.
     let readonly = cx.update(|cx| Attenuated::new(full.clone(), &[], cx));
-    let readonly_ref = cx.update(|cx| host.share_anonymous(&readonly, cx));
+    let readonly_ref = cx.update(|cx| host.share(&readonly, cx));
     assert_ne!(readonly_ref.entity_id(), full_ref.entity_id());
 
-    // The guest probes a write through the attenuated ref: rejected by the wrapper,
+    // The plugin probes a write through the attenuated ref: rejected by the wrapper,
     // without the item ever hearing about it.
-    let gatekeeper = cx.update(|cx| host.remote::<GatekeeperApi>("gatekeeper", cx));
+    let gatekeeper = gatekeeper(&host, cx).await;
     let denied = cx.update(|cx| {
         gatekeeper.probe(
             readonly_ref,
@@ -332,7 +415,7 @@ async fn test_attenuation_is_a_library_pattern(cx: &mut TestAppContext) {
 
     // An allowlist that names the method lets it through, byte-for-byte.
     let writable = cx.update(|cx| Attenuated::new(full.clone(), &["bump"], cx));
-    let writable_ref = cx.update(|cx| host.share_anonymous(&writable, cx));
+    let writable_ref = cx.update(|cx| host.share(&writable, cx));
     let allowed = cx.update(|cx| {
         gatekeeper.probe(
             writable_ref,
@@ -350,19 +433,19 @@ async fn test_attenuation_is_a_library_pattern(cx: &mut TestAppContext) {
 #[gpui::test]
 async fn test_audited_wrapper_keeps_a_ledger(cx: &mut TestAppContext) {
     let host = setup(cx);
-    let factory = cx.update(|cx| host.remote::<FactoryApi>("factory", cx));
+    let factory = factory(&host, cx).await;
 
     let created = cx.update(|cx| factory.create("ledgered".to_string(), cx));
     settle(cx);
     let item_ref = created.await.expect("create");
     let item = cx.update(|cx| host.connect(item_ref, cx));
 
-    // Wrap the capability in an Audited and hand the WRAPPER's ref to the guest. The
-    // ledger stays with us, the wrapper's owner; the guest just sees a working item.
+    // Wrap the capability in an Audited and hand the WRAPPER's ref to the plugin. The
+    // ledger stays with us, the wrapper's owner; the plugin just sees a working item.
     let audited = cx.update(|cx| Audited::new(item.clone(), cx));
-    let audited_ref = cx.update(|cx| host.share_anonymous(&audited, cx));
+    let audited_ref = cx.update(|cx| host.share(&audited, cx));
 
-    let gatekeeper = cx.update(|cx| host.remote::<GatekeeperApi>("gatekeeper", cx));
+    let gatekeeper = gatekeeper(&host, cx).await;
     for _ in 0..2 {
         let bumped = cx.update(|cx| {
             gatekeeper.probe(
@@ -394,7 +477,7 @@ async fn test_audited_wrapper_keeps_a_ledger(cx: &mut TestAppContext) {
 #[gpui::test]
 async fn test_chameleon_handles_methods_dynamically(cx: &mut TestAppContext) {
     let host = setup(cx);
-    let chameleon = cx.update(|cx| host.remote::<ChameleonApi>("chameleon", cx));
+    let chameleon = chameleon(&host, cx).await;
 
     // Default mode echoes.
     let poke = cx.update(|cx| chameleon.call_raw::<String>("poke", encode(&"hello").unwrap(), cx));
@@ -429,7 +512,7 @@ async fn test_chameleon_handles_methods_dynamically(cx: &mut TestAppContext) {
 #[gpui::test(iterations = 10)]
 async fn test_random_interleavings_stay_consistent(cx: &mut TestAppContext, mut rng: StdRng) {
     let host = setup(cx);
-    let counter = cx.update(|cx| host.remote::<TestCounterApi>("guest-counter", cx));
+    let counter = counter(&host, cx).await;
 
     let mut expected_total = 0u32;
     let mut pending_calls = Vec::new();

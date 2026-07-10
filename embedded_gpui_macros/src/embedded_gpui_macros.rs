@@ -4,12 +4,12 @@ use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::spanned::Spanned as _;
-use syn::{FnArg, Ident, ItemImpl, ItemTrait, LitStr, Token, TraitItem, Type, bracketed};
+use syn::{FnArg, Ident, ItemImpl, ItemTrait, Token, TraitItem, Type, bracketed};
 
 /// Turns a trait declaration into a complete shared-entity interface.
 ///
 /// ```ignore
-/// #[shared_interface("demo.counter", events = [Milestone])]
+/// #[shared_interface(events = [Milestone])]
 /// pub trait CounterApi {
 ///     fn increment(&mut self, by: u32, cx: &mut gpui::Context<Self>) -> u32;
 ///     fn count(&mut self, cx: &mut gpui::Context<Self>) -> u32;
@@ -98,24 +98,21 @@ pub fn shared_data(_attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 struct InterfaceArgs {
-    type_name: LitStr,
     events: Vec<syn::Path>,
 }
 
 impl Parse for InterfaceArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
-        let type_name: LitStr = input.parse().map_err(|_| {
-            syn::Error::new(
-                input.span(),
-                "expected a wire type name first: #[shared_interface(\"demo.counter\")]",
-            )
-        })?;
         let mut events = Vec::new();
+        let mut first = true;
         while !input.is_empty() {
-            input.parse::<Token![,]>()?;
-            if input.is_empty() {
-                break;
+            if !first {
+                input.parse::<Token![,]>()?;
+                if input.is_empty() {
+                    break;
+                }
             }
+            first = false;
             let key: Ident = input.parse()?;
             if key == "events" {
                 input.parse::<Token![=]>()?;
@@ -132,7 +129,7 @@ impl Parse for InterfaceArgs {
                 ));
             }
         }
-        Ok(Self { type_name, events })
+        Ok(Self { events })
     }
 }
 
@@ -150,10 +147,13 @@ fn expand_interface(
     args: InterfaceArgs,
     mut item_trait: ItemTrait,
 ) -> syn::Result<proc_macro2::TokenStream> {
-    let InterfaceArgs { type_name, events } = args;
+    let InterfaceArgs { events } = args;
 
     let vis = item_trait.vis.clone();
     let spec_ident = item_trait.ident.clone();
+    // The interface's own name doubles as the diagnostic type name; nothing on the
+    // wire checks it.
+    let type_name = spec_ident.to_string();
     let doc_attrs: Vec<_> = item_trait
         .attrs
         .iter()
@@ -389,10 +389,9 @@ fn expand_interface(
     });
 
     let spec_doc = format!(
-        "\n\nThe `{spec_ident}` shared interface (wire name `{}`): hold one as \
-         `Remote<{spec_ident}>`, reference one as `SharedRef<{spec_ident}>`, implement \
-         one with `#[shared] impl {spec_ident} for ...`.",
-        type_name.value()
+        "\n\nThe `{spec_ident}` shared interface: hold one as `Remote<{spec_ident}>`, \
+         reference one as `SharedRef<{spec_ident}>`, implement one with \
+         `#[shared] impl {spec_ident} for ...`."
     );
     let caller_doc = format!(
         "Typed calls to a shared `{spec_ident}` entity: implemented for \

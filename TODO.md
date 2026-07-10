@@ -4,65 +4,7 @@ What's deliberately not built yet, in rough priority order. The spike's goal is
 to prove the architecture; these are the known gaps between "proven" and
 "product".
 
-## One root object per side: stringless discovery (do this first)
-
-Sequenced deliberately *before* views-as-objects: this deletes protocol
-machinery (announcements, name binding) that the views work would otherwise
-have to route around, and once both roots exist, "give me a surface" is just
-another typed method returning a renderable ref — the two designs snap
-together instead of being retrofitted.
-
-Well-known names were the bootstrap namespace; for Zed extensions they should
-not survive. Strings are ambient authority (any plugin that can spell
-"workspace" can attach to it) and a second identifier system living alongside
-refs. The replacement: **one starting object per side**. At init the host hands
-the plugin a single capability — the host root, whose typed methods return
-everything else (`fn workspace(&mut self, cx) -> SharedRef<WorkspaceApi>`) —
-and symmetrically the plugin's `Plugin::new` returns *its* root, through which
-the host reaches every plugin surface. Everything participates in one object
-system, and authority becomes reachability from your root.
-
-- `share(name)` / `remote(name)` and the whole announcement/name-binding
-  machinery (unclaimed announcements, `TYPE_NAME` checks at bind, name-keyed
-  projections) get deleted; the wire keeps only refs. Names retreat into
-  schema method names, where they belong — codegen, not identifiers (the same
-  place Wayland keeps its interface strings).
-- The root makes the policy chokepoint concrete and *total*: hand a plugin an
-  `Attenuated` root and its whole reachable world is attenuated; a deep
-  membrane around the root covers the entire API surface transitively;
-  powerbox-style consent is a root method that asks the user before minting a
-  ref. Per-plugin tailoring is just constructing different roots.
-- Discovery *is* the root schema: optional capabilities are methods returning
-  refs (or an error to degrade on); the plugin-to-plugin registry (see
-  multi-plugin routing) becomes an object reachable from the root, opt-in as
-  before.
-- Converges with views-as-objects below: `create_view(name)` is also a string
-  API. Renderable refs plus a root means the host asks the plugin's root for
-  surfaces, and no string identifiers remain anywhere in the protocol.
-- **Total symmetry is the goal**: both sides run their own copy of the exact
-  same code doing the exact same thing — the host is special only in owning
-  the compositor and the sandbox, not in API shape. Concretely that means
-  finishing what `Remote`'s transport closure started: one shared
-  home/projection registry implementation, host and guest differing only in
-  how bytes move.
-- The deeper simplification: today the host provides an assortment of things
-  (view slots, shares, mounts) and the plugin provides an assortment of things
-  (named views, named entities), each with its own bespoke plumbing. With one
-  entry point per side, all of it becomes plain method calls: the host calls
-  the plugin root's methods to get the plugin's features, the plugin calls the
-  host root's methods to get the host's features, and the initial exchange of
-  the two roots is the *entire* bootstrap. The `Plugin` trait shrinks toward
-  "construct your root object"; the WIT world trends toward pure transport
-  (scenes, input, text, scheduling, one object channel) with every *feature*
-  living in the two root schemas, where it can be typed, versioned, attenuated,
-  and audited like everything else.
-- The caution: the root schema becomes the real compatibility surface for Zed
-  extensions — the de facto extension API crate. Unknown methods already fail
-  soft, but it wants explicit versioning discipline (a version method, or
-  probe-and-degrade conventions), because it can never break casually once
-  extensions ship against it.
-
-## Views as replicated objects (after the root object)
+## Views as replicated objects (do this first)
 
 Today views are addressed by name (`host.view("panel")`) over a dedicated
 scene channel. That has the same weakness names always have: surfaces that are
@@ -73,8 +15,8 @@ list to the other side, where a remote to it can be mounted anywhere in the
 element tree.
 
 - `view("panel")` dissolves into a typed method on the plugin's root object
-  returning a renderable ref (see "one root object per side"); no view names,
-  no view ids.
+  returning a renderable ref — the roots exist now, so this is the last string
+  identifier in the protocol; no view names, no view ids.
 - Inline surfaces are anonymous renderable refs traveling in payloads:
   `Vec<(BufferRow, SharedRef<InlayWidget>)>`, connected and mounted by the
   host wherever its own layout puts them.
@@ -103,6 +45,26 @@ one-focus model; window-granular dirtiness (one animating widget redraws the
 composition) is fine at gpui's normal scale, with per-region damage tracking as
 a later optimization.
 
+## Object model follow-ups (from the root-object pass)
+
+- [ ] **Promise pipelining**: a ref returned by a method call round-trips before
+  you can call through it (the demo's views render a brief "connecting" state).
+  Cap'n-Proto-style promise ids — call through an unresolved ref, home-side
+  resolution table, FIFO behind the resolving call — would erase that latency.
+  The old name-based pending-send queues were this in miniature; the root pass
+  deleted them deliberately rather than keeping names alive for it.
+- [ ] **Share dedup**: sharing the same entity twice mints two independent ids.
+  Dedup wants a per-entity identity map (and interacts with release: both refs
+  share one strong hold).
+- [ ] **Root versioning discipline**: the root schema is the real compatibility
+  surface (for Zed: the extension API). Unknown methods already fail soft, but
+  it wants an explicit convention — a `version()` method or probe-and-degrade —
+  before anything ships against it.
+- [ ] **A public symmetric handle**: `PluginHostHandle` (host) and the free
+  functions (plugin) expose the same operations with the same names; a shared
+  `Peer`-style handle type both ends hand out would finish the symmetry at the
+  API-surface level too.
+
 ## Platform completeness
 
 - [ ] **Resource limits**: wasmtime epoch interruption for runaway plugins, store
@@ -115,10 +77,12 @@ a later optimization.
 - [ ] **Atlas hygiene**: image/SVG payloads are cached per instance and never
   evicted; `FontId`s are host-global and session-scoped (a persisted display
   list from a previous session would replay wrong glyphs).
-- [ ] **Multi-plugin routing**: several stores behind one host, with the host
-  routing shared-entity traffic between plugins (the id spaces already
-  anticipate this: guest-homed ids carry a high bit; loopback routing is the
-  single-store special case of the same reflection logic). This is also the
+- [ ] **Multi-plugin routing**: several stores behind one host. The registry is
+  already peer-to-peer (one side-blind module per connection end, namespaced by
+  one bit), so multi-plugin is "one registry pair per connection",
+  Cap'n-Proto-vat style: plugin-to-plugin traffic is either routed through the
+  host (a membrane, with id rewriting at each hop) or a fresh pairwise
+  connection. This is also the
   inter-plugin API story: plugins never share memory, only routed messages.
   Discovery is a host-homed registry entity - Wayland-style, a `list`
   call returns (plugin, interface, version, ref) - and being listed is opt-in, so

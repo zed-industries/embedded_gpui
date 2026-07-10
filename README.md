@@ -18,11 +18,15 @@ changes; nothing here is a supported API yet.
 - A host runtime: loads a component with wasmtime, replays its display
   lists as native GPUI primitives (text hits the host's real rasterizer), and
   never calls into wasm from the frame path.
-- **Shared entities**: an entity lives on one side ("home"); the other side
+- **Shared entities**: an entity lives on one end ("home"); the other end
   holds a `Remote` that behaves as much like an `Entity<T>` as a sandbox wall
   allows — typed method calls with responses, `observe` for the home's
   `cx.notify`, `subscribe` for its `cx.emit` events, refcounted auto-release
   on drop, and capability references you can embed in payloads (`SharedRef`).
+  The object model is symmetric and stringless: each end installs one **root
+  object** at its id 0 (`share_root`), reaches the other end's root with
+  `remote_root`, and discovers everything else as refs returned by method
+  calls — authority is reachability from your root.
 - **Typed interfaces**: one attribute on a trait (`#[shared_interface]`) makes
   one name the whole interface — `Remote<CounterApi>` for callers,
   `#[shared] impl CounterApi for MyEntity` for the implementation, both
@@ -49,7 +53,10 @@ div()
 ```
 
 The WASI sandbox grants nothing but stdout/stderr by default; every additional
-authority is an explicit `PluginOptions::with_wasi` choice.
+authority is an explicit `PluginOptions::with_wasi` choice — and everything the
+plugin can *do* to your app is reachable from the one root object you install
+with `share_root`, so tailoring (or faking) a plugin's world is constructing a
+different root.
 
 ## Quick start
 

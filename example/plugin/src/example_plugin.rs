@@ -1,20 +1,24 @@
 //! A demo GPUI plugin: two views (a button and a panel) sharing one guest App, rendered
 //! by the `embedded_gpui` host. The panel exercises text, SVGs, images, paths, and
 //! keyboard input. See `DESIGN.md`.
+//!
+//! The bootstrap is two root objects: this plugin installs its `DemoPlugin` root at its
+//! id 0 (`share_root`), and reaches the host through the host's `DemoHost` root
+//! (`remote_root`). Every capability in either direction is a method call from there.
 
 use embedded_gpui::{
-    Plugin, Receipt, Remote, register_plugin, remote, share, share_anonymous, shared,
+    Plugin, Receipt, Remote, SharedRef, connect, register_plugin, remote_root, share, share_root,
+    shared,
 };
 use embedded_gpui_util::Mirror;
 use example_schema::{
-    Clicks, CommandApi, CounterApi, Increment, Milestone, PaletteApi, PaletteEntry, TextApi,
-    WorkspaceApi, WorkspaceApiCaller as _,
+    Clicks, CommandApi, CounterApi, DemoHost, DemoHostCaller as _, DemoPlugin, Increment,
+    Milestone, PaletteApi, PaletteEntry, TextApi, WorkspaceApi, WorkspaceApiCaller as _,
 };
 use gpui::{
     AnyView, App, AssetSource, Bounds, Context, ElementInputHandler, Entity, EntityInputHandler,
     FocusHandle, KeyDownEvent, MouseButton, PathBuilder, Pixels, RenderImage, SharedString,
-    Subscription, UTF16Selection, WeakEntity, Window, canvas, div, hsla, img, point, prelude::*,
-    px, rgb, svg,
+    Subscription, UTF16Selection, Window, canvas, div, hsla, img, point, prelude::*, px, rgb, svg,
 };
 use std::borrow::Cow;
 use std::ops::Range;
@@ -39,29 +43,33 @@ impl AssetSource for PluginAssets {
 }
 
 struct ExamplePlugin {
-    /// The click counter homed on the HOST: reads are calls (mirrored locally for
-    /// rendering), writes are `increment` calls dispatched to the host's handler.
-    counter: Remote<CounterApi>,
-    /// The host's workspace service: the plugin drives native chrome through it.
-    workspace: Remote<WorkspaceApi>,
+    /// The host's root object: the single capability this plugin starts from.
+    host: Remote<DemoHost>,
+    /// This plugin's root object, installed at this end's id 0.
+    root: Entity<PluginRoot>,
 }
 
 impl Plugin for ExamplePlugin {
     fn new(cx: &mut App) -> Self {
-        Self {
-            counter: remote::<CounterApi>("clicks", cx),
-            workspace: remote::<WorkspaceApi>("workspace", cx),
-        }
+        let host = remote_root::<DemoHost>(cx);
+        let root = cx.new(|_| PluginRoot::default());
+        share_root(&root, cx);
+        Self { host, root }
     }
 
     fn create_view(&mut self, name: &str, _window: &mut Window, cx: &mut App) -> AnyView {
         match name {
-            "button" => cx
-                .new(|cx| ButtonView::new(self.counter.clone(), cx))
-                .into(),
-            _ => cx
-                .new(|cx| PanelView::new(self.counter.clone(), self.workspace.clone(), cx))
-                .into(),
+            "button" => cx.new(|cx| ButtonView::new(self.host.clone(), cx)).into(),
+            _ => {
+                // The panel renders the same entities the root's methods publish: the
+                // lazy factories converge on one input line and one wave, whichever
+                // side asks first.
+                let (input_line, wave) = self.root.update(cx, |root, cx| {
+                    (root.ensure_input_line(cx), root.ensure_wave(cx))
+                });
+                cx.new(|cx| PanelView::new(self.host.clone(), input_line, wave, cx))
+                    .into()
+            }
         }
     }
 
@@ -72,23 +80,163 @@ impl Plugin for ExamplePlugin {
 
 register_plugin!(ExamplePlugin);
 
+/// The plugin's root object: the host's entire view of this plugin. Each method is a
+/// lazy factory — the entity is created on the first call (from either end) and cached,
+/// so repeated calls return the same ref and `connect` on the host dedups to one
+/// projection.
+#[derive(Default)]
+struct PluginRoot {
+    input_line: Option<Entity<InputLine>>,
+    input_line_ref: Option<SharedRef<TextApi>>,
+    wave: Option<Entity<Wave>>,
+    palette: Option<(Entity<Palette>, SharedRef<PaletteApi>)>,
+    /// The root owns the command entities whose refs travel in the palette.
+    commands: Vec<Entity<WaveCommand>>,
+}
+
+impl PluginRoot {
+    fn ensure_input_line(&mut self, cx: &mut Context<Self>) -> Entity<InputLine> {
+        if let Some(input_line) = &self.input_line {
+            return input_line.clone();
+        }
+        let input_line = cx.new(InputLine::new);
+        self.input_line = Some(input_line.clone());
+        input_line
+    }
+
+    fn ensure_wave(&mut self, cx: &mut Context<Self>) -> Entity<Wave> {
+        if let Some(wave) = &self.wave {
+            return wave.clone();
+        }
+        let wave = cx.new(|_| Wave {
+            speed: 0.15,
+            hue: 0.85,
+        });
+        self.wave = Some(wave.clone());
+        wave
+    }
+}
+
+#[shared]
+impl DemoPlugin for PluginRoot {
+    fn typed_text(&mut self, cx: &mut Context<Self>) -> SharedRef<TextApi> {
+        if let Some(reference) = self.input_line_ref {
+            return reference;
+        }
+        let input_line = self.ensure_input_line(cx);
+        let reference = share(&input_line, cx);
+        self.input_line_ref = Some(reference);
+        reference
+    }
+
+    fn palette(&mut self, cx: &mut Context<Self>) -> SharedRef<PaletteApi> {
+        if let Some((_, reference)) = &self.palette {
+            return *reference;
+        }
+        // The command palette: each command is an anonymously shared entity, and the
+        // palette carries their refs. The host renders the labels as native buttons;
+        // clicking one calls straight back into these closures, which mutate the wave
+        // model the panel view observes.
+        let wave = self.ensure_wave(cx);
+        let command_table: [(&str, CommandAction); 4] = [
+            ("Wave: faster", |wave, cx| {
+                wave.speed = (wave.speed * 1.6).clamp(-1.2, 1.2);
+                cx.notify();
+                format!("wave speed is now {:.2}/tick", wave.speed)
+            }),
+            ("Wave: slower", |wave, cx| {
+                wave.speed /= 1.6;
+                cx.notify();
+                format!("wave speed is now {:.2}/tick", wave.speed)
+            }),
+            ("Wave: reverse", |wave, cx| {
+                wave.speed = -wave.speed;
+                cx.notify();
+                if wave.speed < 0.0 {
+                    "the wave now runs right-to-left".to_string()
+                } else {
+                    "the wave now runs left-to-right".to_string()
+                }
+            }),
+            ("Wave: recolor", |wave, cx| {
+                wave.hue = (wave.hue + 0.13) % 1.0;
+                cx.notify();
+                format!("wave hue is now {:.2}", wave.hue)
+            }),
+        ];
+        let mut commands = Vec::new();
+        let mut entries = Vec::new();
+        for (label, action) in command_table {
+            let command = cx.new(|_| WaveCommand {
+                wave: wave.clone(),
+                action,
+            });
+            let reference = share(&command, cx);
+            entries.push(PaletteEntry {
+                label: label.to_string(),
+                command: reference,
+            });
+            commands.push(command);
+        }
+        let palette = cx.new(|_| Palette { entries });
+        let reference = share(&palette, cx);
+        self.commands = commands;
+        self.palette = Some((palette, reference));
+        reference
+    }
+}
+
+/// The wave's shared knobs: a plain model entity. Commands mutate it, and the panel
+/// view — whenever one exists — observes it. State outlives views.
+struct Wave {
+    speed: f32,
+    hue: f32,
+}
+
 struct ButtonView {
-    counter: Remote<CounterApi>,
+    /// The host counter, discovered through the host root's `counter()` method; `None`
+    /// until that call's receipt resolves (real distributed behavior, not a hack).
+    counter: Option<Remote<CounterApi>>,
     /// A local, observable cache of the host counter's value: snapshots as a library.
-    clicks: Entity<Mirror<u32>>,
+    clicks: Option<Entity<Mirror<u32>>>,
 }
 
 impl ButtonView {
-    fn new(counter: Remote<CounterApi>, cx: &mut Context<Self>) -> Self {
-        let clicks = Mirror::new(counter.clone(), Clicks {}, cx);
-        cx.observe(&clicks, |_, _, cx| cx.notify()).detach();
-        Self { counter, clicks }
+    fn new(host: Remote<DemoHost>, cx: &mut Context<Self>) -> Self {
+        let receipt = host.counter(cx);
+        cx.spawn(async move |this, cx| {
+            let reference = match receipt.await {
+                Ok(reference) => reference,
+                Err(error) => {
+                    eprintln!("[example_plugin] counter discovery failed: {error:#}");
+                    return;
+                }
+            };
+            this.update(cx, |view, cx| {
+                let counter = connect(reference, cx);
+                let clicks = Mirror::new(counter.clone(), Clicks {}, cx);
+                cx.observe(&clicks, |_, _, cx| cx.notify()).detach();
+                view.counter = Some(counter);
+                view.clicks = Some(clicks);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        Self {
+            counter: None,
+            clicks: None,
+        }
     }
 }
 
 impl Render for ButtonView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let click_count = self.clicks.read(cx).latest().copied().unwrap_or(0);
+        let click_count = self
+            .clicks
+            .as_ref()
+            .and_then(|clicks| clicks.read(cx).latest().copied())
+            .unwrap_or(0);
         let counter = self.counter.clone();
         div()
             .size_full()
@@ -107,6 +255,9 @@ impl Render for ButtonView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |_, _, _, cx| {
+                    let Some(counter) = counter.clone() else {
+                        return;
+                    };
                     // A call: resolves with the host handler's return value. The mirror
                     // refetches on the home's notify, so the label follows on its own.
                     let call = counter.call(Increment { by: 1 }, cx);
@@ -119,7 +270,9 @@ impl Render for ButtonView {
                     .detach();
                 }),
             )
-            .child(if click_count == 0 {
+            .child(if self.counter.is_none() {
+                "Connecting…".to_string()
+            } else if click_count == 0 {
                 "Click me!".to_string()
             } else {
                 format!("Clicked {click_count}x")
@@ -128,45 +281,42 @@ impl Render for ButtonView {
 }
 
 struct PanelView {
-    workspace: Remote<WorkspaceApi>,
-    clicks: Entity<Mirror<u32>>,
+    /// The host's workspace service; `None` until the host root's `workspace()` receipt
+    /// resolves.
+    workspace: Option<Remote<WorkspaceApi>>,
+    clicks: Option<Entity<Mirror<u32>>>,
     /// Filled by the host counter's `Milestone` events: `cx.emit` crossing the boundary.
     last_milestone: Option<u32>,
     input_line: Entity<InputLine>,
+    /// The wave knobs live in a model owned by the plugin root (palette commands mutate
+    /// them); the panel only animates the phase and observes the rest.
+    wave: Entity<Wave>,
     gradient: Arc<RenderImage>,
     wave_phase: f32,
-    wave_speed: f32,
-    wave_hue: f32,
     _animation: gpui::Task<()>,
-    _milestones: Subscription,
-    /// The panel owns its command entities and the palette that publishes them; the
-    /// anonymous shares hold them alive for the host too, but ownership lives here.
-    _commands: Vec<Entity<PanelCommand>>,
-    _palette: Entity<Palette>,
+    _milestones: Option<Subscription>,
 }
 
 /// A command the host can discover and invoke: an entity implementing the schema's
-/// `CommandApi` interface, shared anonymously so its ref can travel in the palette.
-/// Each invocation mutates the panel and reports what it did.
-type CommandAction = fn(&mut PanelView, &mut Context<PanelView>) -> String;
+/// `CommandApi` interface, shared so its ref can travel in the palette. Each invocation
+/// mutates the wave model and reports what it did.
+type CommandAction = fn(&mut Wave, &mut Context<Wave>) -> String;
 
-struct PanelCommand {
-    panel: WeakEntity<PanelView>,
+struct WaveCommand {
+    wave: Entity<Wave>,
     action: CommandAction,
 }
 
 #[shared]
-impl CommandApi for PanelCommand {
+impl CommandApi for WaveCommand {
     fn invoke(&mut self, cx: &mut Context<Self>) -> String {
-        match self.panel.upgrade() {
-            Some(panel) => panel.update(cx, |panel, cx| (self.action)(panel, cx)),
-            None => "the panel is gone".to_string(),
-        }
+        let wave = self.wave.clone();
+        wave.update(cx, |wave, cx| (self.action)(wave, cx))
     }
 }
 
 /// The registry the host renders natively: a list of labels plus the capability to run
-/// each one. Homed in the guest under the well-known name "palette".
+/// each one. Homed in the plugin, reached through the root's `palette()` method.
 struct Palette {
     entries: Vec<PaletteEntry>,
 }
@@ -187,22 +337,61 @@ impl TextApi for InputLine {
 
 impl PanelView {
     fn new(
-        counter: Remote<CounterApi>,
-        workspace: Remote<WorkspaceApi>,
+        host: Remote<DemoHost>,
+        input_line: Entity<InputLine>,
+        wave: Entity<Wave>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let clicks = Mirror::new(counter.clone(), Clicks {}, cx);
-        cx.observe(&clicks, |_, _, cx| cx.notify()).detach();
-        // A typed event from the host home, exactly like a local `cx.subscribe`.
-        let this = cx.weak_entity();
-        let milestones = counter.subscribe::<Milestone>(cx, move |event, cx| {
-            let clicks = event.clicks;
-            this.update(cx, |panel, cx| {
-                panel.last_milestone = Some(clicks);
-                cx.notify();
-            })
-            .ok();
-        });
+        // Discover the host's counter and workspace through its root: two receipts,
+        // resolved in the background; the panel renders what it has in the meantime.
+        let counter_receipt = host.counter(cx);
+        let workspace_receipt = host.workspace(cx);
+        cx.spawn(async move |this, cx| {
+            match counter_receipt.await {
+                Ok(reference) => {
+                    this.update(cx, |panel, cx| {
+                        let counter = connect(reference, cx);
+                        let clicks = Mirror::new(counter.clone(), Clicks {}, cx);
+                        cx.observe(&clicks, |_, _, cx| cx.notify()).detach();
+                        // A typed event from the host home, exactly like a local
+                        // `cx.subscribe`.
+                        let weak_panel = cx.weak_entity();
+                        let milestones = counter.subscribe::<Milestone>(cx, move |event, cx| {
+                            let clicks = event.clicks;
+                            weak_panel
+                                .update(cx, |panel, cx| {
+                                    panel.last_milestone = Some(clicks);
+                                    cx.notify();
+                                })
+                                .ok();
+                        });
+                        panel.clicks = Some(clicks);
+                        panel._milestones = Some(milestones);
+                        cx.notify();
+                    })
+                    .ok();
+                }
+                Err(error) => {
+                    eprintln!("[example_plugin] counter discovery failed: {error:#}")
+                }
+            }
+            match workspace_receipt.await {
+                Ok(reference) => {
+                    this.update(cx, |panel, cx| {
+                        panel.workspace = Some(connect(reference, cx));
+                        cx.notify();
+                    })
+                    .ok();
+                }
+                Err(error) => {
+                    eprintln!("[example_plugin] workspace discovery failed: {error:#}")
+                }
+            }
+        })
+        .detach();
+
+        cx.observe(&wave, |_, _, cx| cx.notify()).detach();
+
         // Drives the wave at ~30fps through the guest's timer path: each await arms a
         // dispatcher timer, which asks the host for a wakeup via `request-tick`.
         let animation = cx.spawn(async move |this, cx| {
@@ -211,7 +400,7 @@ impl PanelView {
                     .timer(std::time::Duration::from_millis(33))
                     .await;
                 let still_alive = this.update(cx, |this, cx| {
-                    this.wave_phase += this.wave_speed;
+                    this.wave_phase += this.wave.read(cx).speed;
                     cx.notify();
                 });
                 if still_alive.is_err() {
@@ -219,72 +408,19 @@ impl PanelView {
                 }
             }
         });
-        let input_line = cx.new(InputLine::new);
-        // Homed HERE in the guest: the host mirrors this entity's text natively.
-        share(&input_line, "typed-text", cx);
-
-        // The command palette: each command is an anonymously shared entity, and the
-        // palette carries their refs. The host renders the labels as native buttons;
-        // clicking one calls straight back into these closures.
-        let command_table: [(&str, CommandAction); 4] = [
-            ("Wave: faster", |panel, cx| {
-                panel.wave_speed = (panel.wave_speed * 1.6).clamp(-1.2, 1.2);
-                cx.notify();
-                format!("wave speed is now {:.2}/tick", panel.wave_speed)
-            }),
-            ("Wave: slower", |panel, cx| {
-                panel.wave_speed /= 1.6;
-                cx.notify();
-                format!("wave speed is now {:.2}/tick", panel.wave_speed)
-            }),
-            ("Wave: reverse", |panel, cx| {
-                panel.wave_speed = -panel.wave_speed;
-                cx.notify();
-                if panel.wave_speed < 0.0 {
-                    "the wave now runs right-to-left".to_string()
-                } else {
-                    "the wave now runs left-to-right".to_string()
-                }
-            }),
-            ("Wave: recolor", |panel, cx| {
-                panel.wave_hue = (panel.wave_hue + 0.13) % 1.0;
-                cx.notify();
-                format!("wave hue is now {:.2}", panel.wave_hue)
-            }),
-        ];
-        let weak_panel = cx.weak_entity();
-        let mut commands = Vec::new();
-        let mut entries = Vec::new();
-        for (label, action) in command_table {
-            let command = cx.new(|_| PanelCommand {
-                panel: weak_panel.clone(),
-                action,
-            });
-            let reference = share_anonymous(&command, cx);
-            entries.push(PaletteEntry {
-                label: label.to_string(),
-                command: reference,
-            });
-            commands.push(command);
-        }
-        let palette = cx.new(|_| Palette { entries });
-        share(&palette, "palette", cx);
 
         Self {
-            workspace,
-            clicks,
+            workspace: None,
+            clicks: None,
             last_milestone: None,
             input_line,
+            wave,
             gradient: Arc::new(RenderImage::new(vec![image::Frame::new(gradient_bitmap(
                 48, 48,
             ))])),
             wave_phase: 0.0,
-            wave_speed: 0.15,
-            wave_hue: 0.85,
             _animation: animation,
-            _milestones: milestones,
-            _commands: commands,
-            _palette: palette,
+            _milestones: None,
         }
     }
 }
@@ -306,8 +442,13 @@ fn gradient_bitmap(width: u32, height: u32) -> image::RgbaImage {
 
 impl Render for PanelView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let clicks = self.clicks.read(cx).latest().copied().unwrap_or(0);
+        let clicks = self
+            .clicks
+            .as_ref()
+            .and_then(|clicks| clicks.read(cx).latest().copied())
+            .unwrap_or(0);
         let bar_width = px(16. + (clicks as f32 * 14.) % 380.);
+        let wave_hue = self.wave.read(cx).hue;
         let milestone = match self.last_milestone {
             Some(clicks) => format!("last milestone event: {clicks} clicks"),
             None => "no milestone events yet (every 5th click)".to_string(),
@@ -366,35 +507,35 @@ impl Render for PanelView {
                     ),
             )
             .child(self.input_line.clone())
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(rgb(0x9aa3af))
-                            .child("drive the host:"),
-                    )
-                    .child(panel_button("toast-host", "Toast the host", {
-                        let workspace = self.workspace.clone();
-                        move |cx| {
-                            let receipt = workspace
-                                .show_toast("hello from inside the sandbox 👋".to_string(), cx);
-                            log_reply(receipt, cx);
-                        }
-                    }))
-                    .child(panel_button("tint-host", "Tint host to wave color", {
-                        let workspace = self.workspace.clone();
-                        let hue = self.wave_hue;
-                        move |cx| {
-                            let receipt = workspace.set_accent(hue, cx);
-                            log_reply(receipt, cx);
-                        }
-                    })),
-            )
-            .child(wave_canvas(self.wave_phase, self.wave_hue))
+            .when_some(self.workspace.clone(), |this, workspace| {
+                this.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(rgb(0x9aa3af))
+                                .child("drive the host:"),
+                        )
+                        .child(panel_button("toast-host", "Toast the host", {
+                            let workspace = workspace.clone();
+                            move |cx| {
+                                let receipt = workspace
+                                    .show_toast("hello from inside the sandbox 👋".to_string(), cx);
+                                log_reply(receipt, cx);
+                            }
+                        }))
+                        .child(panel_button("tint-host", "Tint host to wave color", {
+                            move |cx| {
+                                let receipt = workspace.set_accent(wave_hue, cx);
+                                log_reply(receipt, cx);
+                            }
+                        })),
+                )
+            })
+            .child(wave_canvas(self.wave_phase, wave_hue))
             .child(
                 div()
                     .h(px(10.))

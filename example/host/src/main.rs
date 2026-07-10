@@ -1,5 +1,9 @@
 //! Demo host binary: opens a native GPUI window with two embedded plugin views driven by
 //! the `example_plugin` guest component.
+//!
+//! The bootstrap is two root objects: this host installs its `DemoHost` root at its
+//! id 0 (`share_root`), and reaches the plugin through the plugin's `DemoPlugin` root
+//! (`remote_root`). Every capability in either direction is a method call from there.
 
 use std::path::{Path, PathBuf};
 
@@ -8,12 +12,12 @@ use embedded_gpui::{
 };
 use embedded_gpui_util::Mirror;
 use example_schema::{
-    CommandApi, CommandApiCaller as _, Commands, CounterApi, Milestone, PaletteApi, PaletteEntry,
-    Text, TextApi, WorkspaceApi,
+    CommandApi, CommandApiCaller as _, Commands, CounterApi, DemoHost, DemoPlugin,
+    DemoPluginCaller as _, Milestone, PaletteEntry, Text, WorkspaceApi,
 };
 use gpui::{
-    App, Application, Bounds, Context, Entity, EventEmitter, MouseButton, Pixels, WindowBounds,
-    WindowOptions, div, prelude::*, px, rgb, size,
+    App, Application, Bounds, Context, Entity, EventEmitter, MouseButton, Pixels, Task,
+    WindowBounds, WindowOptions, div, prelude::*, px, rgb, size,
 };
 use std::collections::HashMap;
 
@@ -50,6 +54,38 @@ impl CounterApi for Counter {
 struct Workspace {
     accent_hue: f32,
     last_toast: Option<String>,
+}
+
+/// The host's root object: the plugin's entire view of the host. Its methods mint (and
+/// cache) refs to the entities the native UI also renders; handing the plugin a
+/// different root — attenuated, audited, or fake — would change its whole world.
+struct HostRoot {
+    host: Entity<PluginHost>,
+    counter: Entity<Counter>,
+    workspace: Entity<Workspace>,
+    counter_ref: Option<SharedRef<CounterApi>>,
+    workspace_ref: Option<SharedRef<WorkspaceApi>>,
+}
+
+#[shared]
+impl DemoHost for HostRoot {
+    fn counter(&mut self, cx: &mut Context<Self>) -> SharedRef<CounterApi> {
+        if let Some(reference) = self.counter_ref {
+            return reference;
+        }
+        let reference = self.host.share(&self.counter, cx);
+        self.counter_ref = Some(reference);
+        reference
+    }
+
+    fn workspace(&mut self, cx: &mut Context<Self>) -> SharedRef<WorkspaceApi> {
+        if let Some(reference) = self.workspace_ref {
+            return reference;
+        }
+        let reference = self.host.share(&self.workspace, cx);
+        self.workspace_ref = Some(reference);
+        reference
+    }
 }
 
 #[shared]
@@ -109,32 +145,77 @@ fn open_demo_window(host: gpui::Entity<PluginHost>, cx: &mut App) {
                 accent_hue: 0.58,
                 last_toast: None,
             });
-            // Homed on the HOST, driven by the plugin: the counter and the workspace
-            // service, mounted under well-known names.
-            host.share(&counter, "clicks", cx);
-            host.share(&workspace, "workspace", cx);
-            // Homed in the GUEST: the wasm input line's text and the command palette.
-            // Reads are calls, so native rendering goes through local mirrors that
-            // refetch whenever the guest home notifies.
-            let typed_text = Mirror::new(host.remote::<TextApi>("typed-text", cx), Text {}, cx);
-            let palette = Mirror::new(host.remote::<PaletteApi>("palette", cx), Commands {}, cx);
+            // The host's entire API surface, as one object: install the root at this
+            // end's id 0. The plugin discovers the counter and the workspace by calling
+            // its methods.
+            let root = cx.new(|_| HostRoot {
+                host: host.clone(),
+                counter: counter.clone(),
+                workspace: workspace.clone(),
+                counter_ref: None,
+                workspace_ref: None,
+            });
+            host.share_root(&root, cx);
+            // Homed in the PLUGIN: the wasm input line's text and the command palette,
+            // both reached through the plugin root's methods. Reads are calls, so
+            // native rendering goes through local mirrors that refetch whenever the
+            // plugin home notifies.
+            let plugin = host.remote_root::<DemoPlugin>(cx);
+            let typed_text_receipt = plugin.typed_text(cx);
+            let palette_receipt = plugin.palette(cx);
             // Views by name; each fills whatever slot the host lays out for it.
             let view0 = host.view("button", cx);
             let view1 = host.view("panel", cx);
             cx.new(|cx| {
                 cx.observe(&counter, |_, _, cx| cx.notify()).detach();
                 cx.observe(&workspace, |_, _, cx| cx.notify()).detach();
-                cx.observe(&typed_text, |_, _, cx| cx.notify()).detach();
-                cx.observe(&palette, |_, _, cx| cx.notify()).detach();
+                // Discovery is asynchronous: connect the mirrors when the refs arrive.
+                let discovery = cx.spawn({
+                    let host = host.clone();
+                    async move |this: gpui::WeakEntity<DemoView>, cx| {
+                        let typed_text = typed_text_receipt.await;
+                        let palette = palette_receipt.await;
+                        cx.update(|cx| {
+                            this.update(cx, |view: &mut DemoView, cx| {
+                                match typed_text {
+                                    Ok(reference) => {
+                                        let remote = host.connect(reference, cx);
+                                        let mirror = Mirror::new(remote, Text {}, cx);
+                                        cx.observe(&mirror, |_, _, cx| cx.notify()).detach();
+                                        view.typed_text = Some(mirror);
+                                    }
+                                    Err(error) => log::error!(
+                                        "embedded_gpui: typed_text discovery failed: {error:#}"
+                                    ),
+                                }
+                                match palette {
+                                    Ok(reference) => {
+                                        let remote = host.connect(reference, cx);
+                                        let mirror = Mirror::new(remote, Commands {}, cx);
+                                        cx.observe(&mirror, |_, _, cx| cx.notify()).detach();
+                                        view.palette = Some(mirror);
+                                    }
+                                    Err(error) => log::error!(
+                                        "embedded_gpui: palette discovery failed: {error:#}"
+                                    ),
+                                }
+                                cx.notify();
+                            })
+                            .ok();
+                        });
+                    }
+                });
                 DemoView {
                     host,
+                    _root: root,
                     counter,
                     workspace,
-                    typed_text,
-                    palette,
+                    typed_text: None,
+                    palette: None,
                     command_remotes: HashMap::new(),
                     command_status: None,
                     command_task: None,
+                    _discovery: discovery,
                     view0,
                     view1,
                 }
@@ -185,15 +266,20 @@ fn resolve_wasm_path() -> Option<PathBuf> {
 
 struct DemoView {
     host: Entity<PluginHost>,
+    /// Keeps the root's ref caches alive; the registry holds it for the plugin anyway.
+    _root: Entity<HostRoot>,
     counter: Entity<Counter>,
     workspace: Entity<Workspace>,
-    typed_text: Entity<Mirror<String>>,
-    palette: Entity<Mirror<Vec<PaletteEntry>>>,
+    /// `None` until the plugin root's `typed_text()` receipt resolves.
+    typed_text: Option<Entity<Mirror<String>>>,
+    /// `None` until the plugin root's `palette()` receipt resolves.
+    palette: Option<Entity<Mirror<Vec<PaletteEntry>>>>,
     /// Remotes connected from palette refs, cached so repeated clicks reuse one
     /// projection (and so auto-release doesn't fire between clicks).
     command_remotes: HashMap<u64, Remote<CommandApi>>,
     command_status: Option<String>,
     command_task: Option<gpui::Task<()>>,
+    _discovery: Task<()>,
     view0: Entity<PluginViewState>,
     view1: Entity<PluginViewState>,
 }
@@ -225,12 +311,15 @@ impl DemoView {
 impl Render for DemoView {
     fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
         let clicks = self.counter.read(cx).clicks;
-        let commands = self.palette.read(cx).latest().cloned().unwrap_or_default();
+        let commands = self
+            .palette
+            .as_ref()
+            .and_then(|palette| palette.read(cx).latest().cloned())
+            .unwrap_or_default();
         let typed = self
             .typed_text
-            .read(cx)
-            .latest()
-            .cloned()
+            .as_ref()
+            .and_then(|typed_text| typed_text.read(cx).latest().cloned())
             .unwrap_or_default();
         let counter = self.counter.clone();
         let accent = gpui::hsla(self.workspace.read(cx).accent_hue, 0.65, 0.6, 1.0);

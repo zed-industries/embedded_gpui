@@ -1,9 +1,9 @@
 //! Common object-capability patterns built on `embedded_gpui`.
 //!
 //! Everything here is side-agnostic: each wrapper holds a [`Remote`], and remotes look
-//! the same in the guest and on the host. All three forwarders implement
+//! the same on both ends of the boundary. All three forwarders implement
 //! [`Shared`](embedded_gpui::Shared), so sharing one is exactly like sharing any other
-//! entity: `share_anonymous(&wrapper, cx)`.
+//! entity: `share(&wrapper, cx)`.
 
 use anyhow::anyhow;
 use embedded_gpui::{
@@ -22,12 +22,12 @@ use gpui::{App, AppContext as _, Context, Entity, Subscription, Task, WeakEntity
 ///
 /// Revocation authority stays with whoever holds this entity; it is deliberately not
 /// exposed over the wire. To let a *peer* revoke (or to add any other control surface),
-/// share with `share_anonymous_with` and register extra methods alongside
+/// share with `share_with` and register extra methods alongside
 /// [`Revocable::register`]:
 ///
 /// ```ignore
 /// let revocable = Revocable::new(vault, cx);
-/// let guarded_ref = share_anonymous_with(
+/// let guarded_ref = share_with(
 ///     &revocable,
 ///     |methods| {
 ///         Revocable::register(methods);
@@ -122,7 +122,7 @@ impl<S: SharedSpec> Shared<S> for Revocable<S> {
 ///
 /// ```ignore
 /// let readonly = Attenuated::new(item_remote, &["describe"], cx);
-/// let readonly_ref = share_anonymous(&readonly, cx);
+/// let readonly_ref = share(&readonly, cx);
 /// ```
 pub struct Attenuated<S: SharedSpec> {
     target: Remote<S>,

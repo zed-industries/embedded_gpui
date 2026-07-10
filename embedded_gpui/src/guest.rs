@@ -9,7 +9,7 @@ pub(crate) mod dispatcher;
 pub(crate) mod platform;
 mod shared;
 
-pub use shared::{connect, remote, share, share_anonymous, share_anonymous_with, share_with};
+pub use shared::{connect, remote_root, share, share_root, share_with};
 pub(crate) mod text_system;
 pub(crate) mod window;
 
@@ -36,7 +36,9 @@ use std::rc::Rc;
 /// A GPUI plugin. Implement this and call [`register_plugin!`] to make your crate a loadable
 /// plugin component.
 pub trait Plugin: 'static {
-    /// Build the plugin's shared state. Runs once, when the host initializes the component.
+    /// Build the plugin's shared state. Runs once, when the host initializes the
+    /// component. Construct your root object here and install it with [`share_root`]
+    /// before returning; reach the host's root with [`remote_root`].
     fn new(cx: &mut App) -> Self
     where
         Self: Sized;
@@ -147,6 +149,7 @@ fn runtime_handles() -> Option<(AsyncApp, Rc<PluginPlatform>, SharedPlugin)> {
 /// Wakeup requests are suppressed for the duration: everything queued during the pump is
 /// drained before it returns, so only the earliest remaining timer needs a host tick.
 fn pump(platform: &PluginPlatform) {
+    shared::drain_releases();
     let dispatcher = platform.dispatcher();
     dispatcher.set_wakeups_suppressed(true);
     dispatcher.run_until_idle();
@@ -155,6 +158,7 @@ fn pump(platform: &PluginPlatform) {
     }
     dispatcher.run_until_idle();
     dispatcher.set_wakeups_suppressed(false);
+    shared::drain_releases();
     if let Some(delay) = dispatcher.next_timer_delay() {
         wit::request_tick(delay.as_millis().min(u32::MAX as u128) as u32);
     }
@@ -252,14 +256,6 @@ impl wit::Guest for Component {
         let Some((_, platform, _)) = runtime_handles() else {
             return;
         };
-        pump(&platform);
-    }
-
-    fn shared_entity_announced(announcement: wit::SharedEntityAnnouncement) {
-        let Some((_, platform, _)) = runtime_handles() else {
-            return;
-        };
-        shared::entity_announced(announcement);
         pump(&platform);
     }
 

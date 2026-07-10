@@ -324,24 +324,35 @@ world plugin {
     // ------------------------------------------------------------------
     // Shared entities
     //
-    // An entity has exactly one *home* side, which owns its state and dispatches messages
-    // to it; the other side holds remotes that call methods on it and receive its events.
-    // All dispatch is dynamic on the wire -- a method or event name plus serialized
-    // payload -- with typed wrappers layered on in each language. Everything is
-    // single-threaded and queued, so ordering is deterministic and there are no
+    // A symmetric object channel. Each end of the connection owns *local* objects
+    // (homes: entities whose state lives here and whose methods answer messages) and
+    // holds *remotes* to the other end's objects. The protocol has no notion of host
+    // or guest -- both ends run the same registry -- and no names: objects are
+    // addressed only by id, and new objects are discovered as refs (bare ids) inside
+    // message payloads.
+    //
+    // Ids are u64 in one canonical namespace per connection: bit 63 says which end
+    // homes the object. This embedding assigns the embedder's objects the clear bit
+    // and the component's objects the set bit; that assignment is boundary
+    // configuration, invisible above the registry. Each end's *root* object is id 0
+    // in its own half (embedder root = 0, component root = bit 63), and the exchange
+    // of the two roots is the entire bootstrap: everything else is reached by calling
+    // root methods that return refs.
+    //
+    // Ids stay canonical rather than perspective-relative so that payloads remain
+    // opaque: a forwarder (caretaker, membrane) can pass bytes through verbatim and
+    // any refs inside keep meaning the same objects.
+    //
+    // An entity has exactly one home end, which owns its state and dispatches messages
+    // to it; the other end holds remotes that call methods on it and receive its
+    // events. All dispatch is dynamic on the wire -- a method or event name plus
+    // serialized payload -- with typed wrappers layered on in each language. Everything
+    // is single-threaded and queued, so ordering is deterministic and there are no
     // synchronization concerns, only reentrancy rules (messages are delivered from the
     // effects/tick machinery, never mid-render).
     // ------------------------------------------------------------------
 
-    /// Announces an entity homed on the sending side, bound to a well-known name so the
-    /// other side can attach remotes without sharing types.
-    record shared-entity-announcement {
-        entity-id: u64,
-        type-name: string,
-        name: string,
-    }
-
-    /// A dynamically dispatched message for a shared entity's home side. Delivery is
+    /// A dynamically dispatched message for a shared entity's home end. Delivery is
     /// FIFO over a single thread, so the home applies messages in send order. A message
     /// with a `request-id` expects a `shared-response` carrying the handler's return
     /// value (or an error). FIFO is also the consistency story: any read made after a
@@ -360,10 +371,10 @@ world plugin {
         outcome: result<list<u8>, string>,
     }
 
-    /// An event flowing from an entity's home to the remotes on the other side: the
+    /// An event flowing from an entity's home to the remotes on the other end: the
     /// mirror image of `shared-message`. The reserved name `$notify` carries the home
     /// entity's `cx.notify` across the boundary; every other name is a schema-defined
-    /// typed event (`cx.emit` on the home side). Events only flow while the other side
+    /// typed event (`cx.emit` on the home side). Events only flow while the other end
     /// holds at least one live remote.
     record shared-event {
         entity-id: u64,
@@ -371,28 +382,22 @@ world plugin {
         payload: list<u8>,
     }
 
-    /// Announce a guest-homed entity to the host.
-    import announce-shared-entity: func(announcement: shared-entity-announcement);
-
-    /// Send a message to a host-homed entity.
+    /// Send a message to an embedder-homed entity.
     import send-shared-message: func(message: shared-message);
 
-    /// Emit an event from a guest-homed entity to the host's remotes.
+    /// Emit an event from a component-homed entity to the embedder's remotes.
     import emit-shared-event: func(event: shared-event);
 
-    /// Answer a call that the host made to a guest-homed entity.
+    /// Answer a call that the embedder made to a component-homed entity.
     import send-shared-response: func(response: shared-response);
 
-    /// Notify the guest of a host-homed entity.
-    export shared-entity-announced: func(announcement: shared-entity-announcement);
-
-    /// Deliver a message to a guest-homed entity.
+    /// Deliver a message to a component-homed entity.
     export deliver-shared-message: func(message: shared-message);
 
-    /// Deliver a host-homed entity's event to the guest's remotes.
+    /// Deliver an embedder-homed entity's event to the component's remotes.
     export deliver-shared-event: func(event: shared-event);
 
-    /// Answer a call that the guest made to a host-homed entity.
+    /// Answer a call that the component made to an embedder-homed entity.
     export deliver-shared-response: func(response: shared-response);
 
     /// Ask the host to call the `tick` export after at least `delay-ms` milliseconds.
@@ -411,7 +416,11 @@ world plugin {
     // Exports (host -> guest)
     // ------------------------------------------------------------------
 
-    /// Initialize the plugin: construct the guest-side GPUI app.
+    /// Initialize the plugin: construct the component-side GPUI app. The component is
+    /// expected to install its root object (its id 0) before returning, and may
+    /// immediately send messages to the embedder's root (id 0 on the other half of
+    /// the namespace) -- each end queues root-addressed traffic that arrives before
+    /// its own root is installed, so the two bootstraps may race freely.
     export init-plugin: func();
 
     /// Create a plugin view (a "GPUI plugin window" in the guest) with the given id and

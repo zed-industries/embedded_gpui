@@ -1,49 +1,102 @@
-//! The guest half of `tests/shared_entities.rs`: a zoo of guest-homed
-//! entities exercising calls, events, capability refs, attenuation, and fully dynamic
-//! dispatch.
+//! The plugin half of `tests/shared_entities.rs`: one root object through which the
+//! host reaches a zoo of entities exercising calls, events, capability refs,
+//! attenuation, and fully dynamic dispatch.
 
 use anyhow::anyhow;
 use embedded_gpui::{
-    Plugin, SharedRef, connect, decode, encode, register_plugin, share, share_anonymous,
-    share_anonymous_with, share_with, shared,
+    Plugin, Remote, SharedRef, connect, decode, encode, register_plugin, remote_root, share,
+    share_root, share_with, shared,
 };
 use embedded_gpui_util::Revocable;
 use gpui::{AnyView, App, Context, Entity, EventEmitter, Task, Window, div, prelude::*};
 use test_schema::{
     ChameleonApi, ChameleonState, CounterMilestone, FactoryApi, GatekeeperApi, ItemApi, ItemInfo,
-    TestCounterApi, VaultApi,
+    TestCounterApi, TestHost, TestHostCaller as _, TestPlugin, VaultApi,
 };
 
-/// Named shares borrow their entities (the sharer owns the lifetime), so the plugin must
-/// keep them alive; anonymous shares own theirs until released.
+/// The plugin's whole bootstrap: construct the root object and install it at this end's
+/// id 0. Everything else is reached through the root's methods.
 struct TestGuest {
-    _counter: Entity<Counter>,
-    _factory: Entity<Factory>,
-    _chameleon: Entity<Chameleon>,
-    _gatekeeper: Entity<Gatekeeper>,
+    _root: Entity<Root>,
 }
 
 impl Plugin for TestGuest {
     fn new(cx: &mut App) -> Self {
+        let host = remote_root::<TestHost>(cx);
+        let root = cx.new(|_| Root {
+            host,
+            counter: None,
+            factory: None,
+            gatekeeper: None,
+            chameleon: None,
+        });
+        share_root(&root, cx);
+        TestGuest { _root: root }
+    }
+
+    fn create_view(&mut self, _name: &str, _window: &mut Window, cx: &mut App) -> AnyView {
+        cx.new(|_| EmptyView).into()
+    }
+}
+
+register_plugin!(TestGuest);
+
+/// The root object: each method is a lazy factory, creating its entity on first call
+/// and returning the same ref thereafter. The root keeps the entities alive itself so a
+/// release (last remote dropped on the other end) does not invalidate the cached ref.
+struct Root {
+    host: Remote<TestHost>,
+    counter: Option<(Entity<Counter>, SharedRef<TestCounterApi>)>,
+    factory: Option<(Entity<Factory>, SharedRef<FactoryApi>)>,
+    gatekeeper: Option<(Entity<Gatekeeper>, SharedRef<GatekeeperApi>)>,
+    chameleon: Option<(Entity<Chameleon>, SharedRef<ChameleonApi>)>,
+}
+
+#[shared]
+impl TestPlugin for Root {
+    fn counter(&mut self, cx: &mut Context<Self>) -> SharedRef<TestCounterApi> {
+        if let Some((_, reference)) = &self.counter {
+            return *reference;
+        }
         let counter = cx.new(|_| Counter { count: 0 });
-        share(&counter, "guest-counter", cx);
+        let reference = share(&counter, cx);
+        self.counter = Some((counter, reference));
+        reference
+    }
 
+    fn factory(&mut self, cx: &mut Context<Self>) -> SharedRef<FactoryApi> {
+        if let Some((_, reference)) = &self.factory {
+            return *reference;
+        }
         let factory = cx.new(|_| Factory { created: 0 });
-        share(&factory, "factory", cx);
+        let reference = share(&factory, cx);
+        self.factory = Some((factory, reference));
+        reference
+    }
 
+    fn gatekeeper(&mut self, cx: &mut Context<Self>) -> SharedRef<GatekeeperApi> {
+        if let Some((_, reference)) = &self.gatekeeper {
+            return *reference;
+        }
         let gatekeeper = cx.new(|_| Gatekeeper { guarded: 0 });
-        share(&gatekeeper, "gatekeeper", cx);
+        let reference = share(&gatekeeper, cx);
+        self.gatekeeper = Some((gatekeeper, reference));
+        reference
+    }
 
+    fn chameleon(&mut self, cx: &mut Context<Self>) -> SharedRef<ChameleonApi> {
+        if let Some((_, reference)) = &self.chameleon {
+            return *reference;
+        }
         let chameleon = cx.new(|_| Chameleon {
             mode: "echo".to_string(),
             pokes: 0,
         });
         // Entirely dynamic dispatch: one wildcard handler interprets every method name at
         // runtime and can change its own behavior ("become"). The schema declares nothing
-        // but the wire name, so this uses the closure escape hatch under `share`.
-        share_with::<ChameleonApi, _>(
+        // but the interface, so this uses the closure escape hatch under `share`.
+        let reference = share_with::<ChameleonApi, _>(
             &chameleon,
-            "chameleon",
             |methods| {
                 methods.on("*", |entity, method, payload, cx| {
                     entity.update(cx, |this, cx| match method {
@@ -73,21 +126,21 @@ impl Plugin for TestGuest {
             },
             cx,
         );
-
-        TestGuest {
-            _counter: counter,
-            _factory: factory,
-            _chameleon: chameleon,
-            _gatekeeper: gatekeeper,
-        }
+        self.chameleon = Some((chameleon, reference));
+        reference
     }
 
-    fn create_view(&mut self, _name: &str, _window: &mut Window, cx: &mut App) -> AnyView {
-        cx.new(|_| EmptyView).into()
+    fn ping_host(
+        &mut self,
+        message: String,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<String>> {
+        // The symmetric bootstrap from inside a handler: this end's remote to the other
+        // end's root, used like any other capability.
+        let receipt = self.host.ping(message, cx);
+        cx.spawn(async move |_, _| receipt.await)
     }
 }
-
-register_plugin!(TestGuest);
 
 struct EmptyView;
 
@@ -151,7 +204,7 @@ impl FactoryApi for Factory {
         self.created += 1;
         cx.notify();
         let item: Entity<Item> = cx.new(|_| Item { label, bumps: 0 });
-        share_anonymous(&item, cx)
+        share(&item, cx)
     }
 }
 
@@ -169,7 +222,7 @@ impl GatekeeperApi for Gatekeeper {
         // (auto-release cascades to the vault's home).
         let vault = connect(vault, cx);
         let revocable = Revocable::new(vault, cx);
-        share_anonymous_with(
+        share_with(
             &revocable,
             |methods| {
                 Revocable::register(methods);

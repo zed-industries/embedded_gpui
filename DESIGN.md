@@ -101,13 +101,15 @@ is another. Why both? Because they type different things, with opposite change p
   wrong for an app API. Note the WIT here is already almost entirely machine protocol;
   the whole object model rides on eight small functions with opaque payloads.
 - **The object model is userspace** — the evolving semantic surface (what a host app
-  exposes, what plugins expose to each other), with soft, runtime-negotiated
+  exposes, what plugins expose to each other), side-blind and peer-to-peer (see
+  "Symmetry" below), with soft, runtime-negotiated
   commitments: unknown methods fail as handleable errors, payload fields evolve by serde
   defaulting, a plugin built against an old schema degrades at specific calls instead of
   failing to load. Evolution is a library release, not a flag day: old and new methods are just
   entries in the same dispatch table. Wayland-style version negotiation is expressible
   as a plain shared entity (a registry whose `list` call returns interface/version/ref) —
-  the two Wayland primitives already exist here as names (globals) and refs (objects).
+  and the bootstrap primitive already exists as the root object (Wayland's object 1,
+  Cap'n Proto's bootstrap capability), with refs (objects) below it.
 
 Two things the static layer structurally cannot express, which is why "just put it all
 in WIT" loses: **capability semantics** (WIT imports are ambient and identical for every
@@ -170,9 +172,31 @@ types), so shared state is built on three rules:
    display lists, so there are no synchronization concerns and wasm is never re-entered
    from within a render or another delivery.
 
-Identity is a well-known string binding (`host.share(&entity, "clicks", cx)` /
-`remote::<CounterApi>("clicks", cx)` in the guest), type-checked at announcement time via
-`SharedSpec::TYPE_NAME`.
+Identity is refs only. There are no names anywhere in the protocol: strings survive
+solely as schema method/event names (codegen vocabulary, like Wayland's interface
+names). Discovery starts from **one root object per end** — see "Bootstrap" below —
+and every other object is reached as a `SharedRef` returned by a method call.
+`SharedSpec::TYPE_NAME` survives purely as diagnostic metadata in error messages;
+nothing on the wire checks it.
+
+### Bootstrap: one root object per end
+
+At boundary creation each end installs a single *root object* at its id 0
+(`share_root(&entity, cx)`), and reaches the other end's root with
+`remote_root::<S>(cx)`. That exchange is the entire bootstrap: the host calls the
+plugin root's methods for plugin features, the plugin calls the host root's methods
+for host features, and every method that returns a `SharedRef` extends the reachable
+world. Authority is reachability from your root — hand a plugin an `Attenuated` root
+and its whole world is attenuated; hand it a fake root and you have mocked the entire
+host for testing.
+
+The two bootstraps may race freely: messages addressed to a root that has not been
+installed yet queue in the registry and are delivered, in order, when `share_root`
+runs (an end that never installs a root leaves such calls pending, like a server
+that never starts; messages to any other unknown id fail soft). The root schema is
+the de facto compatibility surface (for Zed: the
+extension API), so it wants explicit versioning discipline — a version method, or
+probe-and-degrade — before anything ships against it.
 
 ### The `Entity<T>` analogy
 
@@ -202,9 +226,11 @@ ordering. `send` returns a `Receipt` that resolves once the home has applied the
 `Receipt<Vec<u8>>`, the undecoded forwarding primitive. One type, three decoders.
 Dropping a receipt is fire-and-forget; the message is unaffected.
 
-Sends to a not-yet-announced entity queue in order and flush on binding — which is
-promise pipelining in miniature: messages addressed "through" an unresolved reference are
-ordered behind its resolution, never lost or reordered.
+Every projection is born bound — `connect` always has the ref's id, and root ids are
+fixed — so there is no unresolved-name state and no pending-send queue. The cost is
+that a ref returned by a method call must round-trip before you can call through it;
+Cap'n-Proto-style promise pipelining (calling through a not-yet-resolved ref) is
+deliberately not built yet (see TODO).
 
 ### Events: `cx.notify` and `cx.emit`, across the wall
 
@@ -224,31 +250,38 @@ blesses one serialized state type per entity. State transfer is just a method ca
 
 ### Symmetry
 
-Both directions are implemented: host-homed entities with guest remotes (the demo's click
-counter — incremented by the wasm button, mirrored in both wasm views, read directly by
-native UI), and guest-homed entities with host remotes (the demo input line's text,
-mirrored live in the native header). Guest-homed ids set the high bit so the two sides'
-ids never collide.
+The object model is one side-blind module (`registry`), compiled identically into both
+ends. A registry knows exactly two things: *local* objects (homes it allocated ids
+for, its root at its 0) and *remote* objects (projections of the other end's homes).
+No API, type, or log line in it says host or guest; the ends differ only in the
+configuration the boundary hands them — a byte-transport sink and which half of the
+id namespace is theirs (bit 63, assigned by the embedding). The model is peer-to-peer;
+the wasm surface (scenes, input, ticks) is the only directional part, and it lives
+outside the object model entirely.
+
+Ids stay canonical per connection rather than perspective-relative so payloads remain
+opaque: a caretaker forwards bytes verbatim and any refs inside keep meaning the same
+objects. Both directions are exercised by the demo: a host-homed counter driven by
+wasm buttons, and plugin-homed text/palette entities mirrored natively.
 
 ### References and capabilities (OCAP)
 
-Well-known names are only the *bootstrap* namespace — rendezvous roots, like mounts in a
-filesystem or globals in the Wayland registry. Everything else moves by reference:
-`SharedRef<S>` is a serializable entity reference (a bare id on the wire) that travels
-*inside* message and event payloads, including call responses. A home shares an entity
-anonymously (`share_anonymous` returns the ref), embeds the ref wherever it likes, and
-the receiving side connects a remote to it (`connect`) — no name involved. The demo's
-command palette works this way: the plugin publishes `[(label, SharedRef<CommandApi>)]`,
-the host renders native buttons for the labels, and clicking one invokes the ref.
-Holding a ref *is* the authority to use it.
+Everything moves by reference: `SharedRef<S>` is a serializable entity reference (a
+bare id on the wire) that travels *inside* message and event payloads, including call
+responses. A home shares an entity (`share` returns the ref), embeds the ref wherever
+it likes, and the receiving end connects a remote to it (`connect`). The two roots are
+the only refs that exist by convention; every other ref was minted by a method call.
+The demo's command palette works this way: the plugin publishes
+`[(label, SharedRef<CommandApi>)]`, the host renders native buttons for the labels,
+and clicking one invokes the ref. Holding a ref *is* the authority to use it.
 
-Lifetimes follow gpui's own model, stretched across the boundary. Named shares borrow
-their entity (the sharer owns the lifetime); anonymous shares own theirs. Remotes
-connected from refs carry a refcounted guard shared by all clones: when the last clone
-drops, a `$release` control message tells the home to drop its strong handle. The guest
-releases from `Drop` directly; the host queues releases and flushes them on the next
-guest interaction (or `PluginHost::pump`). Connecting the same ref twice yields the same
-projection and the same guard.
+Lifetimes are own-only, like `Entity<T>` itself: sharing holds the entity strongly in
+the registry until the other end's last remote drops, at which point a `$release`
+control message lets it go (revocation-by-drop's principled replacement is
+`Revocable`). Remotes carry a refcounted guard shared by all clones; drops queue the
+release, flushed on the next pump on either end. Connecting the same ref twice yields
+the same projection and the same guard. Sharing the same entity twice mints two
+independent refs (dedup is future work).
 
 ### Attenuation, revocation, and membranes
 
@@ -286,7 +319,7 @@ while answering one. Forwarders, aggregators, and caretakers are all this patter
 The wire stays dynamic; types are sugar, and the sugar is one attribute:
 
 ```rust
-#[shared_interface("demo.counter", events = [Milestone])]
+#[shared_interface(events = [Milestone])]
 pub trait CounterApi {
     fn increment(&mut self, by: u32, cx: &mut Context<Self>) -> u32;
     fn clicks(&mut self, cx: &mut Context<Self>) -> u32;
@@ -307,10 +340,10 @@ extension trait implemented for `Remote<CounterApi>`, giving remotes typed
 `.increment(by, cx) -> Receipt<u32>`. `#[shared]` turns the block's methods into
 ordinary methods of the entity and registers each one through schema-generated functions
 taking checked function pointers — a signature mismatch against the schema is a compile
-error — then implements `Shared`, which is what `share` / `share_anonymous` need
+error — then implements `Shared`, which is what `share` and `share_root` need
 (and what makes the spec inferable at share sites: no turbofish).
 
-Fully dynamic entities skip the schema: `share_with(&entity, "name", |methods| ...)`
+Fully dynamic entities skip the schema: `share_with(&entity, |methods| ...)`
 registers handlers by name at runtime, including the `"*"` wildcard the wrappers use.
 
 Home transfer is not implemented (if ever needed: a serialize-and-swap barrier message;

@@ -1,34 +1,38 @@
 //! Common object-capability patterns built on `embedded_gpui`.
 //!
-//! Everything here is side-agnostic: the same code runs in the guest (wrapping a
-//! `Remote<S>`) and on the host (wrapping a `HostRemote<S>`), because it only relies on
-//! the [`SharedCaller`] surface.
+//! Everything here is side-agnostic: the same code runs in the guest and on the host,
+//! because it only relies on the [`SharedCaller`] surface that `Remote` (and every
+//! wrapper here) implements. All three wrappers implement
+//! [`SharedHome`](embedded_gpui::SharedHome), so sharing one is exactly like sharing any
+//! other entity: `share_anonymous(&wrapper, cx)`.
 
 use anyhow::anyhow;
-use embedded_gpui::{Methods, SharedCaller, SharedEntitySource, SharedSpec, WILDCARD_METHOD};
-use gpui::{App, AppContext as _, Context, Entity, Subscription, Task};
+use embedded_gpui::{
+    EventSink, Methods, SharedCaller, SharedHome, SharedMessage, SharedSpec, WILDCARD_METHOD,
+};
+use gpui::{App, AppContext as _, Context, Entity, Subscription, Task, WeakEntity};
 
 /// A revocable forwarder (OCAP "caretaker") around any capability you hold.
 ///
 /// Wrap a remote in a `Revocable`, share the *wrapper*, and hand out the resulting ref
 /// instead of the original. To the recipient it is indistinguishable from the real
-/// entity: snapshots pass through, and every method — including ones this code has
-/// never heard of — forwards asynchronously to the wrapped capability. When you call
-/// [`Revocable::revoke`], the wrapper drops the inner remote (auto-release cascades to
-/// its home), the last snapshot freezes, and every subsequent call fails with
-/// `"capability revoked"`.
+/// entity: notifies and events pass through, and every method — including ones this
+/// code has never heard of — forwards asynchronously to the wrapped capability. When
+/// you call [`Revocable::revoke`], the wrapper drops the inner remote (auto-release
+/// cascades to its home) and every subsequent call fails with `"capability revoked"`.
 ///
 /// Revocation authority stays with whoever holds this entity; it is deliberately not
 /// exposed over the wire. To let a *peer* revoke (or to add any other control surface),
-/// register extra methods alongside [`Revocable::register`]:
+/// share with `share_anonymous_with` and register extra methods alongside
+/// [`Revocable::register`]:
 ///
 /// ```ignore
-/// let revocable = Revocable::new(vault, placeholder_snapshot, cx);
-/// let guarded_ref = share_anonymous::<VaultSpec, _>(
+/// let revocable = Revocable::new(vault, cx);
+/// let guarded_ref = share_anonymous_with(
 ///     &revocable,
 ///     |methods| {
 ///         Revocable::register(methods);
-///         methods.on_raw("revoke", |entity, _, _, cx| {
+///         methods.on("revoke", |entity, _, _, cx| {
 ///             entity.update(cx, |revocable, cx| revocable.revoke(cx));
 ///             encode(&())
 ///         });
@@ -36,43 +40,36 @@ use gpui::{App, AppContext as _, Context, Entity, Subscription, Task};
 ///     cx,
 /// );
 /// ```
-pub struct Revocable<S: SharedSpec, C: SharedCaller<S>> {
+pub struct Revocable<C> {
     target: Option<C>,
-    /// Served while the target replica is empty, and frozen from the target's last
-    /// state at revocation.
-    fallback: S::Snapshot,
-    _observation: Option<Subscription>,
+    _notify: Option<Subscription>,
 }
 
-impl<S, C> Revocable<S, C>
-where
-    S: SharedSpec,
-    S::Snapshot: Clone,
-    C: SharedCaller<S>,
-{
-    /// Wrap `target`. `placeholder` is served to subscribers until the target's first
-    /// snapshot arrives. Changes to the target's replica republish through the wrapper.
-    pub fn new(target: C, placeholder: S::Snapshot, cx: &mut App) -> Entity<Self> {
+impl<C: 'static> Revocable<C> {
+    /// Wrap `target`. The wrapped capability's notifies republish through the wrapper.
+    pub fn new<S>(target: C, cx: &mut App) -> Entity<Self>
+    where
+        S: SharedSpec,
+        C: SharedCaller<S>,
+    {
         cx.new(|cx| {
-            let observation = cx.observe(target.shared_replica(), |_, _, cx| cx.notify());
+            let this = cx.weak_entity();
+            let notify = target.observe_shared(cx, move |cx| {
+                this.update(cx, |_, cx| cx.notify()).ok();
+            });
             Self {
                 target: Some(target),
-                fallback: placeholder,
-                _observation: Some(observation),
+                _notify: Some(notify),
             }
         })
     }
 
     /// Sever the wrapper from the wrapped capability. The inner remote drops here — if
     /// it was the last handle, auto-release tells its home to let the entity go — and
-    /// the wrapper freezes the last observed snapshot for any remaining subscribers.
+    /// every further call through the wrapper fails.
     pub fn revoke(&mut self, cx: &mut Context<Self>) {
-        if let Some(target) = self.target.take()
-            && let Some(state) = target.shared_replica().read(cx).state.clone()
-        {
-            self.fallback = state;
-        }
-        self._observation = None;
+        self.target = None;
+        self._notify = None;
         cx.notify();
     }
 
@@ -83,8 +80,12 @@ where
 
     /// Install the forwarding handler: a wildcard that pipes every method through to the
     /// wrapped capability, byte-for-byte, resolving when the real response comes back.
-    pub fn register(methods: &mut Methods<S, Self>) {
-        methods.on_raw_async(WILDCARD_METHOD, |entity, method, payload, cx| match entity
+    pub fn register<S>(methods: &mut Methods<S, Self>)
+    where
+        S: SharedSpec,
+        C: SharedCaller<S>,
+    {
+        methods.on_async(WILDCARD_METHOD, |entity, method, payload, cx| match entity
             .read(cx)
             .target
             .clone()
@@ -98,17 +99,28 @@ where
     }
 }
 
-impl<S, C> SharedEntitySource<S> for Revocable<S, C>
+impl<S, C> SharedHome<S> for Revocable<C>
 where
     S: SharedSpec,
-    S::Snapshot: Clone,
     C: SharedCaller<S>,
 {
-    fn snapshot(&self, cx: &App) -> S::Snapshot {
-        self.target
-            .as_ref()
-            .and_then(|target| target.shared_replica().read(cx).state.clone())
-            .unwrap_or_else(|| self.fallback.clone())
+    fn methods(methods: &mut Methods<S, Self>) {
+        Self::register(methods);
+    }
+
+    fn events(entity: &Entity<Self>, sink: EventSink, cx: &mut App) -> Vec<Subscription> {
+        let Some(target) = entity.read(cx).target.clone() else {
+            return Vec::new();
+        };
+        let wrapper = entity.downgrade();
+        vec![target.subscribe_shared_raw(cx, move |name, payload, cx| {
+            let live = wrapper
+                .read_with(cx, |wrapper, _| wrapper.target.is_some())
+                .unwrap_or(false);
+            if live {
+                sink(name, payload.to_vec(), cx);
+            }
+        })]
     }
 }
 
@@ -118,53 +130,54 @@ where
 /// construction, since a wrapper can only forward what it can itself call, and no
 /// cooperation from the entity's author is required.
 ///
+/// Attenuation is method-level: notifies and events pass through unfiltered (they flow
+/// outward, revealing only what the entity already chose to broadcast).
+///
 /// ```ignore
-/// let readonly = Attenuated::new(item_remote, &[], placeholder_snapshot, cx);
-/// let readonly_ref = share_anonymous::<ItemSpec, _>(&readonly, Attenuated::register, cx);
+/// let readonly = Attenuated::new(item_remote, &["describe"], cx);
+/// let readonly_ref = share_anonymous(&readonly, cx);
 /// ```
-pub struct Attenuated<S: SharedSpec, C: SharedCaller<S>> {
+pub struct Attenuated<C> {
     target: C,
     allowed: Vec<String>,
-    /// Served while the target replica is empty.
-    fallback: S::Snapshot,
-    _observation: Subscription,
+    _notify: Subscription,
 }
 
-impl<S, C> Attenuated<S, C>
-where
-    S: SharedSpec,
-    S::Snapshot: Clone,
-    C: SharedCaller<S>,
-{
+impl<C: 'static> Attenuated<C> {
     /// Wrap `target`, permitting only the listed methods through.
-    pub fn new(
-        target: C,
-        allowed: &[&str],
-        placeholder: S::Snapshot,
-        cx: &mut App,
-    ) -> Entity<Self> {
+    pub fn new<S>(target: C, allowed: &[&str], cx: &mut App) -> Entity<Self>
+    where
+        S: SharedSpec,
+        C: SharedCaller<S>,
+    {
         let allowed = allowed.iter().map(|method| method.to_string()).collect();
         cx.new(|cx| {
-            let observation = cx.observe(target.shared_replica(), |_, _, cx| cx.notify());
+            let this = cx.weak_entity();
+            let notify = target.observe_shared(cx, move |cx| {
+                this.update(cx, |_, cx| cx.notify()).ok();
+            });
             Self {
                 target,
                 allowed,
-                fallback: placeholder,
-                _observation: observation,
+                _notify: notify,
             }
         })
     }
 
     /// Install the filtering forwarder: allowed methods pipe through byte-for-byte,
     /// everything else fails without touching the wrapped capability.
-    pub fn register(methods: &mut Methods<S, Self>) {
-        methods.on_raw_async(WILDCARD_METHOD, |entity, method, payload, cx| {
-            let target = entity
+    pub fn register<S>(methods: &mut Methods<S, Self>)
+    where
+        S: SharedSpec,
+        C: SharedCaller<S>,
+    {
+        methods.on_async(WILDCARD_METHOD, |entity, method, payload, cx| {
+            let permitted = entity
                 .read(cx)
                 .allowed
                 .iter()
                 .any(|allowed| allowed == method);
-            if !target {
+            if !permitted {
                 return Task::ready(Err(anyhow!(
                     "method {method:?} is not permitted by this capability"
                 )));
@@ -176,19 +189,20 @@ where
     }
 }
 
-impl<S, C> SharedEntitySource<S> for Attenuated<S, C>
+impl<S, C> SharedHome<S> for Attenuated<C>
 where
     S: SharedSpec,
-    S::Snapshot: Clone,
     C: SharedCaller<S>,
 {
-    fn snapshot(&self, cx: &App) -> S::Snapshot {
-        self.target
-            .shared_replica()
-            .read(cx)
-            .state
-            .clone()
-            .unwrap_or_else(|| self.fallback.clone())
+    fn methods(methods: &mut Methods<S, Self>) {
+        Self::register(methods);
+    }
+
+    fn events(entity: &Entity<Self>, sink: EventSink, cx: &mut App) -> Vec<Subscription> {
+        let target = entity.read(cx).target.clone();
+        vec![target.subscribe_shared_raw(cx, move |name, payload, cx| {
+            sink(name, payload.to_vec(), cx);
+        })]
     }
 }
 
@@ -209,29 +223,28 @@ pub struct AuditRecord {
 /// Reading the ledger is itself an authority: it stays with whoever holds this entity.
 /// Exposing it over the wire (or to a UI) is an explicit choice, exactly like
 /// revocation on [`Revocable`].
-pub struct Audited<S: SharedSpec, C: SharedCaller<S>> {
+pub struct Audited<C> {
     target: C,
     records: Vec<AuditRecord>,
-    /// Served while the target replica is empty.
-    fallback: S::Snapshot,
-    _observation: Subscription,
+    _notify: Subscription,
 }
 
-impl<S, C> Audited<S, C>
-where
-    S: SharedSpec,
-    S::Snapshot: Clone,
-    C: SharedCaller<S>,
-{
+impl<C: 'static> Audited<C> {
     /// Wrap `target`; every call forwarded through the wrapper is recorded.
-    pub fn new(target: C, placeholder: S::Snapshot, cx: &mut App) -> Entity<Self> {
+    pub fn new<S>(target: C, cx: &mut App) -> Entity<Self>
+    where
+        S: SharedSpec,
+        C: SharedCaller<S>,
+    {
         cx.new(|cx| {
-            let observation = cx.observe(target.shared_replica(), |_, _, cx| cx.notify());
+            let this = cx.weak_entity();
+            let notify = target.observe_shared(cx, move |cx| {
+                this.update(cx, |_, cx| cx.notify()).ok();
+            });
             Self {
                 target,
                 records: Vec::new(),
-                fallback: placeholder,
-                _observation: observation,
+                _notify: notify,
             }
         })
     }
@@ -242,8 +255,12 @@ where
     }
 
     /// Install the recording forwarder.
-    pub fn register(methods: &mut Methods<S, Self>) {
-        methods.on_raw_async(WILDCARD_METHOD, |entity, method, payload, cx| {
+    pub fn register<S>(methods: &mut Methods<S, Self>)
+    where
+        S: SharedSpec,
+        C: SharedCaller<S>,
+    {
+        methods.on_async(WILDCARD_METHOD, |entity, method, payload, cx| {
             let index = entity.update(cx, |audited, cx| {
                 log::info!(
                     "audited capability: {:?} called with {} bytes",
@@ -277,18 +294,128 @@ where
     }
 }
 
-impl<S, C> SharedEntitySource<S> for Audited<S, C>
+impl<S, C> SharedHome<S> for Audited<C>
 where
     S: SharedSpec,
-    S::Snapshot: Clone,
     C: SharedCaller<S>,
 {
-    fn snapshot(&self, cx: &App) -> S::Snapshot {
-        self.target
-            .shared_replica()
-            .read(cx)
-            .state
-            .clone()
-            .unwrap_or_else(|| self.fallback.clone())
+    fn methods(methods: &mut Methods<S, Self>) {
+        Self::register(methods);
+    }
+
+    fn events(entity: &Entity<Self>, sink: EventSink, cx: &mut App) -> Vec<Subscription> {
+        let target = entity.read(cx).target.clone();
+        vec![target.subscribe_shared_raw(cx, move |name, payload, cx| {
+            sink(name, payload.to_vec(), cx);
+        })]
+    }
+}
+
+/// A local, observable cache of remote state: snapshots as a *library* instead of a
+/// protocol feature.
+///
+/// Reads on a [`Remote`](embedded_gpui::Remote) are calls, but GPUI rendering is
+/// synchronous — so anything that renders remote state natively wants a local copy that
+/// notifies when it changes. `Mirror` is that copy: it observes the capability, refetches
+/// through the given message whenever the home notifies (coalescing bursts into one
+/// in-flight call), and holds the latest value in an ordinary observable entity.
+///
+/// ```ignore
+/// let commands: Entity<Mirror<Vec<PaletteEntry>>> = Mirror::new(palette, Commands {}, cx);
+/// cx.observe(&commands, |_, _, cx| cx.notify()).detach();
+/// // in render:
+/// let entries = commands.read(cx).latest().cloned().unwrap_or_default();
+/// ```
+pub struct Mirror<T: 'static> {
+    latest: Option<T>,
+    fetching: bool,
+    dirty: bool,
+    _observation: Subscription,
+}
+
+impl<T: 'static> Mirror<T> {
+    /// Mirror the value of `request` (a call returning `T`) on `caller`, refreshing on
+    /// every notify from the home. The home notifies once on subscription, so the first
+    /// value arrives without any explicit kick.
+    pub fn new<S, C, M>(caller: C, request: M, cx: &mut App) -> Entity<Self>
+    where
+        S: SharedSpec,
+        C: SharedCaller<S>,
+        M: SharedMessage<Spec = S, Response = T> + Clone,
+    {
+        let mirror = cx.new(|cx| {
+            let this = cx.weak_entity();
+            let fetch_caller = caller.clone();
+            let fetch_request = request.clone();
+            let observation = caller.observe_shared(cx, move |cx| {
+                Self::refresh(this.clone(), &fetch_caller, &fetch_request, cx);
+            });
+            Self {
+                latest: None,
+                fetching: false,
+                dirty: false,
+                _observation: observation,
+            }
+        });
+        // The subscription's initial notify may predate this mirror; fetch once
+        // unconditionally.
+        Self::refresh(mirror.downgrade(), &caller, &request, cx);
+        mirror
+    }
+
+    /// The most recently fetched value, if any has arrived yet.
+    pub fn latest(&self) -> Option<&T> {
+        self.latest.as_ref()
+    }
+
+    fn refresh<S, C, M>(this: WeakEntity<Self>, caller: &C, request: &M, cx: &mut App)
+    where
+        S: SharedSpec,
+        C: SharedCaller<S>,
+        M: SharedMessage<Spec = S, Response = T> + Clone,
+    {
+        let started = this
+            .update(cx, |mirror, _| {
+                if mirror.fetching {
+                    // A fetch is already in flight; remember to go again with the newer
+                    // state. Any number of notifies coalesce into one trailing fetch.
+                    mirror.dirty = true;
+                    false
+                } else {
+                    mirror.fetching = true;
+                    true
+                }
+            })
+            .unwrap_or(false);
+        if !started {
+            return;
+        }
+        let receipt = caller.call_shared(request.clone(), cx);
+        let caller = caller.clone();
+        let request = request.clone();
+        cx.spawn(async move |cx| {
+            let outcome = receipt.await;
+            cx.update(move |cx| {
+                let redo = this
+                    .update(cx, |mirror, cx| {
+                        mirror.fetching = false;
+                        match outcome {
+                            Ok(value) => {
+                                mirror.latest = Some(value);
+                                cx.notify();
+                            }
+                            Err(error) => {
+                                log::warn!("embedded_gpui_util: mirror refresh failed: {error:#}")
+                            }
+                        }
+                        std::mem::take(&mut mirror.dirty)
+                    })
+                    .unwrap_or(false);
+                if redo {
+                    Self::refresh(this, &caller, &request, cx);
+                }
+            });
+        })
+        .detach();
     }
 }

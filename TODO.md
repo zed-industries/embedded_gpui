@@ -10,23 +10,29 @@ Today views are addressed by name (`host.view("panel")`) over a dedicated
 scene channel. That has the same weakness names always have: surfaces that are
 *data* — a widget per buffer line, a decoration per diagnostic — can't be a
 naming convention. The unification: **renderability becomes a feature of a
-shared entity**. A home entity that implements `Render` replicates its display
-list the way snapshots replicate state, so its projection on the other side
-also implements `Render` and can be mounted anywhere in the element tree.
+shared entity**. A home entity that implements `Render` streams its display
+list to the other side, where a remote to it can be mounted anywhere in the
+element tree.
 
-- `view("panel")` dissolves into `remote::<PanelSpec>("panel")`; the named form
+- `view("panel")` dissolves into `remote::<PanelApi>("panel")`; the named form
   is just the named-mount special case.
 - Inline surfaces are anonymous renderable refs traveling in payloads:
-  `Vec<(BufferRow, SharedRef<InlayWidget>)>`, materialized and mounted by the
+  `Vec<(BufferRow, SharedRef<InlayWidget>)>`, connected and mounted by the
   host wherever its own layout puts them.
 - Input flows backward along the same identity: mouse/key messages addressed to
   the entity, not a view id. Each mount drives resize like a window, as today.
 - Composes with the OCAP layer for free: revoking a renderable ref unmounts it
   everywhere; attenuating away input methods yields a render-only capability.
 
-Implementation notes for later: display lists want their own lane or delta
-encoding (they're big; don't ride the snapshot channel naively). On surface
-overhead: don't make windows lighter, make fewer windows. A gpui `Window`
+Likely rendering shape (sketch): scenes upload to **tracks**, identified by a
+shared object id rather than a view id — keeping today's `PluginElement`-style
+retained replay, but with each track a disjoint rendering timeline the host
+composites out of a cache. That may need small gpui changes on the host side;
+display lists are big, so tracks want their own lane and eventually a delta
+encoding (frame-to-frame scene diffing), not the object-message channel.
+
+Implementation notes for later: on surface overhead, don't make windows
+lighter, make fewer windows. A gpui `Window`
 carries real baseline weight (two retained frames, a Taffy arena, per-window
 frame pump) that's irrelevant for a handful of panels but wasteful for hundreds
 of widgets — while "one window, thousands of elements" is exactly gpui's design
@@ -50,26 +56,13 @@ a later optimization.
 - [ ] **Atlas hygiene**: image/SVG payloads are cached per instance and never
   evicted; `FontId`s are host-global and session-scoped (a persisted display
   list from a previous session would replay wrong glyphs).
-- [ ] **Delta sync**: snapshots ship whole-state per notify — right for small
-  states (idempotent, self-healing, zero per-type work), wasteful for large
-  collections with small churn and for the renderable-entity display lists.
-  The upgrade is cheap when needed: `published_ack` already tells the home
-  exactly which state the replica holds (the hard part of diffing safely),
-  so the wire grows one flag (`Full | Delta`, Full on subscribe/desync) and
-  schemas grow an opt-in delta representation — with keyed-collection sugar
-  (`SharedCollection<K, V>` with per-key patches) covering most real cases
-  instead of a general diff trait. Read-your-writes is untouched. Note that
-  state-diffs self-coalesce: diffing against the last *acked* state means one
-  delta regardless of how many notifies elapsed, so there is no N-deltas
-  backlog problem; only op-log sync (the buffer-like case, a dedicated
-  interface if ever needed) accumulates and would want streaming.
 - [ ] **Multi-plugin routing**: several stores behind one host, with the host
   routing shared-entity traffic between plugins (the id spaces already
   anticipate this: guest-homed ids carry a high bit; loopback routing is the
   single-store special case of the same reflection logic). This is also the
   inter-plugin API story: plugins never share memory, only routed messages.
-  Discovery is a host-homed registry entity - Wayland-style, its snapshot
-  lists (plugin, interface, version, ref) - and being listed is opt-in, so
+  Discovery is a host-homed registry entity - Wayland-style, a `list`
+  call returns (plugin, interface, version, ref) - and being listed is opt-in, so
   discoverability is itself a capability. The only contract between two
   cooperating plugins is a shared schema crate they both compiled against;
   the host never needs to know the interface exists. Routing through the
@@ -95,8 +88,9 @@ a later optimization.
   deadline or call budget.
 - [ ] **Sealer/unsealer pairs**: rights amplification, for when plugins trade
   refs among each other.
-- [ ] **Multi-subscriber homes**: per-sender sequence channels, so several
-  projections of one home get correct acks.
+- [ ] **Multi-subscriber homes**: a subscriber count instead of a `subscribed`
+  bool, so one home keeps events flowing to several remotes (the multi-plugin
+  case; a single host/guest pair never needs it).
 
 ## Zed integration
 

@@ -1,53 +1,59 @@
-//! Demo host binary: opens a native GPUI window with two embedded plugin views driven by the
-//! `example_plugin` guest component.
+//! Demo host binary: opens a native GPUI window with two embedded plugin views driven by
+//! the `example_plugin` guest component.
 
 use std::path::{Path, PathBuf};
 
 use embedded_gpui::{
-    HandleShared, HostRemote, PluginHost, PluginOptions, PluginViewState, SharedEntitySource,
-    SharedRef,
+    PluginHost, PluginHostHandle as _, PluginOptions, PluginViewState, Remote, SharedRef,
+    shared_home,
 };
+use embedded_gpui_util::Mirror;
 use example_schema::{
-    CommandApiCaller as _, CommandSpec, CounterSnapshot, CounterSpec, Increment, PaletteSpec,
-    TextSpec, WorkspaceApi, WorkspaceSnapshot, WorkspaceSpec, register_workspace_api,
+    CommandApi, CommandApiCaller as _, Commands, CounterApi, Milestone, PaletteApi, PaletteEntry,
+    Text, TextApi, WorkspaceApi,
 };
 use gpui::{
-    App, Application, Bounds, Context, Entity, MouseButton, Pixels, WindowBounds, WindowOptions,
-    div, prelude::*, px, rgb, size,
+    App, Application, Bounds, Context, Entity, EventEmitter, MouseButton, Pixels, WindowBounds,
+    WindowOptions, div, prelude::*, px, rgb, size,
 };
 use std::collections::HashMap;
 
-/// The home of the shared click counter: a plain host entity. The guest's views project it
-/// and send `Increment` messages; native UI reads and mutates it directly.
+/// The home of the shared click counter: a plain host entity. The guest's views hold
+/// remotes to it, call `increment`, and mirror `clicks`; native UI reads and mutates it
+/// directly. `cx.notify` and `cx.emit(Milestone)` cross the boundary on their own.
 struct Counter {
     clicks: u32,
 }
 
-impl SharedEntitySource<CounterSpec> for Counter {
-    fn snapshot(&self, _cx: &App) -> CounterSnapshot {
-        CounterSnapshot {
-            clicks: self.clicks,
+impl EventEmitter<Milestone> for Counter {}
+
+#[shared_home]
+impl CounterApi for Counter {
+    fn increment(&mut self, by: u32, cx: &mut Context<Self>) -> u32 {
+        self.clicks += by;
+        if self.clicks.is_multiple_of(5) {
+            cx.emit(Milestone {
+                clicks: self.clicks,
+            });
         }
+        cx.notify();
+        self.clicks
+    }
+
+    fn clicks(&mut self, _cx: &mut Context<Self>) -> u32 {
+        self.clicks
     }
 }
 
 /// A host service the PLUGIN drives: wasm buttons call `show_toast` / `set_accent`
-/// through the schema's generated caller, and the native chrome reacts. Implementing
-/// the `WorkspaceApi` trait is all it takes; `register_workspace_api` wires it up.
+/// through the schema's generated caller, and the native chrome reacts. One attribute
+/// on the impl block is all the wiring there is.
 struct Workspace {
     accent_hue: f32,
     last_toast: Option<String>,
 }
 
-impl SharedEntitySource<WorkspaceSpec> for Workspace {
-    fn snapshot(&self, _cx: &App) -> WorkspaceSnapshot {
-        WorkspaceSnapshot {
-            accent_hue: self.accent_hue,
-            last_toast: self.last_toast.clone(),
-        }
-    }
-}
-
+#[shared_home]
 impl WorkspaceApi for Workspace {
     fn show_toast(&mut self, message: String, cx: &mut Context<Self>) -> String {
         self.last_toast = Some(message);
@@ -59,14 +65,6 @@ impl WorkspaceApi for Workspace {
         self.accent_hue = hue.rem_euclid(1.0);
         cx.notify();
         format!("native accent set to hue {:.2}", self.accent_hue)
-    }
-}
-
-impl HandleShared<Increment> for Counter {
-    fn handle(&mut self, message: Increment, cx: &mut Context<Self>) -> u32 {
-        self.clicks += message.by;
-        cx.notify();
-        self.clicks
     }
 }
 
@@ -112,34 +110,23 @@ fn open_demo_window(host: gpui::Entity<PluginHost>, cx: &mut App) {
                 accent_hue: 0.58,
                 last_toast: None,
             });
-            let (view0, view1, typed_text, palette) = host.update(cx, |host, cx| {
-                host.share(
-                    &counter,
-                    "clicks",
-                    |methods| {
-                        methods.on::<Increment>();
-                    },
-                    cx,
-                );
-                // Homed on the HOST, driven by the plugin: the workspace service.
-                host.share(&workspace, "workspace", register_workspace_api, cx);
-                // Homed in the GUEST: the wasm input line's text, projected natively.
-                let typed_text = host.remote::<TextSpec>("typed-text", cx);
-                // Also guest-homed: the command palette. Labels render as native
-                // buttons below; the refs they carry are the authority to invoke.
-                let palette = host.remote::<PaletteSpec>("palette", cx);
-                // Views by name; each fills whatever slot the host lays out for it.
-                let view0 = host.view("button", cx);
-                let view1 = host.view("panel", cx);
-                (view0, view1, typed_text, palette)
-            });
+            // Homed on the HOST, driven by the plugin: the counter and the workspace
+            // service, mounted under well-known names.
+            host.share(&counter, "clicks", cx);
+            host.share(&workspace, "workspace", cx);
+            // Homed in the GUEST: the wasm input line's text and the command palette.
+            // Reads are calls, so native rendering goes through local mirrors that
+            // refetch whenever the guest home notifies.
+            let typed_text = Mirror::new(host.remote::<TextApi>("typed-text", cx), Text {}, cx);
+            let palette = Mirror::new(host.remote::<PaletteApi>("palette", cx), Commands {}, cx);
+            // Views by name; each fills whatever slot the host lays out for it.
+            let view0 = host.view("button", cx);
+            let view1 = host.view("panel", cx);
             cx.new(|cx| {
                 cx.observe(&counter, |_, _, cx| cx.notify()).detach();
                 cx.observe(&workspace, |_, _, cx| cx.notify()).detach();
-                cx.observe(typed_text.replica(), |_, _, cx| cx.notify())
-                    .detach();
-                cx.observe(palette.replica(), |_, _, cx| cx.notify())
-                    .detach();
+                cx.observe(&typed_text, |_, _, cx| cx.notify()).detach();
+                cx.observe(&palette, |_, _, cx| cx.notify()).detach();
                 DemoView {
                     host,
                     counter,
@@ -201,11 +188,11 @@ struct DemoView {
     host: Entity<PluginHost>,
     counter: Entity<Counter>,
     workspace: Entity<Workspace>,
-    typed_text: HostRemote<TextSpec>,
-    palette: HostRemote<PaletteSpec>,
-    /// Remotes materialized from palette refs, cached so repeated clicks reuse one
+    typed_text: Entity<Mirror<String>>,
+    palette: Entity<Mirror<Vec<PaletteEntry>>>,
+    /// Remotes connected from palette refs, cached so repeated clicks reuse one
     /// projection (and so auto-release doesn't fire between clicks).
-    command_remotes: HashMap<u64, HostRemote<CommandSpec>>,
+    command_remotes: HashMap<u64, Remote<CommandApi>>,
     command_status: Option<String>,
     command_task: Option<gpui::Task<()>>,
     view0: Entity<PluginViewState>,
@@ -213,16 +200,13 @@ struct DemoView {
 }
 
 impl DemoView {
-    /// Invoke a palette command through its capability ref: materialize (or reuse) a
-    /// remote, call the schema-generated `invoke`, and surface the plugin's reply.
-    fn run_command(&mut self, reference: SharedRef<CommandSpec>, cx: &mut Context<Self>) {
+    /// Invoke a palette command through its capability ref: connect (or reuse) a remote,
+    /// call the schema-generated `invoke`, and surface the plugin's reply.
+    fn run_command(&mut self, reference: SharedRef<CommandApi>, cx: &mut Context<Self>) {
         let command = self
             .command_remotes
             .entry(reference.entity_id())
-            .or_insert_with(|| {
-                self.host
-                    .update(cx, |host, cx| host.remote_from_ref(reference, cx))
-            })
+            .or_insert_with(|| self.host.connect(reference, cx))
             .clone();
         let receipt = command.invoke(cx);
         self.command_task = Some(cx.spawn(async move |this, cx| {
@@ -242,21 +226,12 @@ impl DemoView {
 impl Render for DemoView {
     fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
         let clicks = self.counter.read(cx).clicks;
-        let commands = self
-            .palette
-            .replica()
-            .read(cx)
-            .state
-            .as_ref()
-            .map(|snapshot| snapshot.commands.clone())
-            .unwrap_or_default();
+        let commands = self.palette.read(cx).latest().cloned().unwrap_or_default();
         let typed = self
             .typed_text
-            .replica()
             .read(cx)
-            .state
-            .as_ref()
-            .map(|snapshot| snapshot.text.clone())
+            .latest()
+            .cloned()
             .unwrap_or_default();
         let counter = self.counter.clone();
         let accent = gpui::hsla(self.workspace.read(cx).accent_hue, 0.65, 0.6, 1.0);

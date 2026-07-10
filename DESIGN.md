@@ -15,17 +15,18 @@ app alive and re-enter it whenever the external run loop yields control).
 - `embedded_gpui/` — **one crate, both sides of the boundary**:
   - `wit/plugin.wit` — the wire protocol (package `gpui:embedded`, world `plugin`); the
     single source of truth both sides bind against.
-  - `src/embedded_gpui.rs` — the always-compiled schema layer: specs, messages, receipts,
-    `SharedCaller`, and the `shared_schema!` macro.
+  - `src/embedded_gpui.rs` — the always-compiled object layer: `Remote`, `Receipt`,
+    `SharedRef`, specs/messages/events, and the `SharedHome`/`SharedCaller` traits.
   - `src/host.rs` (+ `src/host/`) — native targets only: wasmtime glue, host-side shared
     entities, and the element that replays guest display lists.
   - `src/guest.rs` (+ `src/guest/`) — wasm32 targets only: GPUI's
     `Platform`/`PlatformWindow`/`PlatformDispatcher`/`PlatformTextSystem`/`PlatformAtlas`
     over the WIT boundary, `Plugin`/`register_plugin!`, and the guest half of shared
     entities.
-- `embedded_gpui_macros/` — the `#[shared_interface]` proc macro.
-- `embedded_gpui_util/` — side-agnostic OCAP patterns (`Revocable`) built on
-  `SharedCaller`.
+- `embedded_gpui_macros/` — the `#[shared_interface]` / `#[shared_home]` / `#[shared_data]`
+  proc macros.
+- `embedded_gpui_util/` — side-agnostic OCAP patterns (`Revocable`, `Attenuated`,
+  `Audited`, `Mirror`) built on `SharedCaller`.
 - `example/` — the demo pair: `host/` (native window, `cargo run -p example_host`;
   builds the plugin automatically) and `plugin/` (the wasm component, its own workspace
   since it only compiles to `wasm32-wasip2`).
@@ -101,11 +102,11 @@ is another. Why both? Because they type different things, with opposite change p
   the whole object model rides on eight small functions with opaque payloads.
 - **The object model is userspace** — the evolving semantic surface (what a host app
   exposes, what plugins expose to each other), with soft, runtime-negotiated
-  commitments: unknown methods fail as handleable errors, new snapshot fields default,
-  a plugin built against an old schema degrades at specific calls instead of failing to
-  load. Evolution is a library release, not a flag day: old and new methods are just
+  commitments: unknown methods fail as handleable errors, payload fields evolve by serde
+  defaulting, a plugin built against an old schema degrades at specific calls instead of
+  failing to load. Evolution is a library release, not a flag day: old and new methods are just
   entries in the same dispatch table. Wayland-style version negotiation is expressible
-  as a plain shared entity (a registry whose snapshot lists interface/version/ref) —
+  as a plain shared entity (a registry whose `list` call returns interface/version/ref) —
   the two Wayland primitives already exist here as names (globals) and refs (objects).
 
 Two things the static layer structurally cannot express, which is why "just put it all
@@ -137,10 +138,11 @@ fast-and-static where the GPU is the clock:
   inter-process JSON-RPC that the largest existing extension ecosystem (VS Code) runs
   on without anyone feeling it.
 - **Every flexible choice has a named escape hatch.** The wire is bytes, so the payload
-  encoding is swappable per schema (bincode when JSON shows up in a profile); chatty
-  state gets delta sync (see TODO); anything genuinely hot can be promoted into a WIT
-  function; large surfaces get per-region damage tracking. Flexibility was never bought
-  in a way that forecloses speed.
+  encoding is swappable per schema (bincode when JSON shows up in a profile); reads are
+  pull-based, so chatty state costs exactly what the reader asks for (notifies are
+  idempotent and coalesce; a mirror folds any burst into one trailing fetch); anything
+  genuinely hot can be promoted into a WIT function; large surfaces get per-region damage
+  tracking. Flexibility was never bought in a way that forecloses speed.
 - **Known risks, ranked**: display-list volume for large animated views, serde_json
   under chatty state, and turn-taking latency in deep synchronous call chains. All are
   "optimize when observed"; none are architectural.
@@ -150,76 +152,110 @@ fast-and-static where the GPU is the clock:
 Entities cannot literally cross the boundary (separate linear memories, separately compiled
 types), so shared state is built on three rules:
 
-1. **One home per entity.** The home side owns the state as a normal GPUI entity and is the
-   only writer. The other side holds a *projection*: a replica entity refreshed by
-   serialized snapshots, observable with plain `cx.observe`.
-2. **Dynamic dispatch on the wire, types on top.** All writes are actor-style messages
-   `(entity_id, method: string, payload: bytes)`. The `gpui_embedded_shared` crate layers a
-   typed veneer over this: a `SharedSpec` names an entity kind and its snapshot type, a
-   `SharedMessage` names a method and its payload type, and `Remote::send` /
-   `Methods::on::<M>()` are sugar over the raw wire. `send_raw` / `on_raw` remain available,
-   so plugins can define their own entity kinds and methods without protocol changes —
-   what crosses the boundary is data with a name, never memory with a type.
+1. **One home per entity.** The home side owns the state as a normal GPUI entity and is
+   the only holder of it. The other side holds `Remote<S>` handles: they call methods on
+   the home, observe its `cx.notify`, and subscribe to its `cx.emit` events. State never
+   replicates at the protocol level — reads are calls, and anything that needs a local
+   copy builds one in userland (`embedded_gpui_util::Mirror`).
+2. **Dynamic dispatch on the wire, types on top.** All traffic is actor-style messages
+   `(entity_id, method: string, payload: bytes)` one way and events
+   `(entity_id, name: string, payload: bytes)` the other. The schema layer types this —
+   `#[shared_interface]` generates the spec, the message types, and typed caller
+   methods — while `send_raw` / `call_raw` / `Methods::on` (with a `"*"` wildcard)
+   remain available, so plugins can define their own entity kinds and methods without
+   protocol changes. What crosses the boundary is data with a name, never memory with a
+   type.
 3. **Single-threaded, queue-ordered, reentrancy-safe.** Everything runs on the host main
-   thread; messages and snapshots ride the same deferred-effects machinery as display
-   lists, so there are no synchronization concerns and wasm is never re-entered from within
-   a render or another delivery.
+   thread; messages, responses, and events ride the same deferred-effects machinery as
+   display lists, so there are no synchronization concerns and wasm is never re-entered
+   from within a render or another delivery.
 
-Identity is a well-known string binding (`host.share(&entity, "clicks", ...)` /
-`gpui_plugin::shared::remote::<CounterSpec>("clicks", cx)`), type-checked at announcement
-time via `SharedSpec::TYPE_NAME`. Snapshots publish automatically on every `cx.notify` of
-the home entity.
+Identity is a well-known string binding (`host.share(&entity, "clicks", cx)` /
+`shared::remote::<CounterApi>("clicks", cx)`), type-checked at announcement time via
+`SharedSpec::TYPE_NAME`.
 
-### Consistency: sequences, acks, receipts
+### The `Entity<T>` analogy
 
-Every message carries a per-entity monotonic `sequence` assigned by the sender; every
-snapshot carries `acked-sequence`, the highest sender sequence the state already includes.
-`send` returns a `SendReceipt` future that resolves only after a snapshot with
-`acked-sequence >= sequence` has been applied to the *local replica* — so
-`send(msg).await` gives read-your-writes. Homes that handle a message without notifying
-still publish an acking snapshot (deduped via `published_ack`), so receipts always resolve.
+`Remote<S>` is deliberately shaped like holding an `Entity<T>` that happens to live in
+another sandbox:
+
+| local gpui                   | across the boundary                                     |
+| ---------------------------- | ------------------------------------------------------- |
+| calling methods in `update`  | `remote.call(...)` / `.send(...)`, or typed caller fns  |
+| `cx.observe(&entity, ...)`   | `remote.observe(cx, ...)`                               |
+| `cx.subscribe(&entity, ...)` | `remote.subscribe::<Event>(cx, ...)`                    |
+| clones share the entity      | clones share the projection (auto-release on last drop) |
+| `entity.read(cx)`            | a method call returning state (`Mirror` caches it)      |
+
+The one seam that cannot be papered over is synchronous reads: state lives at the home,
+so reading it is asynchronous. `Mirror` covers the rendering case in userland: it
+refetches on every notify and holds the latest value in an ordinary observable entity.
+
+### Consistency: FIFO ordering and receipts
+
+There are no sequence numbers, no acks, and no replicas to keep consistent: both
+directions are FIFO end to end, and that alone carries the consistency story. A read
+issued after a write is itself a message, so it observes the write — read-your-writes by
+ordering. `send` returns a `Receipt` that resolves once the home has applied the message
+(handler errors arrive as `Err`, crossing the boundary as strings); `call` returns a
+`Receipt<R>` carrying the handler's decoded return value; `forward` returns
+`Receipt<Vec<u8>>`, the undecoded forwarding primitive. One type, three decoders.
 Dropping a receipt is fire-and-forget; the message is unaffected.
 
-Sends to a not-yet-announced entity queue in order and flush on binding — which is promise
-pipelining in miniature: messages addressed "through" an unresolved reference are ordered
-behind its resolution, never lost or reordered.
+Sends to a not-yet-announced entity queue in order and flush on binding — which is
+promise pipelining in miniature: messages addressed "through" an unresolved reference are
+ordered behind its resolution, never lost or reordered.
 
-**Calls** are messages with a `request-id`: the home handler's return value flows back as
-a response, decoded by a typed `CallReceipt<R>` (`remote.call(Increment { by: 1 }).await
--> u32`). Responses are delivered strictly *after* the snapshot acking their call, on both
-sides — so when a call resolves, the local replica already reflects it. Handler errors
-arrive as `Err`, crossing the boundary as strings.
+### Events: `cx.notify` and `cx.emit`, across the wall
+
+A home entity's reactivity crosses the boundary in the same shape gpui gives it locally:
+
+- every `cx.notify` on the home becomes a `$notify` event, firing `Remote::observe`
+  callbacks on the other side (notifies are idempotent, so bursts coalesce trivially);
+- `cx.emit(SomeEvent)` on the home becomes a named, typed event for `Remote::subscribe`,
+  provided the schema declares it (`events = [SomeEvent]`) and the home type is an
+  ordinary gpui `EventEmitter<SomeEvent>` — emitting is completely standard GPUI code.
+
+Events only flow while the other side holds a live remote: a remote's creation sends a
+`$subscribe` control message, answered by an initial notify, so a new remote's observers
+always fire at least once. This is what replaced snapshots: the protocol no longer
+blesses one serialized state type per entity. State transfer is just a method call, and
+*when to look again* is the only thing the wire signals.
 
 ### Symmetry
 
-Both directions are implemented: host-homed entities with guest projections (the demo's
-click counter — mutated by a native button and the wasm button, observed everywhere), and
-guest-homed entities with host projections (the demo input line's text, mirrored live in
-the native header). Guest-homed ids set the high bit so the two sides' ids never collide.
+Both directions are implemented: host-homed entities with guest remotes (the demo's click
+counter — incremented by the wasm button, mirrored in both wasm views, read directly by
+native UI), and guest-homed entities with host remotes (the demo input line's text,
+mirrored live in the native header). Guest-homed ids set the high bit so the two sides'
+ids never collide.
 
 ### References and capabilities (OCAP)
 
 Well-known names are only the *bootstrap* namespace — rendezvous roots, like mounts in a
 filesystem or globals in the Wayland registry. Everything else moves by reference:
 `SharedRef<S>` is a serializable entity reference (a bare id on the wire) that travels
-*inside* snapshot and message payloads. A home shares an entity anonymously
-(`share_anonymous` returns the ref), embeds the ref wherever it likes, and the receiving
-side materializes a remote from it (`remote_from_ref`) — no name involved. The demo's
-command palette works this way: the plugin publishes `[(label, SharedRef<CommandSpec>)]`
-in a snapshot, the host renders native buttons for the labels, and clicking one invokes
-the ref. Holding a ref *is* the authority to use it.
+*inside* message and event payloads, including call responses. A home shares an entity
+anonymously (`share_anonymous` returns the ref), embeds the ref wherever it likes, and
+the receiving side connects a remote to it (`connect`) — no name involved. The demo's
+command palette works this way: the plugin publishes `[(label, SharedRef<CommandApi>)]`,
+the host renders native buttons for the labels, and clicking one invokes the ref.
+Holding a ref *is* the authority to use it.
 
 Lifetimes follow gpui's own model, stretched across the boundary. Named shares borrow
 their entity (the sharer owns the lifetime); anonymous shares own theirs. Remotes
-materialized from refs carry a refcounted guard shared by all clones: when the last clone
+connected from refs carry a refcounted guard shared by all clones: when the last clone
 drops, a `$release` control message tells the home to drop its strong handle. The guest
 releases from `Drop` directly; the host queues releases and flushes them on the next
-guest interaction (or `PluginHost::pump`). Materializing the same ref twice yields the
-same replica and the same guard.
+guest interaction (or `PluginHost::pump`). Connecting the same ref twice yields the same
+projection and the same guard.
 
 ### Attenuation, revocation, and membranes
 
-Refs can be weakened and severed without any cooperation from the entity's author:
+Refs can be weakened and severed without any cooperation from the entity's author. All
+three wrappers below are generic over `SharedCaller` (so the same code runs in the guest
+and on the host, and wrappers wrap each other), and all implement `SharedHome` (so
+sharing one is exactly like sharing any other entity):
 
 - **Attenuation** is a library pattern, not a protocol feature:
   `embedded_gpui_util::Attenuated` wraps any capability you hold with an allowlist —
@@ -231,43 +267,55 @@ Refs can be weakened and severed without any cooperation from the entity's autho
   every call (method, payload size, eventual outcome) in a ledger readable by whoever
   holds the wrapper entity — capability accountability without interference.
 - **Revocation** is `embedded_gpui_util::Revocable`: wrap any capability you hold in a
-  caretaker entity, share the wrapper, hand out *its* ref. Snapshots pass through, and a
-  wildcard handler forwards every method — including ones the wrapper has never heard
-  of — to the wrapped capability as raw bytes (`SharedCaller::forward_shared`).
-  `revoke()` drops the inner remote (auto-release cascades to its home), freezes the last
-  snapshot, and fails all further calls. Because it is generic over `SharedCaller`, the
-  same code runs in the guest and on the host; the integration tests drive a full
+  caretaker entity, share the wrapper, hand out *its* ref. Notifies and events pass
+  through, and a wildcard handler forwards every method — including ones the wrapper has
+  never heard of — to the wrapped capability as raw bytes
+  (`SharedCaller::forward_shared`). `revoke()` drops the inner remote (auto-release
+  cascades to its home) and fails all further calls. The integration tests drive a full
   membrane (host vault → guest caretaker → host caller) through it.
 
 ### Async handlers
 
-A handler can return work instead of a value: `HandlerResponse::Pending(Task<...>)`
-(registered via `Methods::on_async` / `on_raw_async`, or the `HandleSharedAsync` trait).
-The delivery machinery holds the ack and the response until the task resolves, preserving
-snapshot-before-response ordering — which is what lets an entity await calls on *other*
-refs while answering one. Forwarders, aggregators, and caretakers are all this pattern.
+A handler can return work instead of a value: an `async fn` in the schema (or a raw
+`Methods::on_async` registration) produces a `Task` whose value becomes the response when
+it resolves. The response flows only then, so an entity can await calls on *other* refs
+while answering one. Forwarders, aggregators, and caretakers are all this pattern.
 
 ### Typed interfaces: `#[shared_interface]`
 
-The wire stays dynamic; types are sugar, and the sugar is now one attribute:
+The wire stays dynamic; types are sugar, and the sugar is one attribute:
 
 ```rust
-#[shared_interface(spec = CommandSpec, type_name = "demo.command", snapshot = CommandSnapshot)]
-pub trait CommandApi {
-    fn invoke(&mut self, cx: &mut Context<Self>) -> String;
+#[shared_interface("demo.counter", events = [Milestone])]
+pub trait CounterApi {
+    fn increment(&mut self, by: u32, cx: &mut Context<Self>) -> u32;
+    fn clicks(&mut self, cx: &mut Context<Self>) -> u32;
 }
 ```
 
-generates the `SharedSpec`, one message struct per method, a `CommandApiCaller` extension
-trait blanket-implemented for every `SharedCaller<CommandSpec>` (so guest `Remote` and
-host `HostRemote` both get a typed `.invoke(cx) -> CallReceipt<String>`), and
-`register_command_api` to wire a trait implementation into a home's dispatch table. The
-trait itself is the home-side handler surface. `shared_schema!` remains for
-snapshot-plus-messages declarations without a trait.
+One name is the whole interface: hold a `Remote<CounterApi>`, reference a
+`SharedRef<CounterApi>`, and implement a home by keeping the same name on the impl block:
 
-Not yet implemented: async methods in `#[shared_interface]` (register those manually via
-`Methods::on_async`), and home transfer (if ever needed: a serialize-and-swap barrier
-message; FIFO ordering makes it race-free by construction).
+```rust
+#[shared_home]
+impl CounterApi for Counter { ... }
+```
+
+Under the hood the trait syntax is consumed: it becomes the spec struct, one message type
+per method, `SharedEvent` wiring for each declared event, and a `CounterApiCaller`
+extension trait blanket-implemented for every `SharedCaller<CounterApi>` — so a
+`Remote<CounterApi>` and any wrapper around one get typed
+`.increment(by, cx) -> Receipt<u32>`. `#[shared_home]` turns the block's methods into
+ordinary methods of the entity and registers each one through schema-generated functions
+taking checked function pointers — a signature mismatch against the schema is a compile
+error — then implements `SharedHome`, which is what `share` / `share_anonymous` need
+(and what makes the spec inferable at share sites: no turbofish).
+
+Fully dynamic entities skip the schema: `share_with(&entity, "name", |methods| ...)`
+registers handlers by name at runtime, including the `"*"` wildcard the wrappers use.
+
+Home transfer is not implemented (if ever needed: a serialize-and-swap barrier message;
+FIFO ordering makes it race-free by construction).
 
 ## Known spike limitations (intentional)
 

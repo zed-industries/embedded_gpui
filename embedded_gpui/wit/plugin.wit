@@ -325,29 +325,30 @@ world plugin {
     // Shared entities
     //
     // An entity has exactly one *home* side, which owns its state and dispatches messages
-    // to it; the other side holds a projection kept fresh by snapshots. All dispatch is
-    // dynamic on the wire — a method name plus serialized payload — with typed wrappers
-    // layered on in each language. Everything is single-threaded and queued, so ordering
-    // is deterministic and there are no synchronization concerns, only reentrancy rules
-    // (messages are delivered from the effects/tick machinery, never mid-render).
+    // to it; the other side holds remotes that call methods on it and receive its events.
+    // All dispatch is dynamic on the wire -- a method or event name plus serialized
+    // payload -- with typed wrappers layered on in each language. Everything is
+    // single-threaded and queued, so ordering is deterministic and there are no
+    // synchronization concerns, only reentrancy rules (messages are delivered from the
+    // effects/tick machinery, never mid-render).
     // ------------------------------------------------------------------
 
     /// Announces an entity homed on the sending side, bound to a well-known name so the
-    /// other side can attach projections without sharing types.
+    /// other side can attach remotes without sharing types.
     record shared-entity-announcement {
         entity-id: u64,
         type-name: string,
         name: string,
     }
 
-    /// A dynamically dispatched message for a shared entity's home side. `sequence` is a
-    /// per-entity monotonic counter assigned by the sender; because all delivery is FIFO
-    /// over a single thread, the home applies messages in sequence order. A message with a
-    /// `request-id` is a call: the home answers with a `shared-response`, delivered after
-    /// the snapshot that acks the call's sequence (so calls are read-your-writes too).
+    /// A dynamically dispatched message for a shared entity's home side. Delivery is
+    /// FIFO over a single thread, so the home applies messages in send order. A message
+    /// with a `request-id` expects a `shared-response` carrying the handler's return
+    /// value (or an error). FIFO is also the consistency story: any read made after a
+    /// message is itself a message, so it observes the write (read-your-writes by
+    /// ordering, no sequence numbers required).
     record shared-message {
         entity-id: u64,
-        sequence: u64,
         request-id: option<u64>,
         method: string,
         payload: list<u8>,
@@ -359,13 +360,14 @@ world plugin {
         outcome: result<list<u8>, string>,
     }
 
-    /// A serialized state snapshot flowing from an entity's home to its projections.
-    /// `acked-sequence` is the highest sender sequence this state already includes, giving
-    /// projections read-your-writes: a send's future resolves when a snapshot with
-    /// `acked-sequence >= sequence` has been applied to the local replica.
-    record shared-snapshot {
+    /// An event flowing from an entity's home to the remotes on the other side: the
+    /// mirror image of `shared-message`. The reserved name `$notify` carries the home
+    /// entity's `cx.notify` across the boundary; every other name is a schema-defined
+    /// typed event (`cx.emit` on the home side). Events only flow while the other side
+    /// holds at least one live remote.
+    record shared-event {
         entity-id: u64,
-        acked-sequence: u64,
+        name: string,
         payload: list<u8>,
     }
 
@@ -375,8 +377,8 @@ world plugin {
     /// Send a message to a host-homed entity.
     import send-shared-message: func(message: shared-message);
 
-    /// Publish a snapshot of a guest-homed entity.
-    import publish-shared-snapshot: func(snapshot: shared-snapshot);
+    /// Emit an event from a guest-homed entity to the host's remotes.
+    import emit-shared-event: func(event: shared-event);
 
     /// Answer a call that the host made to a guest-homed entity.
     import send-shared-response: func(response: shared-response);
@@ -387,8 +389,8 @@ world plugin {
     /// Deliver a message to a guest-homed entity.
     export deliver-shared-message: func(message: shared-message);
 
-    /// Deliver a snapshot of a host-homed entity to the guest's projections.
-    export deliver-shared-snapshot: func(snapshot: shared-snapshot);
+    /// Deliver a host-homed entity's event to the guest's remotes.
+    export deliver-shared-event: func(event: shared-event);
 
     /// Answer a call that the guest made to a host-homed entity.
     export deliver-shared-response: func(response: shared-response);

@@ -1,18 +1,19 @@
-//! A demo GPUI plugin: two views (a button and a panel) sharing one entity inside the guest
-//! App, rendered by the `embedded_gpui` host. The panel exercises text, SVGs, images,
-//! paths, and keyboard input. See `DESIGN.md`.
+//! A demo GPUI plugin: two views (a button and a panel) sharing one guest App, rendered
+//! by the `embedded_gpui` host. The panel exercises text, SVGs, images, paths, and
+//! keyboard input. See `DESIGN.md`.
 
-use embedded_gpui::shared::{Remote, SharedEntitySource, SharedProjection};
-use embedded_gpui::{Plugin, register_plugin};
+use embedded_gpui::shared::{remote, share, share_anonymous};
+use embedded_gpui::{Plugin, Receipt, Remote, register_plugin, shared_home};
+use embedded_gpui_util::Mirror;
 use example_schema::{
-    CommandApi, CommandSnapshot, CommandSpec, CounterSnapshot, CounterSpec, Increment,
-    PaletteEntry, PaletteSnapshot, PaletteSpec, TextSnapshot, TextSpec, WorkspaceApiCaller as _,
-    WorkspaceSpec, register_command_api,
+    Clicks, CommandApi, CounterApi, Increment, Milestone, PaletteApi, PaletteEntry, TextApi,
+    WorkspaceApi, WorkspaceApiCaller as _,
 };
 use gpui::{
     AnyView, App, AssetSource, Bounds, Context, ElementInputHandler, Entity, EntityInputHandler,
     FocusHandle, KeyDownEvent, MouseButton, PathBuilder, Pixels, RenderImage, SharedString,
-    UTF16Selection, WeakEntity, Window, canvas, div, hsla, img, point, prelude::*, px, rgb, svg,
+    Subscription, UTF16Selection, WeakEntity, Window, canvas, div, hsla, img, point, prelude::*,
+    px, rgb, svg,
 };
 use std::borrow::Cow;
 use std::ops::Range;
@@ -37,18 +38,18 @@ impl AssetSource for PluginAssets {
 }
 
 struct ExamplePlugin {
-    /// A projection of the click counter homed on the HOST: reads come from snapshots,
-    /// writes are `Increment` messages dispatched to the host's handler.
-    counter: Remote<CounterSpec>,
+    /// The click counter homed on the HOST: reads are calls (mirrored locally for
+    /// rendering), writes are `increment` calls dispatched to the host's handler.
+    counter: Remote<CounterApi>,
     /// The host's workspace service: the plugin drives native chrome through it.
-    workspace: Remote<WorkspaceSpec>,
+    workspace: Remote<WorkspaceApi>,
 }
 
 impl Plugin for ExamplePlugin {
     fn new(cx: &mut App) -> Self {
         Self {
-            counter: embedded_gpui::shared::remote::<CounterSpec>("clicks", cx),
-            workspace: embedded_gpui::shared::remote::<WorkspaceSpec>("workspace", cx),
+            counter: remote::<CounterApi>("clicks", cx),
+            workspace: remote::<WorkspaceApi>("workspace", cx),
         }
     }
 
@@ -68,31 +69,25 @@ impl Plugin for ExamplePlugin {
     }
 }
 
-fn clicks(replica: &Entity<SharedProjection<CounterSnapshot>>, cx: &App) -> u32 {
-    replica
-        .read(cx)
-        .state
-        .as_ref()
-        .map_or(0, |snapshot| snapshot.clicks)
-}
-
 register_plugin!(ExamplePlugin);
 
 struct ButtonView {
-    counter: Remote<CounterSpec>,
+    counter: Remote<CounterApi>,
+    /// A local, observable cache of the host counter's value: snapshots as a library.
+    clicks: Entity<Mirror<u32>>,
 }
 
 impl ButtonView {
-    fn new(counter: Remote<CounterSpec>, cx: &mut Context<Self>) -> Self {
-        cx.observe(counter.replica(), |_, _, cx| cx.notify())
-            .detach();
-        Self { counter }
+    fn new(counter: Remote<CounterApi>, cx: &mut Context<Self>) -> Self {
+        let clicks = Mirror::new(counter.clone(), Clicks {}, cx);
+        cx.observe(&clicks, |_, _, cx| cx.notify()).detach();
+        Self { counter, clicks }
     }
 }
 
 impl Render for ButtonView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let click_count = clicks(self.counter.replica(), cx);
+        let click_count = self.clicks.read(cx).latest().copied().unwrap_or(0);
         let counter = self.counter.clone();
         div()
             .size_full()
@@ -111,16 +106,12 @@ impl Render for ButtonView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |_, _, _, cx| {
-                    // A call: resolves with the host handler's return value, which is
-                    // delivered after the snapshot that acks it, so the replica agrees.
-                    let call = counter.call(Increment { by: 1 });
-                    let counter = counter.clone();
-                    cx.spawn(async move |_, cx| match call.await {
+                    // A call: resolves with the host handler's return value. The mirror
+                    // refetches on the home's notify, so the label follows on its own.
+                    let call = counter.call(Increment { by: 1 }, cx);
+                    cx.spawn(async move |_, _| match call.await {
                         Ok(new_count) => {
-                            let observed = cx.update(|cx| clicks(counter.replica(), cx));
-                            eprintln!(
-                                "[example_plugin] call returned {new_count}; replica shows {observed}"
-                            );
+                            eprintln!("[example_plugin] increment returned {new_count}")
                         }
                         Err(error) => eprintln!("[example_plugin] call failed: {error:#}"),
                     })
@@ -136,14 +127,17 @@ impl Render for ButtonView {
 }
 
 struct PanelView {
-    counter: Remote<CounterSpec>,
-    workspace: Remote<WorkspaceSpec>,
+    workspace: Remote<WorkspaceApi>,
+    clicks: Entity<Mirror<u32>>,
+    /// Filled by the host counter's `Milestone` events: `cx.emit` crossing the boundary.
+    last_milestone: Option<u32>,
     input_line: Entity<InputLine>,
     gradient: Arc<RenderImage>,
     wave_phase: f32,
     wave_speed: f32,
     wave_hue: f32,
     _animation: gpui::Task<()>,
+    _milestones: Subscription,
     /// The panel owns its command entities and the palette that publishes them; the
     /// anonymous shares hold them alive for the host too, but ownership lives here.
     _commands: Vec<Entity<PanelCommand>>,
@@ -151,37 +145,22 @@ struct PanelView {
 }
 
 /// A command the host can discover and invoke: an entity implementing the schema's
-/// `CommandApi` interface, shared anonymously so its ref can travel in the palette
-/// snapshot. Each invocation mutates the panel and reports what it did; the report
-/// also lands in the command's own snapshot (`detail`), which republishes to anyone
-/// projecting the command entity itself.
+/// `CommandApi` interface, shared anonymously so its ref can travel in the palette.
+/// Each invocation mutates the panel and reports what it did.
 type CommandAction = fn(&mut PanelView, &mut Context<PanelView>) -> String;
 
 struct PanelCommand {
-    label: String,
-    detail: String,
     panel: WeakEntity<PanelView>,
     action: CommandAction,
 }
 
-impl SharedEntitySource<CommandSpec> for PanelCommand {
-    fn snapshot(&self, _cx: &App) -> CommandSnapshot {
-        CommandSnapshot {
-            label: self.label.clone(),
-            detail: self.detail.clone(),
-        }
-    }
-}
-
+#[shared_home]
 impl CommandApi for PanelCommand {
     fn invoke(&mut self, cx: &mut Context<Self>) -> String {
-        let outcome = match self.panel.upgrade() {
+        match self.panel.upgrade() {
             Some(panel) => panel.update(cx, |panel, cx| (self.action)(panel, cx)),
             None => "the panel is gone".to_string(),
-        };
-        self.detail = outcome.clone();
-        cx.notify();
-        outcome
+        }
     }
 }
 
@@ -191,30 +170,38 @@ struct Palette {
     entries: Vec<PaletteEntry>,
 }
 
-impl SharedEntitySource<PaletteSpec> for Palette {
-    fn snapshot(&self, _cx: &App) -> PaletteSnapshot {
-        PaletteSnapshot {
-            commands: self.entries.clone(),
-        }
+#[shared_home]
+impl PaletteApi for Palette {
+    fn commands(&mut self, _cx: &mut Context<Self>) -> Vec<PaletteEntry> {
+        self.entries.clone()
     }
 }
 
-impl SharedEntitySource<TextSpec> for InputLine {
-    fn snapshot(&self, _cx: &App) -> TextSnapshot {
-        TextSnapshot {
-            text: self.text.clone(),
-        }
+#[shared_home]
+impl TextApi for InputLine {
+    fn text(&mut self, _cx: &mut Context<Self>) -> String {
+        self.text.clone()
     }
 }
 
 impl PanelView {
     fn new(
-        counter: Remote<CounterSpec>,
-        workspace: Remote<WorkspaceSpec>,
+        counter: Remote<CounterApi>,
+        workspace: Remote<WorkspaceApi>,
         cx: &mut Context<Self>,
     ) -> Self {
-        cx.observe(counter.replica(), |_, _, cx| cx.notify())
-            .detach();
+        let clicks = Mirror::new(counter.clone(), Clicks {}, cx);
+        cx.observe(&clicks, |_, _, cx| cx.notify()).detach();
+        // A typed event from the host home, exactly like a local `cx.subscribe`.
+        let this = cx.weak_entity();
+        let milestones = counter.subscribe::<Milestone>(cx, move |event, cx| {
+            let clicks = event.clicks;
+            this.update(cx, |panel, cx| {
+                panel.last_milestone = Some(clicks);
+                cx.notify();
+            })
+            .ok();
+        });
         // Drives the wave at ~30fps through the guest's timer path: each await arms a
         // dispatcher timer, which asks the host for a wakeup via `request-tick`.
         let animation = cx.spawn(async move |this, cx| {
@@ -232,12 +219,12 @@ impl PanelView {
             }
         });
         let input_line = cx.new(InputLine::new);
-        // Homed HERE in the guest: the host projects this entity to mirror the typed text.
-        embedded_gpui::shared::share::<TextSpec, _>(&input_line, "typed-text", |_methods| {}, cx);
+        // Homed HERE in the guest: the host mirrors this entity's text natively.
+        share(&input_line, "typed-text", cx);
 
         // The command palette: each command is an anonymously shared entity, and the
-        // palette snapshot carries their refs. The host renders the labels as native
-        // buttons; clicking one calls straight back into these closures.
+        // palette carries their refs. The host renders the labels as native buttons;
+        // clicking one calls straight back into these closures.
         let command_table: [(&str, CommandAction); 4] = [
             ("Wave: faster", |panel, cx| {
                 panel.wave_speed = (panel.wave_speed * 1.6).clamp(-1.2, 1.2);
@@ -269,16 +256,10 @@ impl PanelView {
         let mut entries = Vec::new();
         for (label, action) in command_table {
             let command = cx.new(|_| PanelCommand {
-                label: label.to_string(),
-                detail: "never invoked".to_string(),
                 panel: weak_panel.clone(),
                 action,
             });
-            let reference = embedded_gpui::shared::share_anonymous::<CommandSpec, _>(
-                &command,
-                register_command_api,
-                cx,
-            );
+            let reference = share_anonymous(&command, cx);
             entries.push(PaletteEntry {
                 label: label.to_string(),
                 command: reference,
@@ -286,11 +267,12 @@ impl PanelView {
             commands.push(command);
         }
         let palette = cx.new(|_| Palette { entries });
-        embedded_gpui::shared::share::<PaletteSpec, _>(&palette, "palette", |_methods| {}, cx);
+        share(&palette, "palette", cx);
 
         Self {
-            counter,
             workspace,
+            clicks,
+            last_milestone: None,
             input_line,
             gradient: Arc::new(RenderImage::new(vec![image::Frame::new(gradient_bitmap(
                 48, 48,
@@ -299,6 +281,7 @@ impl PanelView {
             wave_speed: 0.15,
             wave_hue: 0.85,
             _animation: animation,
+            _milestones: milestones,
             _commands: commands,
             _palette: palette,
         }
@@ -322,8 +305,12 @@ fn gradient_bitmap(width: u32, height: u32) -> image::RgbaImage {
 
 impl Render for PanelView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let clicks = clicks(self.counter.replica(), cx);
+        let clicks = self.clicks.read(cx).latest().copied().unwrap_or(0);
         let bar_width = px(16. + (clicks as f32 * 14.) % 380.);
+        let milestone = match self.last_milestone {
+            Some(clicks) => format!("last milestone event: {clicks} clicks"),
+            None => "no milestone events yet (every 5th click)".to_string(),
+        };
         div()
             .size_full()
             .flex()
@@ -346,6 +333,12 @@ impl Render for PanelView {
                 "The button view has been clicked {clicks} time{}.",
                 if clicks == 1 { "" } else { "s" }
             )))
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(0x9aa3af))
+                    .child(milestone),
+            )
             .child(
                 div()
                     .flex()
@@ -460,7 +453,7 @@ fn panel_button(
 }
 
 /// Await a call receipt in the background and log the host's reply.
-fn log_reply(receipt: embedded_gpui::shared::CallReceipt<String>, cx: &mut App) {
+fn log_reply(receipt: Receipt<String>, cx: &mut App) {
     cx.spawn(async move |_| match receipt.await {
         Ok(reply) => eprintln!("[example_plugin] host replied: {reply}"),
         Err(error) => eprintln!("[example_plugin] host call failed: {error:#}"),

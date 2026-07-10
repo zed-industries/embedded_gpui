@@ -11,15 +11,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::{
-    AckSender, CallReceipt, HandlerResponse, Methods, RawCallReceipt, ResponseSender, SendReceipt,
-    SharedEntitySource, SharedMessage, SharedProjection, SharedRef, SharedSpec,
+    EventSink, HandlerResponse, Methods, NOTIFY_EVENT, RELEASE_METHOD, RawSharedEvent, Remote,
+    RemoteSignal, ResponseSender, SUBSCRIBE_METHOD, SharedHome, SharedRef, SharedSpec, Transport,
 };
 use anyhow::{Context as _, Result};
 use futures::StreamExt as _;
 use futures::channel::mpsc;
-use gpui::{
-    AppContext as _, Context, Entity, Pixels, PlatformTextSystem, Size, Task, WeakEntity, px,
-};
+use gpui::{AppContext as _, Context, Entity, Pixels, PlatformTextSystem, Size, Task, px};
 use wasmtime::component::{Component, Linker};
 use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
@@ -38,54 +36,7 @@ mod shared_entities;
 
 pub use plugin_element::PluginViewState;
 
-/// A typed host-side handle to a guest-homed shared entity.
-pub struct HostRemote<S: SharedSpec> {
-    name: String,
-    replica: Entity<SharedProjection<S::Snapshot>>,
-    host: WeakEntity<PluginHost>,
-    /// Present only for remotes materialized from a [`SharedRef`]; named remotes are
-    /// bootstrap mounts and are never auto-released.
-    _guard: Option<Rc<HostReleaseGuard>>,
-}
-
-impl<S: SharedSpec> Clone for HostRemote<S> {
-    fn clone(&self) -> Self {
-        Self {
-            name: self.name.clone(),
-            replica: self.replica.clone(),
-            host: self.host.clone(),
-            _guard: self._guard.clone(),
-        }
-    }
-}
-
-impl<S: SharedSpec> embedded_gpui::SharedCaller<S> for HostRemote<S> {
-    fn shared_replica(&self) -> &Entity<SharedProjection<S::Snapshot>> {
-        self.replica()
-    }
-
-    fn send_shared<M: SharedMessage<Spec = S>>(
-        &self,
-        message: M,
-        cx: &mut gpui::App,
-    ) -> SendReceipt {
-        self.send(message, cx)
-    }
-
-    fn call_shared<M: SharedMessage<Spec = S>>(
-        &self,
-        message: M,
-        cx: &mut gpui::App,
-    ) -> CallReceipt<M::Response> {
-        self.call(message, cx)
-    }
-
-    fn forward_shared(&self, method: &str, payload: Vec<u8>, cx: &mut gpui::App) -> RawCallReceipt {
-        self.forward(method, payload, cx)
-    }
-}
-
-/// Dropping the last `HostRemote` for a ref-derived projection queues a release; the
+/// Dropping the last [`Remote`] for a ref-derived projection queues a release; the
 /// host can't call into the guest from `Drop` (no context, and the instance may be
 /// mid-call), so the queue is drained on the next `apply_effects` or [`PluginHost::pump`].
 struct HostReleaseGuard {
@@ -99,104 +50,6 @@ impl Drop for HostReleaseGuard {
     }
 }
 
-impl<S: SharedSpec> HostRemote<S> {
-    /// The local replica entity, for `cx.observe` and reads.
-    pub fn replica(&self) -> &Entity<SharedProjection<S::Snapshot>> {
-        &self.replica
-    }
-
-    /// All outgoing traffic is deferred rather than dispatched inline: a handler on a
-    /// host-homed entity runs inside a `PluginHost` update, so a synchronous re-entry
-    /// (e.g. a caretaker forwarding from its wildcard handler) would double-borrow the
-    /// host. Deferral keeps sends FIFO while making remotes safe to use from anywhere.
-    fn dispatch(
-        &self,
-        method: String,
-        payload: Vec<u8>,
-        ack: Option<AckSender>,
-        response: Option<ResponseSender>,
-        cx: &mut gpui::App,
-    ) {
-        let host = self.host.clone();
-        let name = self.name.clone();
-        cx.defer(move |cx| {
-            host.update(cx, |host, cx| {
-                host.send_to_guest(&name, &method, payload, ack, response, cx);
-            })
-            .ok();
-        });
-    }
-
-    /// Send a typed message to the guest home. Await the receipt for read-your-writes.
-    pub fn send<M: SharedMessage<Spec = S>>(&self, message: M, cx: &mut gpui::App) -> SendReceipt {
-        let (ack_sender, receipt) = SendReceipt::channel();
-        match embedded_gpui::encode(&message) {
-            Ok(payload) => {
-                self.dispatch(M::METHOD.to_string(), payload, Some(ack_sender), None, cx)
-            }
-            Err(error) => log::error!(
-                "embedded_gpui: failed to encode {}::{}: {error:#}",
-                S::TYPE_NAME,
-                M::METHOD
-            ),
-        }
-        receipt
-    }
-
-    /// The dynamic escape hatch: send an arbitrary method and payload.
-    pub fn send_raw(&self, method: &str, payload: Vec<u8>, cx: &mut gpui::App) -> SendReceipt {
-        let (ack_sender, receipt) = SendReceipt::channel();
-        self.dispatch(method.to_string(), payload, Some(ack_sender), None, cx);
-        receipt
-    }
-
-    /// The dynamic call escape hatch: call an arbitrary method and decode the response.
-    pub fn call_raw<R: serde::de::DeserializeOwned>(
-        &self,
-        method: &str,
-        payload: Vec<u8>,
-        cx: &mut gpui::App,
-    ) -> CallReceipt<R> {
-        let (response_sender, receipt) = CallReceipt::channel();
-        self.dispatch(method.to_string(), payload, None, Some(response_sender), cx);
-        receipt
-    }
-
-    /// Call a method by name with pre-encoded payload, resolving with the raw response
-    /// bytes. This is the forwarding primitive: a caretaker pipes a caller's request
-    /// through to the entity it guards without knowing the method's types.
-    pub fn forward(&self, method: &str, payload: Vec<u8>, cx: &mut gpui::App) -> RawCallReceipt {
-        let (response_sender, receipt) = RawCallReceipt::channel();
-        self.dispatch(method.to_string(), payload, None, Some(response_sender), cx);
-        receipt
-    }
-
-    /// Call a typed method on the guest home, resolving with its return value after the
-    /// replica reflects the mutation.
-    pub fn call<M: SharedMessage<Spec = S>>(
-        &self,
-        message: M,
-        cx: &mut gpui::App,
-    ) -> CallReceipt<M::Response> {
-        let (response_sender, receipt) = CallReceipt::channel();
-        match embedded_gpui::encode(&message) {
-            Ok(payload) => self.dispatch(
-                M::METHOD.to_string(),
-                payload,
-                None,
-                Some(response_sender),
-                cx,
-            ),
-            Err(error) => log::error!(
-                "embedded_gpui: failed to encode {}::{}: {error:#}",
-                S::TYPE_NAME,
-                M::METHOD
-            ),
-        }
-        receipt
-    }
-}
-
 /// Effects drained from the guest after each call into it. The host acts on these once the
 /// guest call has returned, never re-entering wasm from within a host import (see DESIGN.md
 /// invariant 3).
@@ -207,7 +60,7 @@ pub struct PendingEffects {
     pub cursor_style: Option<gpui::CursorStyle>,
     pub shared_messages: Vec<bindings::SharedMessage>,
     pub shared_announcements: Vec<bindings::SharedEntityAnnouncement>,
-    pub shared_snapshots: Vec<bindings::SharedSnapshot>,
+    pub shared_events: Vec<bindings::SharedEvent>,
     pub shared_responses: Vec<bindings::SharedResponse>,
 }
 
@@ -409,8 +262,8 @@ impl PluginImports for HostState {
         self.pending.shared_announcements.push(announcement);
     }
 
-    fn publish_shared_snapshot(&mut self, snapshot: bindings::SharedSnapshot) {
-        self.pending.shared_snapshots.push(snapshot);
+    fn emit_shared_event(&mut self, event: bindings::SharedEvent) {
+        self.pending.shared_events.push(event);
     }
 
     fn send_shared_response(&mut self, response: bindings::SharedResponse) {
@@ -606,12 +459,9 @@ impl PluginInstance {
         Ok(self.take_effects())
     }
 
-    pub fn deliver_shared_snapshot(
-        &mut self,
-        snapshot: &bindings::SharedSnapshot,
-    ) -> Result<Effects> {
+    pub fn deliver_shared_event(&mut self, event: &bindings::SharedEvent) -> Result<Effects> {
         self.bindings
-            .call_deliver_shared_snapshot(&mut self.store, snapshot)?;
+            .call_deliver_shared_event(&mut self.store, event)?;
         Ok(self.take_effects())
     }
 
@@ -668,7 +518,7 @@ enum PluginRequest {
     Tick,
     AnnounceSharedEntity(bindings::SharedEntityAnnouncement),
     DeliverSharedMessage(bindings::SharedMessage),
-    DeliverSharedSnapshot(bindings::SharedSnapshot),
+    DeliverSharedEvent(bindings::SharedEvent),
     DeliverSharedResponse(bindings::SharedResponse),
 }
 
@@ -694,9 +544,7 @@ impl PluginInstance {
                 self.announce_shared_entity(&announcement)
             }
             PluginRequest::DeliverSharedMessage(message) => self.deliver_shared_message(&message),
-            PluginRequest::DeliverSharedSnapshot(snapshot) => {
-                self.deliver_shared_snapshot(&snapshot)
-            }
+            PluginRequest::DeliverSharedEvent(event) => self.deliver_shared_event(&event),
             PluginRequest::DeliverSharedResponse(response) => {
                 self.deliver_shared_response(&response)
             }
@@ -713,7 +561,6 @@ pub struct PluginHost {
     next_view_id: u32,
     images: PluginImages,
     shared: shared_entities::HostShared,
-    remotes_by_name: HashMap<String, gpui::AnyEntity>,
     /// Names whose `HostReleaseGuard` dropped; drained into `$release` sends.
     pending_releases: Rc<RefCell<Vec<String>>>,
     release_guards: HashMap<String, std::rc::Weak<HostReleaseGuard>>,
@@ -762,7 +609,6 @@ impl PluginHost {
             next_view_id: 0,
             images: PluginImages::default(),
             shared: shared_entities::HostShared::default(),
-            remotes_by_name: HashMap::new(),
             pending_releases: Rc::default(),
             release_guards: HashMap::new(),
             scheduled_tick: None,
@@ -794,11 +640,39 @@ impl PluginHost {
         }
     }
 
-    /// Share a host entity with the guest under a well-known name. The entity becomes the
-    /// *home* of the shared state: guest messages dispatch to the handlers registered in
-    /// `register`, and every `cx.notify` on it publishes a fresh snapshot to guest
-    /// projections. Call after [`PluginHost::init`].
+    /// Share a host entity with the guest under a well-known name (a mount the guest
+    /// attaches to with `remote`). The entity becomes the *home* of the shared state:
+    /// its `#[shared_home]` methods answer guest messages, and its `cx.notify` /
+    /// declared `cx.emit` events reach every guest remote.
     pub fn share<S, T>(
+        &mut self,
+        entity: &Entity<T>,
+        name: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) where
+        S: SharedSpec,
+        T: SharedHome<S>,
+    {
+        let mut methods = Methods::new(entity.downgrade());
+        T::methods(&mut methods);
+        let entity_id = self.shared.reserve_entity_id();
+        let events = T::events(entity, self.home_event_sink(entity_id, cx), cx);
+        self.install_home(
+            entity,
+            methods,
+            events,
+            None,
+            name.into(),
+            true,
+            entity_id,
+            cx,
+        );
+    }
+
+    /// The dynamic escape hatch beneath [`PluginHost::share`]: register method handlers
+    /// with a closure instead of a schema interface. `cx.notify` still crosses; typed
+    /// events are not wired (implement [`SharedHome`] manually if you need both).
+    pub fn share_with<S, T>(
         &mut self,
         entity: &Entity<T>,
         name: impl Into<String>,
@@ -806,83 +680,55 @@ impl PluginHost {
         cx: &mut Context<Self>,
     ) where
         S: SharedSpec,
-        T: SharedEntitySource<S>,
+        T: 'static,
     {
-        let name = name.into();
         let mut methods = Methods::new(entity.downgrade());
         register(&mut methods);
-
-        let snapshot_fn: shared_entities::SnapshotFn = {
-            let entity = entity.downgrade();
-            Rc::new(move |cx| {
-                let entity = entity.upgrade().context("shared entity dropped")?;
-                embedded_gpui::encode(&entity.read(cx).snapshot(cx))
-            })
-        };
-
-        let entity_id = self.shared.insert_placeholder();
-        let observation = cx.observe(entity, move |host, _, cx| {
-            host.publish_home(entity_id, cx);
-        });
-        self.shared.fill_placeholder(
+        let entity_id = self.shared.reserve_entity_id();
+        self.install_home(
+            entity,
+            methods,
+            Vec::new(),
+            None,
+            name.into(),
+            true,
             entity_id,
-            shared_entities::HostSharedEntity::new(
-                name.clone(),
-                S::TYPE_NAME,
-                methods,
-                snapshot_fn,
-                true,
-                None,
-                observation,
-            ),
+            cx,
         );
-
-        let announcement = bindings::SharedEntityAnnouncement {
-            entity_id,
-            type_name: S::TYPE_NAME.to_string(),
-            name,
-        };
-        self.enqueue(PluginRequest::AnnounceSharedEntity(announcement));
-        self.publish_home(entity_id, cx);
-    }
-
-    /// Attach to a guest-homed shared entity by name. The replica fills in when the guest's
-    /// announcement and first snapshot arrive; sends queue (in order) until then.
-    pub fn remote<S: SharedSpec>(
-        &mut self,
-        name: impl Into<String>,
-        cx: &mut Context<Self>,
-    ) -> HostRemote<S> {
-        let name = name.into();
-        let replica = cx.new(|_| SharedProjection::<S::Snapshot> { state: None });
-        let apply_snapshot: shared_entities::ApplySnapshot = {
-            let replica = replica.downgrade();
-            Rc::new(move |bytes, cx| {
-                let snapshot: S::Snapshot =
-                    embedded_gpui::decode(bytes).context("decoding shared snapshot")?;
-                replica.update(cx, |projection, cx| {
-                    projection.state = Some(snapshot);
-                    cx.notify();
-                })
-            })
-        };
-        self.shared
-            .insert_projection::<S>(name.clone(), apply_snapshot);
-        if let Some(announcement) = self.shared.unclaimed_announcements.remove(&name) {
-            self.bind_projection(announcement, cx);
-        }
-        HostRemote {
-            name,
-            replica,
-            host: cx.weak_entity(),
-            _guard: None,
-        }
     }
 
     /// Share a host entity anonymously, returning a capability reference to embed in
-    /// snapshot or message payloads. The home holds a strong handle to the entity until the
-    /// reference is released; snapshots start flowing when a guest projection subscribes.
+    /// message or event payloads. The home holds a strong handle to the entity until the
+    /// reference is released.
     pub fn share_anonymous<S, T>(
+        &mut self,
+        entity: &Entity<T>,
+        cx: &mut Context<Self>,
+    ) -> SharedRef<S>
+    where
+        S: SharedSpec,
+        T: SharedHome<S>,
+    {
+        let mut methods = Methods::new(entity.downgrade());
+        T::methods(&mut methods);
+        let entity_id = self.shared.reserve_entity_id();
+        let events = T::events(entity, self.home_event_sink(entity_id, cx), cx);
+        self.install_home(
+            entity,
+            methods,
+            events,
+            Some(entity.clone().into_any()),
+            format!("#{entity_id}"),
+            false,
+            entity_id,
+            cx,
+        );
+        SharedRef::from_raw(entity_id)
+    }
+
+    /// [`PluginHost::share_anonymous`] with a closure-registered dispatch table; see
+    /// [`PluginHost::share_with`].
+    pub fn share_anonymous_with<S, T>(
         &mut self,
         entity: &Entity<T>,
         register: impl FnOnce(&mut Methods<S, T>),
@@ -890,70 +736,108 @@ impl PluginHost {
     ) -> SharedRef<S>
     where
         S: SharedSpec,
-        T: SharedEntitySource<S>,
+        T: 'static,
     {
         let mut methods = Methods::new(entity.downgrade());
         register(&mut methods);
-
-        let snapshot_fn: shared_entities::SnapshotFn = {
-            let entity = entity.downgrade();
-            Rc::new(move |cx| {
-                let entity = entity.upgrade().context("shared entity dropped")?;
-                embedded_gpui::encode(&entity.read(cx).snapshot(cx))
-            })
-        };
-
-        let entity_id = self.shared.insert_placeholder();
-        let observation = cx.observe(entity, move |host, _, cx| {
-            host.publish_home(entity_id, cx);
-        });
-        self.shared.fill_placeholder(
+        let entity_id = self.shared.reserve_entity_id();
+        self.install_home(
+            entity,
+            methods,
+            Vec::new(),
+            Some(entity.clone().into_any()),
+            format!("#{entity_id}"),
+            false,
             entity_id,
-            shared_entities::HostSharedEntity::new(
-                format!("#{entity_id}"),
-                S::TYPE_NAME,
-                methods,
-                snapshot_fn,
-                false,
-                Some(entity.clone().into_any()),
-                observation,
-            ),
+            cx,
         );
         SharedRef::from_raw(entity_id)
     }
 
-    /// Attach to a guest-homed shared entity through a capability reference received in a
-    /// payload. Subscribes immediately; the subscribe's ack delivers the initial snapshot.
-    pub fn remote_from_ref<S: SharedSpec>(
+    #[allow(clippy::too_many_arguments)]
+    fn install_home<S, T>(
+        &mut self,
+        entity: &Entity<T>,
+        methods: Methods<S, T>,
+        event_forwarders: Vec<gpui::Subscription>,
+        strong: Option<gpui::AnyEntity>,
+        name: String,
+        announce: bool,
+        entity_id: u64,
+        cx: &mut Context<Self>,
+    ) where
+        S: SharedSpec,
+        T: 'static,
+    {
+        let mut subscriptions = vec![cx.observe(entity, move |host, _, _| {
+            host.emit_home_event(entity_id, NOTIFY_EVENT, Vec::new());
+        })];
+        subscriptions.extend(event_forwarders);
+        self.shared.insert_home(
+            entity_id,
+            shared_entities::HostSharedEntity::new(name.clone(), methods, strong, subscriptions),
+        );
+        if announce {
+            self.enqueue(PluginRequest::AnnounceSharedEntity(
+                bindings::SharedEntityAnnouncement {
+                    entity_id,
+                    type_name: S::TYPE_NAME.to_string(),
+                    name,
+                },
+            ));
+        }
+    }
+
+    /// The sink handed to schema-generated event wiring: it moves a home's typed events
+    /// onto the wire.
+    fn home_event_sink(&self, entity_id: u64, cx: &mut Context<Self>) -> EventSink {
+        let host = cx.weak_entity();
+        Rc::new(move |event: &str, payload: Vec<u8>, cx: &mut gpui::App| {
+            let event = event.to_string();
+            host.update(cx, |host, _| {
+                host.emit_home_event(entity_id, &event, payload)
+            })
+            .ok();
+        })
+    }
+
+    /// Attach to a guest-homed shared entity by name. Returns immediately; sends queue
+    /// (in order) until the guest's announcement arrives, then flush.
+    pub fn remote<S: SharedSpec>(
+        &mut self,
+        name: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) -> Remote<S> {
+        let name = name.into();
+        let signal = cx.new(|_| RemoteSignal::new());
+        self.shared
+            .insert_projection::<S>(name.clone(), signal.clone());
+        if let Some(announcement) = self.shared.unclaimed_announcements.remove(&name) {
+            self.bind_projection(announcement);
+        }
+        self.send_to_guest(&name, SUBSCRIBE_METHOD, Vec::new(), None);
+        Remote::from_parts(signal, self.remote_transport(name, cx), None)
+    }
+
+    /// Attach to a guest-homed shared entity through a capability reference received in
+    /// a payload. No name is involved: the ref's id addresses the entity directly.
+    /// Connecting the same ref twice returns a handle to the same projection; when the
+    /// last clone drops, the home is told to release the entity.
+    pub fn connect<S: SharedSpec>(
         &mut self,
         reference: SharedRef<S>,
         cx: &mut Context<Self>,
-    ) -> HostRemote<S> {
+    ) -> Remote<S> {
         let entity_id = reference.entity_id();
         let name = format!("#{entity_id}");
         if let Some(guard) = self
             .release_guards
             .get(&name)
             .and_then(std::rc::Weak::upgrade)
+            && let Some(projection) = self.shared.projections_by_name.get(&name)
         {
-            let replica = self
-                .remotes_by_name
-                .get(&name)
-                .cloned()
-                .and_then(|any| any.downcast::<SharedProjection<S::Snapshot>>().ok());
-            match replica {
-                Some(replica) => {
-                    return HostRemote {
-                        name,
-                        replica,
-                        host: cx.weak_entity(),
-                        _guard: Some(guard),
-                    };
-                }
-                None => log::error!(
-                    "embedded_gpui: ref {entity_id} materialized twice with different specs"
-                ),
-            }
+            let signal = projection.signal.clone();
+            return Remote::from_parts(signal, self.remote_transport(name, cx), Some(guard));
         }
         // A dead guard whose release hasn't been drained yet means the projection state
         // is stale; releasing now and resubscribing below keeps the guest home consistent.
@@ -963,63 +847,50 @@ impl PluginHost {
                 .retain(|pending| pending != &name);
             self.release_projection(&name, cx);
         }
-        {
-            let replica = cx.new(|_| SharedProjection::<S::Snapshot> { state: None });
-            let apply_snapshot: shared_entities::ApplySnapshot = {
-                let replica = replica.downgrade();
-                Rc::new(move |bytes, cx| {
-                    let snapshot: S::Snapshot =
-                        embedded_gpui::decode(bytes).context("decoding shared snapshot")?;
-                    replica.update(cx, |projection, cx| {
-                        projection.state = Some(snapshot);
-                        cx.notify();
+        let signal = cx.new(|_| RemoteSignal::new());
+        self.shared
+            .insert_projection_bound::<S>(name.clone(), signal.clone(), entity_id);
+        self.send_to_guest(&name, SUBSCRIBE_METHOD, Vec::new(), None);
+        let guard = Rc::new(HostReleaseGuard {
+            name: name.clone(),
+            queue: self.pending_releases.clone(),
+        });
+        self.release_guards
+            .insert(name.clone(), Rc::downgrade(&guard));
+        Remote::from_parts(signal, self.remote_transport(name, cx), Some(guard))
+    }
+
+    /// All outgoing remote traffic is deferred rather than dispatched inline: a handler
+    /// on a host-homed entity runs inside a `PluginHost` update, so a synchronous
+    /// re-entry (e.g. a caretaker forwarding from its wildcard handler) would
+    /// double-borrow the host. Deferral keeps sends FIFO while making remotes safe to
+    /// use from anywhere.
+    fn remote_transport(&self, name: String, cx: &mut Context<Self>) -> Rc<Transport> {
+        let host = cx.weak_entity();
+        Rc::new(
+            move |method: &str, payload: Vec<u8>, response: Option<ResponseSender>, cx| {
+                let host = host.clone();
+                let name = name.clone();
+                let method = method.to_string();
+                cx.defer(move |cx| {
+                    host.update(cx, |host, _| {
+                        host.send_to_guest(&name, &method, payload, response);
                     })
-                })
-            };
-            self.shared
-                .insert_projection_bound::<S>(name.clone(), apply_snapshot, entity_id);
-            self.remotes_by_name
-                .insert(name.clone(), replica.clone().into_any());
-            self.send_to_guest(
-                &name,
-                embedded_gpui::SUBSCRIBE_METHOD,
-                Vec::new(),
-                None,
-                None,
-                cx,
-            );
-            let guard = Rc::new(HostReleaseGuard {
-                name: name.clone(),
-                queue: self.pending_releases.clone(),
-            });
-            self.release_guards
-                .insert(name.clone(), Rc::downgrade(&guard));
-            HostRemote {
-                name,
-                replica,
-                host: cx.weak_entity(),
-                _guard: Some(guard),
-            }
-        }
+                    .ok();
+                });
+            },
+        )
     }
 
     /// Send `$release` for a ref-derived projection and forget it locally. The guest home
-    /// drops its strong handle; snapshots stop flowing.
-    fn release_projection(&mut self, name: &str, cx: &mut Context<Self>) {
-        self.send_to_guest(
-            name,
-            embedded_gpui::RELEASE_METHOD,
-            Vec::new(),
-            None,
-            None,
-            cx,
-        );
+    /// drops its strong handle; events stop flowing.
+    fn release_projection(&mut self, name: &str, _cx: &mut Context<Self>) {
+        self.send_to_guest(name, RELEASE_METHOD, Vec::new(), None);
         if let Some(projection) = self.shared.projections_by_name.remove(name)
             && let Some(entity_id) = projection.entity_id
         {
             self.shared.projection_names_by_id.remove(&entity_id);
         }
-        self.remotes_by_name.remove(name);
         self.release_guards.remove(name);
     }
 
@@ -1042,53 +913,32 @@ impl PluginHost {
         self.tick(cx);
     }
 
-    fn publish_home(&mut self, entity_id: u64, cx: &mut Context<Self>) {
+    /// Send one event from a host home to the guest's remotes, if the guest holds any.
+    fn emit_home_event(&mut self, entity_id: u64, event: &str, payload: Vec<u8>) {
         let Some(home) = self.shared.home_mut(entity_id) else {
             return;
         };
         if home.subscribed {
-            home.published_ack = home.applied_sequence;
-            let acked_sequence = home.applied_sequence;
-            let snapshot_fn = home.snapshot_fn.clone();
-            match snapshot_fn(cx) {
-                Ok(payload) => {
-                    self.enqueue(PluginRequest::DeliverSharedSnapshot(
-                        bindings::SharedSnapshot {
-                            entity_id,
-                            acked_sequence,
-                            payload,
-                        },
-                    ));
-                }
-                Err(error) => {
-                    log::error!("embedded_gpui: failed to encode shared snapshot: {error:#}")
-                }
-            }
+            self.enqueue(PluginRequest::DeliverSharedEvent(bindings::SharedEvent {
+                entity_id,
+                name: event.to_string(),
+                payload,
+            }));
         }
     }
 
-    fn bind_projection(
-        &mut self,
-        announcement: bindings::SharedEntityAnnouncement,
-        cx: &mut Context<Self>,
-    ) {
+    fn bind_projection(&mut self, announcement: bindings::SharedEntityAnnouncement) {
         if let Some(pending_sends) = self.shared.bind_projection(&announcement) {
             for send in pending_sends {
-                self.deliver_message_to_guest(announcement.entity_id, send, cx);
+                self.deliver_message_to_guest(announcement.entity_id, send);
             }
         }
     }
 
-    fn deliver_message_to_guest(
-        &mut self,
-        entity_id: u64,
-        send: shared_entities::PendingSend,
-        _cx: &mut Context<Self>,
-    ) {
+    fn deliver_message_to_guest(&mut self, entity_id: u64, send: shared_entities::PendingSend) {
         self.enqueue(PluginRequest::DeliverSharedMessage(
             bindings::SharedMessage {
                 entity_id,
-                sequence: send.sequence,
                 request_id: send.request_id,
                 method: send.method,
                 payload: send.payload,
@@ -1101,34 +951,29 @@ impl PluginHost {
         name: &str,
         method: &str,
         payload: Vec<u8>,
-        ack: Option<AckSender>,
         response: Option<ResponseSender>,
-        cx: &mut Context<Self>,
     ) {
+        if !self.shared.projections_by_name.contains_key(name) {
+            // Dropping `response` here resolves the caller's receipt with an error.
+            log::warn!("embedded_gpui: send to unknown shared entity {name:?}");
+            return;
+        }
         let request_id = response.map(|sender| {
             self.shared.next_request_id += 1;
             let request_id = self.shared.next_request_id;
             self.shared.pending_responses.insert(request_id, sender);
             request_id
         });
-        let Some(projection) = self.shared.projections_by_name.get_mut(name) else {
-            log::warn!("embedded_gpui: send to unknown shared entity {name:?}");
-            return;
-        };
-        projection.next_sequence += 1;
-        let sequence = projection.next_sequence;
-        if let Some(ack) = ack {
-            projection.pending_acks.push((sequence, ack));
-        }
-        let entity_id = projection.entity_id;
         let send = shared_entities::PendingSend {
-            sequence,
             request_id,
             method: method.to_string(),
             payload,
         };
-        match entity_id {
-            Some(entity_id) => self.deliver_message_to_guest(entity_id, send, cx),
+        let Some(projection) = self.shared.projections_by_name.get_mut(name) else {
+            return;
+        };
+        match projection.entity_id {
+            Some(entity_id) => self.deliver_message_to_guest(entity_id, send),
             None => projection.pending_sends.push(send),
         }
     }
@@ -1207,13 +1052,12 @@ impl PluginHost {
         self.drain_pending_releases(cx);
 
         for announcement in effects.shared_announcements {
-            self.bind_projection(announcement, cx);
+            self.bind_projection(announcement);
         }
 
-        // Snapshots strictly before responses: a call's receipt must only resolve once the
-        // local replica already reflects it.
-        for snapshot in effects.shared_snapshots {
-            self.apply_guest_snapshot(snapshot, cx);
+        // Events before responses, mirroring the order the home side produced them in.
+        for event in effects.shared_events {
+            self.apply_guest_event(event, cx);
         }
 
         for response in effects.shared_responses {
@@ -1228,82 +1072,7 @@ impl PluginHost {
         }
 
         for message in effects.shared_messages {
-            let response = self.shared.dispatch(
-                message.entity_id,
-                message.sequence,
-                &message.method,
-                &message.payload,
-                cx,
-            );
-            let entity_id = message.entity_id;
-            let outcome = match response {
-                Ok(HandlerResponse::Ready(result)) => result.map_err(|error| {
-                    log::error!("embedded_gpui: shared message failed: {error:#}");
-                    format!("{error:#}")
-                }),
-                Ok(HandlerResponse::Pending(task)) => {
-                    // The handler's work outlives this delivery; ack and response happen
-                    // when its task resolves, preserving the same publish-before-respond
-                    // order as the synchronous path below.
-                    let request_id = message.request_id;
-                    cx.spawn(async move |host, cx| {
-                        let outcome = task.await.map_err(|error| {
-                            log::error!("embedded_gpui: shared message failed: {error:#}");
-                            format!("{error:#}")
-                        });
-                        host.update(cx, |host, cx| {
-                            let needs_ack = host
-                                .shared
-                                .home_mut(entity_id)
-                                .is_some_and(|home| home.published_ack < home.applied_sequence);
-                            if needs_ack {
-                                host.publish_home(entity_id, cx);
-                            }
-                            if let Some(request_id) = request_id {
-                                host.deliver_response_to_guest(bindings::SharedResponse {
-                                    request_id,
-                                    outcome,
-                                });
-                            }
-                        })
-                        .ok();
-                    })
-                    .detach();
-                    continue;
-                }
-                Err(error) => {
-                    log::error!("embedded_gpui: shared message failed: {error:#}");
-                    Err(format!("{error:#}"))
-                }
-            };
-            // Both follow-ups are deferred so they run after the handler's notify effects
-            // flush: first the acking snapshot (deduped via published_ack), then the
-            // response, preserving snapshot-before-response ordering on the guest.
-            let host = cx.weak_entity();
-            cx.defer(move |cx| {
-                host.update(cx, |host, cx| {
-                    let needs_ack = host
-                        .shared
-                        .home_mut(entity_id)
-                        .is_some_and(|home| home.published_ack < home.applied_sequence);
-                    if needs_ack {
-                        host.publish_home(entity_id, cx);
-                    }
-                })
-                .ok();
-            });
-            if let Some(request_id) = message.request_id {
-                let host = cx.weak_entity();
-                cx.defer(move |cx| {
-                    host.update(cx, |host, _cx| {
-                        host.deliver_response_to_guest(bindings::SharedResponse {
-                            request_id,
-                            outcome,
-                        });
-                    })
-                    .ok();
-                });
-            }
+            self.apply_guest_message(message, cx);
         }
 
         for (view_id, list) in effects.scene_updates {
@@ -1337,47 +1106,109 @@ impl PluginHost {
         }
     }
 
+    /// Handle one guest message to a host home: control methods inline, everything else
+    /// through the dispatch table.
+    fn apply_guest_message(&mut self, message: bindings::SharedMessage, cx: &mut Context<Self>) {
+        let entity_id = message.entity_id;
+        let outcome = match message.method.as_str() {
+            SUBSCRIBE_METHOD => {
+                if let Some(home) = self.shared.home_mut(entity_id) {
+                    home.subscribed = true;
+                }
+                // A subscription is answered with an initial notify, so a new remote's
+                // observers always fire at least once.
+                self.emit_home_event(entity_id, NOTIFY_EVENT, Vec::new());
+                embedded_gpui::encode(&()).map_err(|error| format!("{error:#}"))
+            }
+            RELEASE_METHOD => {
+                if let Some(home) = self.shared.home_mut(entity_id) {
+                    home.subscribed = false;
+                    home.strong = None;
+                }
+                embedded_gpui::encode(&()).map_err(|error| format!("{error:#}"))
+            }
+            method => match self
+                .shared
+                .dispatch(entity_id, method, &message.payload, cx)
+            {
+                Ok(HandlerResponse::Ready(result)) => result.map_err(|error| {
+                    log::error!("embedded_gpui: shared message failed: {error:#}");
+                    format!("{error:#}")
+                }),
+                Ok(HandlerResponse::Pending(task)) => {
+                    // The handler's work outlives this delivery; the response flows when
+                    // its task resolves.
+                    let request_id = message.request_id;
+                    cx.spawn(async move |host, cx| {
+                        let outcome = task.await.map_err(|error| {
+                            log::error!("embedded_gpui: shared message failed: {error:#}");
+                            format!("{error:#}")
+                        });
+                        if let Some(request_id) = request_id {
+                            host.update(cx, |host, _| {
+                                host.deliver_response_to_guest(bindings::SharedResponse {
+                                    request_id,
+                                    outcome,
+                                });
+                            })
+                            .ok();
+                        }
+                    })
+                    .detach();
+                    return;
+                }
+                Err(error) => {
+                    log::error!("embedded_gpui: shared message failed: {error:#}");
+                    Err(format!("{error:#}"))
+                }
+            },
+        };
+        if let Some(request_id) = message.request_id {
+            // Deferred so the handler's own effects (sends, notifies) flush to the guest
+            // before the response.
+            let host = cx.weak_entity();
+            cx.defer(move |cx| {
+                host.update(cx, |host, _| {
+                    host.deliver_response_to_guest(bindings::SharedResponse {
+                        request_id,
+                        outcome,
+                    });
+                })
+                .ok();
+            });
+        }
+    }
+
     fn deliver_response_to_guest(&mut self, response: bindings::SharedResponse) {
         self.enqueue(PluginRequest::DeliverSharedResponse(response));
     }
 
-    fn apply_guest_snapshot(&mut self, snapshot: bindings::SharedSnapshot, cx: &mut Context<Self>) {
+    fn apply_guest_event(&mut self, event: bindings::SharedEvent, cx: &mut Context<Self>) {
         let Some(name) = self
             .shared
             .projection_names_by_id
-            .get(&snapshot.entity_id)
+            .get(&event.entity_id)
             .cloned()
         else {
             log::warn!(
-                "embedded_gpui: snapshot for unknown shared entity {}",
-                snapshot.entity_id
+                "embedded_gpui: event for unknown shared entity {}",
+                event.entity_id
             );
             return;
         };
-        let Some(projection) = self.shared.projections_by_name.get_mut(&name) else {
+        let Some(projection) = self.shared.projections_by_name.get(&name) else {
             return;
         };
-        let apply_snapshot = projection.apply_snapshot.clone();
-        if let Err(error) = apply_snapshot(&snapshot.payload, cx) {
-            log::error!("embedded_gpui: failed to apply shared snapshot: {error:#}");
-            return;
-        }
-        // Resolve receipts only after the replica reflects the acked writes.
-        let Some(projection) = self.shared.projections_by_name.get_mut(&name) else {
-            return;
-        };
-        let mut acked = Vec::new();
-        projection.pending_acks.retain_mut(|(sequence, sender)| {
-            if *sequence <= snapshot.acked_sequence {
-                let (drained_tx, _drained_rx) = futures::channel::oneshot::channel();
-                acked.push(std::mem::replace(sender, drained_tx));
-                false
-            } else {
-                true
-            }
-        });
-        for sender in acked {
-            sender.send(()).ok();
+        let signal = projection.signal.clone();
+        if event.name == NOTIFY_EVENT {
+            signal.update(cx, |_, cx| cx.notify());
+        } else {
+            signal.update(cx, |_, cx| {
+                cx.emit(RawSharedEvent {
+                    name: event.name,
+                    payload: event.payload,
+                })
+            });
         }
     }
 
@@ -1406,5 +1237,110 @@ impl PluginHost {
             ]));
             self.images.borrow_mut().insert(payload.id, render_image);
         }
+    }
+}
+
+/// [`PluginHost`]'s surface on the entity handle itself, so call sites skip the
+/// `host.update(cx, |host, cx| ...)` ceremony: `host.view("panel", cx)`,
+/// `host.share(&entity, "name", cx)`, `host.remote::<CounterApi>("clicks", cx)`.
+pub trait PluginHostHandle {
+    /// See [`PluginHost::share`].
+    fn share<S: SharedSpec, T: SharedHome<S>>(
+        &self,
+        entity: &Entity<T>,
+        name: impl Into<String>,
+        cx: &mut gpui::App,
+    );
+
+    /// See [`PluginHost::share_with`].
+    fn share_with<S: SharedSpec, T: 'static>(
+        &self,
+        entity: &Entity<T>,
+        name: impl Into<String>,
+        register: impl FnOnce(&mut Methods<S, T>),
+        cx: &mut gpui::App,
+    );
+
+    /// See [`PluginHost::share_anonymous`].
+    fn share_anonymous<S: SharedSpec, T: SharedHome<S>>(
+        &self,
+        entity: &Entity<T>,
+        cx: &mut gpui::App,
+    ) -> SharedRef<S>;
+
+    /// See [`PluginHost::share_anonymous_with`].
+    fn share_anonymous_with<S: SharedSpec, T: 'static>(
+        &self,
+        entity: &Entity<T>,
+        register: impl FnOnce(&mut Methods<S, T>),
+        cx: &mut gpui::App,
+    ) -> SharedRef<S>;
+
+    /// See [`PluginHost::remote`].
+    fn remote<S: SharedSpec>(&self, name: impl Into<String>, cx: &mut gpui::App) -> Remote<S>;
+
+    /// See [`PluginHost::connect`].
+    fn connect<S: SharedSpec>(&self, reference: SharedRef<S>, cx: &mut gpui::App) -> Remote<S>;
+
+    /// See [`PluginHost::view`].
+    fn view(&self, name: impl Into<String>, cx: &mut gpui::App) -> Entity<PluginViewState>;
+
+    /// See [`PluginHost::pump`].
+    fn pump(&self, cx: &mut gpui::App);
+}
+
+impl PluginHostHandle for Entity<PluginHost> {
+    fn share<S: SharedSpec, T: SharedHome<S>>(
+        &self,
+        entity: &Entity<T>,
+        name: impl Into<String>,
+        cx: &mut gpui::App,
+    ) {
+        self.update(cx, |host, cx| host.share(entity, name, cx))
+    }
+
+    fn share_with<S: SharedSpec, T: 'static>(
+        &self,
+        entity: &Entity<T>,
+        name: impl Into<String>,
+        register: impl FnOnce(&mut Methods<S, T>),
+        cx: &mut gpui::App,
+    ) {
+        self.update(cx, |host, cx| host.share_with(entity, name, register, cx))
+    }
+
+    fn share_anonymous<S: SharedSpec, T: SharedHome<S>>(
+        &self,
+        entity: &Entity<T>,
+        cx: &mut gpui::App,
+    ) -> SharedRef<S> {
+        self.update(cx, |host, cx| host.share_anonymous(entity, cx))
+    }
+
+    fn share_anonymous_with<S: SharedSpec, T: 'static>(
+        &self,
+        entity: &Entity<T>,
+        register: impl FnOnce(&mut Methods<S, T>),
+        cx: &mut gpui::App,
+    ) -> SharedRef<S> {
+        self.update(cx, |host, cx| {
+            host.share_anonymous_with(entity, register, cx)
+        })
+    }
+
+    fn remote<S: SharedSpec>(&self, name: impl Into<String>, cx: &mut gpui::App) -> Remote<S> {
+        self.update(cx, |host, cx| host.remote(name, cx))
+    }
+
+    fn connect<S: SharedSpec>(&self, reference: SharedRef<S>, cx: &mut gpui::App) -> Remote<S> {
+        self.update(cx, |host, cx| host.connect(reference, cx))
+    }
+
+    fn view(&self, name: impl Into<String>, cx: &mut gpui::App) -> Entity<PluginViewState> {
+        self.update(cx, |host, cx| host.view(name, cx))
+    }
+
+    fn pump(&self, cx: &mut gpui::App) {
+        self.update(cx, |host, cx| host.pump(cx))
     }
 }

@@ -18,15 +18,18 @@ changes; nothing here is a supported API yet.
 - A host runtime: loads a component with wasmtime, replays its display
   lists as native GPUI primitives (text hits the host's real rasterizer), and
   never calls into wasm from the frame path.
-- **Shared entities**: state lives on one side ("home"), the other side holds a
-  live replica. Typed messages and calls with responses, read-your-writes
-  ordering, capability references you can embed in payloads (`SharedRef`),
-  attenuation, async handlers, and refcounted auto-release on drop.
-- **Typed interfaces**: declare a trait with `#[shared_interface]` and get the
-  schema, typed callers for both sides, and handler registration generated.
-- **OCAP utilities** (`embedded_gpui_utils`): `Revocable`, a generic
-  caretaker/membrane that wraps any capability with pass-through snapshots,
-  method forwarding, and revocation.
+- **Shared entities**: an entity lives on one side ("home"); the other side
+  holds a `Remote` that behaves as much like an `Entity<T>` as a sandbox wall
+  allows — typed method calls with responses, `observe` for the home's
+  `cx.notify`, `subscribe` for its `cx.emit` events, refcounted auto-release
+  on drop, and capability references you can embed in payloads (`SharedRef`).
+- **Typed interfaces**: one attribute on a trait (`#[shared_interface]`) makes
+  one name the whole interface — `Remote<CounterApi>` for callers,
+  `#[shared_home] impl CounterApi for MyEntity` for the implementation, both
+  compile-time checked against the same schema.
+- **OCAP utilities** (`embedded_gpui_util`): `Revocable` (caretaker/membrane),
+  `Attenuated` (allowlist), `Audited` (call ledger), and `Mirror` (a local,
+  observable cache of remote state — snapshots as a library, not a protocol).
 
 <img width="750" height="643" alt="Screenshot 2026-07-08 at 12 12 14 AM" src="https://github.com/user-attachments/assets/81d10dfa-bad7-4fb2-9385-5629880c11ca" />
 
@@ -42,7 +45,7 @@ let plugin = PluginHost::load(path, PluginOptions::new(text_system), cx);
 div()
     .w(px(480.))
     .h(px(320.))
-    .child(plugin.update(cx, |plugin, cx| plugin.view("panel", cx)))
+    .child(plugin.view("panel", cx))
 ```
 
 The WASI sandbox grants nothing but stdout/stderr by default; every additional
@@ -71,8 +74,10 @@ cargo test -p tests -- --test-threads 1   # protocol tests
 
 - `embedded_gpui/` — the one crate both sides use: schema layer (always), host runtime
   (native), guest platform (wasm32). The WIT protocol lives in `embedded_gpui/wit/`.
-- `embedded_gpui_macros/` — the `#[shared_interface]` proc macro.
-- `embedded_gpui_util/` — object-capability patterns (`Revocable`).
+- `embedded_gpui_macros/` — the `#[shared_interface]` / `#[shared_home]` /
+  `#[shared_data]` proc macros.
+- `embedded_gpui_util/` — object-capability patterns (`Revocable`, `Attenuated`,
+  `Audited`, `Mirror`).
 - `example/` — the demo: `host/` (native window) and `plugin/` (the wasm component).
 - `tests/` — protocol integration tests plus their `test_plugin/` fixture.
 

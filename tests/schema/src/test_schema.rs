@@ -1,61 +1,74 @@
 //! Schemas for the integration tests in `tests`.
 
-use embedded_gpui::SharedRef;
+use embedded_gpui::{SharedRef, shared_data, shared_interface};
 
-embedded_gpui::shared_schema! {
-    entity TestCounterSpec as "test.counter" {
-        snapshot TestCounterSnapshot { count: u32 }
-        message "increment" TestIncrement { by: u32 } -> u32
-    }
+/// The guest-homed counter driven from the host: reads are calls (`count`), and every
+/// crossing of a multiple of ten emits a [`CounterMilestone`] event.
+#[shared_interface("test.counter", events = [CounterMilestone])]
+pub trait TestCounterApi {
+    fn increment(&mut self, by: u32, cx: &mut gpui::Context<Self>) -> u32;
+    fn count(&mut self, cx: &mut gpui::Context<Self>) -> u32;
 }
 
-embedded_gpui::shared_schema! {
-    entity ItemSpec as "test.item" {
-        snapshot ItemSnapshot { label: String, bumps: u32 }
-        message "bump" Bump {} -> u32
-    }
+/// Emitted by the counter's home when the count crosses a multiple of ten.
+#[shared_data]
+pub struct CounterMilestone {
+    pub count: u32,
 }
 
-embedded_gpui::shared_schema! {
-    entity FactorySpec as "test.factory" {
-        snapshot FactorySnapshot { created: u32 }
-        message "create" CreateItem { label: String } -> SharedRef<ItemSpec>
-    }
+#[shared_interface("test.item")]
+pub trait ItemApi {
+    fn bump(&mut self, cx: &mut gpui::Context<Self>) -> u32;
+    fn describe(&mut self, cx: &mut gpui::Context<Self>) -> ItemInfo;
 }
 
-#[derive(Clone, Debug, embedded_gpui::serde::Serialize, embedded_gpui::serde::Deserialize)]
-#[serde(crate = "embedded_gpui::serde")]
-pub struct VaultSnapshot {
+#[shared_data]
+pub struct ItemInfo {
     pub label: String,
+    pub bumps: u32,
 }
 
-/// Declared with an `async fn`: the macro rewrites the trait method to return a
+#[shared_interface("test.factory")]
+pub trait FactoryApi {
+    fn create(&mut self, label: String, cx: &mut gpui::Context<Self>) -> SharedRef<ItemApi>;
+}
+
+/// Declared with an `async fn`: the home implements it as a method returning a
 /// `Task<Result<String>>`, and the response flows when the task resolves.
-#[embedded_gpui::shared_interface(spec = VaultSpec, type_name = "test.vault", snapshot = VaultSnapshot)]
+#[shared_interface("test.vault")]
 pub trait VaultApi {
     async fn read(&mut self, cx: &mut gpui::Context<Self>) -> String;
 }
 
-embedded_gpui::shared_schema! {
-    entity GatekeeperSpec as "test.gatekeeper" {
-        snapshot GatekeeperSnapshot { guarded: u32 }
-        message "guard" Guard { vault: SharedRef<VaultSpec> } -> SharedRef<VaultSpec>
-    }
+#[shared_interface("test.gatekeeper")]
+pub trait GatekeeperApi {
+    /// Wrap the given vault capability in a guest-side caretaker and return a ref to
+    /// *that*; the caller can't tell the difference.
+    fn guard(
+        &mut self,
+        vault: SharedRef<VaultApi>,
+        cx: &mut gpui::Context<Self>,
+    ) -> SharedRef<VaultApi>;
+
+    /// Call an arbitrary method on an arbitrary item capability from the guest side, so
+    /// tests can verify what a ref does and does not permit from across the boundary.
+    async fn probe(
+        &mut self,
+        target: SharedRef<ItemApi>,
+        method: String,
+        payload: Vec<u8>,
+        cx: &mut gpui::Context<Self>,
+    ) -> Vec<u8>;
 }
 
-embedded_gpui::shared_schema! {
-    entity ChameleonSpec as "test.chameleon" {
-        snapshot ChameleonSnapshot { mode: String, pokes: u32 }
-    }
-}
+/// No methods at all: the chameleon is shared with `share_with` and interprets its
+/// method names at runtime, so only the wire name exists in the schema.
+#[shared_interface("test.chameleon")]
+pub trait ChameleonApi {}
 
-/// Payload for the gatekeeper's raw "probe" method: exercise an arbitrary method on an
-/// arbitrary item capability from the guest side, so tests can verify what a ref does
-/// and does not permit from across the boundary.
-#[derive(Clone, Debug, embedded_gpui::serde::Serialize, embedded_gpui::serde::Deserialize)]
-#[serde(crate = "embedded_gpui::serde")]
-pub struct ProbeRequest {
-    pub target: embedded_gpui::SharedRef<ItemSpec>,
-    pub method: String,
-    pub payload: Vec<u8>,
+/// What the chameleon's dynamic "state" method returns.
+#[shared_data]
+pub struct ChameleonState {
+    pub mode: String,
+    pub pokes: u32,
 }

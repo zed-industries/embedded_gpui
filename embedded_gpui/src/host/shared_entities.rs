@@ -1,62 +1,48 @@
 //! Host-side shared entities: homes with dynamic dispatch tables keyed by method name, and
-//! projections of guest-homed entities. See the "Shared entities" section of
-//! `wit/plugin.wit`.
+//! the bookkeeping for remotes to guest-homed entities. See the "Shared entities" section
+//! of `wit/plugin.wit`.
 
 use std::collections::HashMap;
-use std::rc::Rc;
 
 use anyhow::{Context as _, Result, anyhow};
 use embedded_gpui::{
-    AckSender, HandlerResponse, MethodHandler, Methods, RELEASE_METHOD, ResponseSender,
-    SUBSCRIBE_METHOD, SharedSpec, encode,
+    HandlerResponse, MethodHandler, Methods, RemoteSignal, ResponseSender, SharedSpec,
 };
-use gpui::{AnyEntity, App, Subscription};
+use gpui::{AnyEntity, App, Entity, Subscription};
 
 use crate::bindings;
-
-pub(crate) type SnapshotFn = Rc<dyn Fn(&App) -> Result<Vec<u8>>>;
-pub(crate) type ApplySnapshot = Rc<dyn Fn(&[u8], &mut App) -> Result<()>>;
 
 pub(crate) struct HostSharedEntity {
     name: String,
     type_name: &'static str,
     methods: HashMap<String, MethodHandler>,
-    pub snapshot_fn: SnapshotFn,
-    pub applied_sequence: u64,
-    pub published_ack: u64,
-    /// Whether the guest holds a live projection; snapshots only flow when true.
+    /// Whether the guest holds a live remote; events only flow while true.
     pub subscribed: bool,
     /// Anonymous shares keep their entity alive until released; named shares borrow.
-    strong: Option<AnyEntity>,
-    _observation: Subscription,
+    pub strong: Option<AnyEntity>,
+    /// The notify observation plus any typed-event forwarders wired at share time.
+    _subscriptions: Vec<Subscription>,
 }
 
 impl HostSharedEntity {
     pub fn new<S: SharedSpec, T: 'static>(
         name: String,
-        type_name: &'static str,
         methods: Methods<S, T>,
-        snapshot_fn: SnapshotFn,
-        subscribed: bool,
         strong: Option<AnyEntity>,
-        observation: Subscription,
+        subscriptions: Vec<Subscription>,
     ) -> Self {
         Self {
             name,
-            type_name,
+            type_name: S::TYPE_NAME,
             methods: methods.into_map(),
-            snapshot_fn,
-            applied_sequence: 0,
-            published_ack: 0,
-            subscribed,
+            subscribed: false,
             strong,
-            _observation: observation,
+            _subscriptions: subscriptions,
         }
     }
 }
 
 pub(crate) struct PendingSend {
-    pub sequence: u64,
     pub request_id: Option<u64>,
     pub method: String,
     pub payload: Vec<u8>,
@@ -65,10 +51,11 @@ pub(crate) struct PendingSend {
 pub(crate) struct HostProjection {
     type_name: &'static str,
     pub entity_id: Option<u64>,
-    pub apply_snapshot: ApplySnapshot,
-    pub next_sequence: u64,
+    /// Where incoming events land; every `Remote` for this entity holds it.
+    pub signal: Entity<RemoteSignal>,
+    /// Messages sent before the home side's announcement arrived; flushed in order, which
+    /// is what makes sends to a not-yet-resolved entity pipeline correctly.
     pub pending_sends: Vec<PendingSend>,
-    pub pending_acks: Vec<(u64, AckSender)>,
 }
 
 #[derive(Default)]
@@ -77,21 +64,21 @@ pub(crate) struct HostShared {
     homes: HashMap<u64, HostSharedEntity>,
     pub projections_by_name: HashMap<String, HostProjection>,
     pub projection_names_by_id: HashMap<u64, String>,
-    /// Guest announcements that arrived before the host attached a projection.
+    /// Guest announcements that arrived before the host attached a remote.
     pub unclaimed_announcements: HashMap<String, bindings::SharedEntityAnnouncement>,
     pub next_request_id: u64,
     pub pending_responses: HashMap<u64, ResponseSender>,
 }
 
 impl HostShared {
-    /// Mint an entity id before the entity record exists, so snapshot-publishing
+    /// Mint an entity id before the entity record exists, so event-forwarding
     /// subscriptions can capture it.
-    pub fn insert_placeholder(&mut self) -> u64 {
+    pub fn reserve_entity_id(&mut self) -> u64 {
         self.next_entity_id += 1;
         self.next_entity_id
     }
 
-    pub fn fill_placeholder(&mut self, entity_id: u64, entity: HostSharedEntity) {
+    pub fn insert_home(&mut self, entity_id: u64, entity: HostSharedEntity) {
         self.homes.insert(entity_id, entity);
     }
 
@@ -99,25 +86,25 @@ impl HostShared {
         self.homes.get_mut(&entity_id)
     }
 
-    pub fn insert_projection<S: SharedSpec>(&mut self, name: String, apply: ApplySnapshot) {
-        self.insert_projection_inner::<S>(name, apply, None);
+    pub fn insert_projection<S: SharedSpec>(&mut self, name: String, signal: Entity<RemoteSignal>) {
+        self.insert_projection_inner::<S>(name, signal, None);
     }
 
-    /// Insert a projection already bound to an entity id (materialized from a ref).
+    /// Insert a projection already bound to an entity id (connected from a ref).
     pub fn insert_projection_bound<S: SharedSpec>(
         &mut self,
         name: String,
-        apply: ApplySnapshot,
+        signal: Entity<RemoteSignal>,
         entity_id: u64,
     ) {
-        self.insert_projection_inner::<S>(name.clone(), apply, Some(entity_id));
+        self.insert_projection_inner::<S>(name.clone(), signal, Some(entity_id));
         self.projection_names_by_id.insert(entity_id, name);
     }
 
     fn insert_projection_inner<S: SharedSpec>(
         &mut self,
         name: String,
-        apply: ApplySnapshot,
+        signal: Entity<RemoteSignal>,
         entity_id: Option<u64>,
     ) {
         self.projections_by_name.insert(
@@ -125,10 +112,8 @@ impl HostShared {
             HostProjection {
                 type_name: S::TYPE_NAME,
                 entity_id,
-                apply_snapshot: apply,
-                next_sequence: 0,
+                signal,
                 pending_sends: Vec::new(),
-                pending_acks: Vec::new(),
             },
         );
     }
@@ -156,19 +141,15 @@ impl HostShared {
         projection.entity_id = Some(announcement.entity_id);
         self.projection_names_by_id
             .insert(announcement.entity_id, announcement.name.clone());
-        let projection = self
-            .projections_by_name
-            .get_mut(&announcement.name)
-            .expect("looked up above");
         Some(std::mem::take(&mut projection.pending_sends))
     }
 
     /// Run the handler and return its response: encoded bytes for synchronous handlers,
-    /// or a task the caller must drive for asynchronous ones.
+    /// or a task the caller must drive for asynchronous ones. Control methods
+    /// (`$subscribe` / `$release`) are handled by the caller before dispatch.
     pub fn dispatch(
         &mut self,
         entity_id: u64,
-        sequence: u64,
         method: &str,
         payload: &[u8],
         cx: &mut App,
@@ -177,19 +158,6 @@ impl HostShared {
             .homes
             .get_mut(&entity_id)
             .ok_or_else(|| anyhow!("message for unknown shared entity {entity_id}"))?;
-        home.applied_sequence = home.applied_sequence.max(sequence);
-        match method {
-            SUBSCRIBE_METHOD => {
-                home.subscribed = true;
-                return Ok(HandlerResponse::Ready(encode(&())));
-            }
-            RELEASE_METHOD => {
-                home.subscribed = false;
-                home.strong = None;
-                return Ok(HandlerResponse::Ready(encode(&())));
-            }
-            _ => {}
-        }
         let handler = home
             .methods
             .get(method)

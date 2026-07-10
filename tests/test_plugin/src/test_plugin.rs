@@ -1,16 +1,15 @@
 //! The guest half of `tests/shared_entities.rs`: a zoo of guest-homed
-//! entities exercising calls, capability refs, attenuation, and fully dynamic dispatch.
+//! entities exercising calls, events, capability refs, attenuation, and fully dynamic
+//! dispatch.
 
 use anyhow::anyhow;
-use embedded_gpui::shared::{HandleShared, SharedEntitySource, SharedRef};
-use embedded_gpui::{Plugin, register_plugin};
-use embedded_gpui::{decode, encode};
+use embedded_gpui::shared::{connect, share, share_anonymous, share_anonymous_with, share_with};
+use embedded_gpui::{Plugin, SharedRef, decode, encode, register_plugin, shared_home};
 use embedded_gpui_util::Revocable;
-use gpui::{AnyView, App, Context, Entity, Task, Window, div, prelude::*};
+use gpui::{AnyView, App, Context, Entity, EventEmitter, Task, Window, div, prelude::*};
 use test_schema::{
-    Bump, ChameleonSnapshot, ChameleonSpec, CreateItem, FactorySnapshot, FactorySpec,
-    GatekeeperSnapshot, GatekeeperSpec, Guard, ItemSnapshot, ItemSpec, ProbeRequest,
-    TestCounterSnapshot, TestCounterSpec, TestIncrement, VaultSnapshot, VaultSpec,
+    ChameleonApi, ChameleonState, CounterMilestone, FactoryApi, GatekeeperApi, ItemApi, ItemInfo,
+    TestCounterApi, VaultApi,
 };
 
 /// Named shares borrow their entities (the sharer owns the lifetime), so the plugin must
@@ -25,62 +24,26 @@ struct TestGuest {
 impl Plugin for TestGuest {
     fn new(cx: &mut App) -> Self {
         let counter = cx.new(|_| Counter { count: 0 });
-        embedded_gpui::shared::share::<TestCounterSpec, _>(
-            &counter,
-            "guest-counter",
-            |methods| {
-                methods.on::<TestIncrement>();
-            },
-            cx,
-        );
+        share(&counter, "guest-counter", cx);
 
         let factory = cx.new(|_| Factory { created: 0 });
-        embedded_gpui::shared::share::<FactorySpec, _>(
-            &factory,
-            "factory",
-            |methods| {
-                methods.on::<CreateItem>();
-            },
-            cx,
-        );
+        share(&factory, "factory", cx);
 
         let gatekeeper = cx.new(|_| Gatekeeper { guarded: 0 });
-        embedded_gpui::shared::share::<GatekeeperSpec, _>(
-            &gatekeeper,
-            "gatekeeper",
-            |methods| {
-                methods.on::<Guard>();
-                // A raw prober: call any method on any item capability the host hands
-                // us, so tests can check what an attenuated ref permits from this side.
-                methods.on_raw_async("probe", |_, _method, payload, cx| {
-                    let request: ProbeRequest = match decode(payload) {
-                        Ok(request) => request,
-                        Err(error) => return Task::ready(Err(error)),
-                    };
-                    let remote =
-                        embedded_gpui::shared::remote_from_ref::<ItemSpec>(request.target, cx);
-                    let receipt = remote.forward(&request.method, request.payload);
-                    cx.spawn(async move |_| {
-                        let outcome = receipt.await;
-                        drop(remote);
-                        outcome
-                    })
-                });
-            },
-            cx,
-        );
+        share(&gatekeeper, "gatekeeper", cx);
 
         let chameleon = cx.new(|_| Chameleon {
             mode: "echo".to_string(),
             pokes: 0,
         });
         // Entirely dynamic dispatch: one wildcard handler interprets every method name at
-        // runtime and can change its own behavior ("become").
-        embedded_gpui::shared::share::<ChameleonSpec, _>(
+        // runtime and can change its own behavior ("become"). The schema declares nothing
+        // but the wire name, so this uses the closure escape hatch under `share`.
+        share_with::<ChameleonApi, _>(
             &chameleon,
             "chameleon",
             |methods| {
-                methods.on_raw("*", |entity, method, payload, cx| {
+                methods.on("*", |entity, method, payload, cx| {
                     entity.update(cx, |this, cx| match method {
                         "become" => {
                             this.mode = decode(payload)?;
@@ -98,6 +61,10 @@ impl Plugin for TestGuest {
                                 other => Err(anyhow!("chameleon has no mode {other:?}")),
                             }
                         }
+                        "state" => encode(&ChameleonState {
+                            mode: this.mode.clone(),
+                            pokes: this.pokes,
+                        }),
                         other => Err(anyhow!("chameleon does not understand {other:?}")),
                     })
                 });
@@ -132,29 +99,22 @@ struct Counter {
     count: u32,
 }
 
-impl SharedEntitySource<TestCounterSpec> for Counter {
-    fn snapshot(&self, _cx: &App) -> TestCounterSnapshot {
-        TestCounterSnapshot { count: self.count }
-    }
-}
+impl EventEmitter<CounterMilestone> for Counter {}
 
-impl HandleShared<TestIncrement> for Counter {
-    fn handle(&mut self, message: TestIncrement, cx: &mut Context<Self>) -> u32 {
-        self.count += message.by;
+#[shared_home]
+impl TestCounterApi for Counter {
+    fn increment(&mut self, by: u32, cx: &mut Context<Self>) -> u32 {
+        let tens_before = self.count / 10;
+        self.count += by;
+        if self.count / 10 > tens_before {
+            cx.emit(CounterMilestone { count: self.count });
+        }
         cx.notify();
         self.count
     }
-}
 
-struct Factory {
-    created: u32,
-}
-
-impl SharedEntitySource<FactorySpec> for Factory {
-    fn snapshot(&self, _cx: &App) -> FactorySnapshot {
-        FactorySnapshot {
-            created: self.created,
-        }
+    fn count(&mut self, _cx: &mut Context<Self>) -> u32 {
+        self.count
     }
 }
 
@@ -163,38 +123,33 @@ struct Item {
     bumps: u32,
 }
 
-impl SharedEntitySource<ItemSpec> for Item {
-    fn snapshot(&self, _cx: &App) -> ItemSnapshot {
-        ItemSnapshot {
+#[shared_home]
+impl ItemApi for Item {
+    fn bump(&mut self, cx: &mut Context<Self>) -> u32 {
+        self.bumps += 1;
+        cx.notify();
+        self.bumps
+    }
+
+    fn describe(&mut self, _cx: &mut Context<Self>) -> ItemInfo {
+        ItemInfo {
             label: self.label.clone(),
             bumps: self.bumps,
         }
     }
 }
 
-impl HandleShared<Bump> for Item {
-    fn handle(&mut self, _message: Bump, cx: &mut Context<Self>) -> u32 {
-        self.bumps += 1;
-        cx.notify();
-        self.bumps
-    }
+struct Factory {
+    created: u32,
 }
 
-impl HandleShared<CreateItem> for Factory {
-    fn handle(&mut self, message: CreateItem, cx: &mut Context<Self>) -> SharedRef<ItemSpec> {
+#[shared_home]
+impl FactoryApi for Factory {
+    fn create(&mut self, label: String, cx: &mut Context<Self>) -> SharedRef<ItemApi> {
         self.created += 1;
         cx.notify();
-        let item: Entity<Item> = cx.new(|_| Item {
-            label: message.label,
-            bumps: 0,
-        });
-        embedded_gpui::shared::share_anonymous::<ItemSpec, _>(
-            &item,
-            |methods| {
-                methods.on::<Bump>();
-            },
-            cx,
-        )
+        let item: Entity<Item> = cx.new(|_| Item { label, bumps: 0 });
+        share_anonymous(&item, cx)
     }
 }
 
@@ -202,36 +157,23 @@ struct Gatekeeper {
     guarded: u32,
 }
 
-impl SharedEntitySource<GatekeeperSpec> for Gatekeeper {
-    fn snapshot(&self, _cx: &App) -> GatekeeperSnapshot {
-        GatekeeperSnapshot {
-            guarded: self.guarded,
-        }
-    }
-}
-
-impl HandleShared<Guard> for Gatekeeper {
-    fn handle(&mut self, message: Guard, cx: &mut Context<Self>) -> SharedRef<VaultSpec> {
+#[shared_home]
+impl GatekeeperApi for Gatekeeper {
+    fn guard(&mut self, vault: SharedRef<VaultApi>, cx: &mut Context<Self>) -> SharedRef<VaultApi> {
         self.guarded += 1;
         cx.notify();
-        // The membrane is the stock caretaker from embedded_gpui_util: snapshots pass
-        // through, every method forwards to the wrapped vault capability, and revoking
-        // drops the inner remote (auto-release cascades to the vault's home).
-        let vault = embedded_gpui::shared::remote_from_ref::<VaultSpec>(message.vault, cx);
-        let revocable = Revocable::new(
-            vault,
-            VaultSnapshot {
-                label: "pending".to_string(),
-            },
-            cx,
-        );
-        embedded_gpui::shared::share_anonymous::<VaultSpec, _>(
+        // The membrane is the stock caretaker from embedded_gpui_util: every method
+        // forwards to the wrapped vault capability, and revoking drops the inner remote
+        // (auto-release cascades to the vault's home).
+        let vault = connect(vault, cx);
+        let revocable = Revocable::new(vault, cx);
+        share_anonymous_with(
             &revocable,
             |methods| {
                 Revocable::register(methods);
                 // Revocation authority is a deliberate grant: this guest chooses to let
                 // its peer revoke over the wire.
-                methods.on_raw("revoke", |entity, _method, _payload, cx| {
+                methods.on("revoke", |entity, _method, _payload, cx| {
                     entity.update(cx, |revocable, cx| revocable.revoke(cx));
                     encode(&())
                 });
@@ -239,18 +181,25 @@ impl HandleShared<Guard> for Gatekeeper {
             cx,
         )
     }
+
+    fn probe(
+        &mut self,
+        target: SharedRef<ItemApi>,
+        method: String,
+        payload: Vec<u8>,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<Vec<u8>>> {
+        let remote = connect(target, cx);
+        let receipt = remote.forward(&method, payload, cx);
+        cx.spawn(async move |_, _| {
+            let outcome = receipt.await;
+            drop(remote);
+            outcome
+        })
+    }
 }
 
 struct Chameleon {
     mode: String,
     pokes: u32,
-}
-
-impl SharedEntitySource<ChameleonSpec> for Chameleon {
-    fn snapshot(&self, _cx: &App) -> ChameleonSnapshot {
-        ChameleonSnapshot {
-            mode: self.mode.clone(),
-            pokes: self.pokes,
-        }
-    }
 }

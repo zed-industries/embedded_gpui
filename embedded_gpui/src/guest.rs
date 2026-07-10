@@ -269,11 +269,11 @@ impl wit::Guest for Component {
         pump(&platform);
     }
 
-    fn deliver_shared_snapshot(snapshot: wit::SharedSnapshot) {
+    fn deliver_shared_event(event: wit::SharedEvent) {
         let Some((mut async_app, platform, _)) = runtime_handles() else {
             return;
         };
-        shared::snapshot_delivered(snapshot, &mut async_app);
+        shared::event_delivered(event, &mut async_app);
         pump(&platform);
     }
 

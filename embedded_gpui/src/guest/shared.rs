@@ -1,30 +1,22 @@
-//! Guest-side shared entities: projections of host-homed entities, and homes for
-//! guest-owned entities projected into the host. See the "Shared entities" section of
+//! Guest-side shared entities: homes for guest-owned entities, and the registry behind
+//! [`Remote`]s to host-homed entities. See the "Shared entities" section of
 //! `wit/plugin.wit` and DESIGN.md.
 
 use crate::wit;
-use anyhow::{Context as _, Result, anyhow};
 use embedded_gpui::{
-    AckSender, HandlerResponse, MethodHandler, RELEASE_METHOD, ResponseSender, SUBSCRIBE_METHOD,
-    SharedMessage, SharedSpec, decode, encode,
+    EventSink, HandlerResponse, MethodHandler, NOTIFY_EVENT, RELEASE_METHOD, RawSharedEvent,
+    RemoteSignal, ResponseSender, SUBSCRIBE_METHOD, SharedHome, SharedSpec, encode,
 };
-use gpui::{AnyEntity, App, AppContext as _, AsyncApp, Entity};
+use gpui::{AnyEntity, App, AppContext as _, AsyncApp, Entity, Subscription};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 
-pub use embedded_gpui::{
-    CallReceipt, HandleShared, HandleSharedAsync, Methods, RawCallReceipt, SendReceipt,
-    SharedCaller, SharedEntitySource, SharedProjection, SharedRef,
-};
+pub use embedded_gpui::{Methods, Receipt, Remote, SharedCaller, SharedRef};
 
 use crate::GUEST_HOME_BIT;
 
-type ApplySnapshot = Rc<dyn Fn(&[u8], &mut AsyncApp) -> Result<()>>;
-type SnapshotFn = Rc<dyn Fn(&App) -> Result<Vec<u8>>>;
-
 struct PendingSend {
-    sequence: u64,
     request_id: Option<u64>,
     method: String,
     payload: Vec<u8>,
@@ -33,27 +25,25 @@ struct PendingSend {
 struct ProjectionEntry {
     type_name: &'static str,
     entity_id: Option<u64>,
-    apply_snapshot: ApplySnapshot,
-    replica: AnyEntity,
-    next_sequence: u64,
-    /// Messages sent before the home side's announcement arrived; flushed in order, which is
-    /// what makes sends to a not-yet-resolved entity pipeline correctly.
+    /// Where incoming events land; every `Remote` for this entity holds it.
+    signal: Entity<RemoteSignal>,
+    /// Messages sent before the home side's announcement arrived; flushed in order, which
+    /// is what makes sends to a not-yet-resolved entity pipeline correctly.
     pending_sends: Vec<PendingSend>,
-    pending_acks: Vec<(u64, AckSender)>,
-    /// Live only while some `Remote` from `remote_from_ref` still holds the projection;
-    /// used to hand the same guard back when the same ref is materialized twice.
+    /// Live only while some `Remote` from `connect` still holds the projection; used to
+    /// hand the same guard back when the same ref is connected twice.
     guard: Weak<ReleaseGuard>,
 }
 
 /// Dropping the last `Remote` for a ref-derived projection releases the capability:
-/// the home side drops its strong handle and snapshots stop flowing.
+/// the home side drops its strong handle and events stop flowing.
 struct ReleaseGuard {
     name: String,
 }
 
 impl Drop for ReleaseGuard {
     fn drop(&mut self) {
-        dispatch_outgoing(&self.name, RELEASE_METHOD, Vec::new(), None, None);
+        dispatch_outgoing(&self.name, RELEASE_METHOD, Vec::new(), None);
         REGISTRY.with(|registry| {
             let mut registry = registry.borrow_mut();
             if let Some(entry) = registry.projections_by_name.remove(&self.name)
@@ -67,13 +57,12 @@ impl Drop for ReleaseGuard {
 
 struct HomeEntry {
     methods: HashMap<String, MethodHandler>,
-    snapshot_fn: SnapshotFn,
-    applied_sequence: u64,
-    published_ack: u64,
-    /// Whether the other side holds a live projection; snapshots only flow when true.
+    /// Whether the host holds a live remote; events only flow while true.
     subscribed: bool,
     /// Anonymous shares keep their entity alive until released; named shares borrow.
     strong: Option<AnyEntity>,
+    /// The notify observation plus any typed-event forwarders wired at share time.
+    _subscriptions: Vec<Subscription>,
 }
 
 #[derive(Default)]
@@ -90,105 +79,56 @@ thread_local! {
     static REGISTRY: RefCell<Registry> = RefCell::new(Registry::default());
 }
 
-/// A typed handle to an entity homed on the other side of the boundary.
-pub struct Remote<S: SharedSpec> {
-    name: String,
-    replica: Entity<SharedProjection<S::Snapshot>>,
-    /// Present only for remotes materialized from a [`SharedRef`]; named remotes are
-    /// bootstrap mounts and are never auto-released.
-    _guard: Option<Rc<ReleaseGuard>>,
-}
-
-impl<S: SharedSpec> Clone for Remote<S> {
-    fn clone(&self) -> Self {
-        Self {
-            name: self.name.clone(),
-            replica: self.replica.clone(),
-            _guard: self._guard.clone(),
-        }
-    }
-}
-
-/// Attach to the shared entity bound to `name` on the host. Returns immediately; the
-/// replica fills in when the host's announcement and first snapshot arrive.
+/// Attach to the shared entity bound to `name` on the host. Returns immediately; sends
+/// queue (in order) until the host's announcement arrives, then flush.
 pub fn remote<S: SharedSpec>(name: impl Into<String>, cx: &mut App) -> Remote<S> {
     let name = name.into();
-    let replica = cx.new(|_| SharedProjection::<S::Snapshot> { state: None });
-    let apply_snapshot: ApplySnapshot = {
-        let replica = replica.downgrade();
-        Rc::new(move |bytes: &[u8], cx: &mut AsyncApp| {
-            let snapshot: S::Snapshot = decode(bytes).context("decoding shared snapshot")?;
-            replica.update(cx, |projection, cx| {
-                projection.state = Some(snapshot);
-                cx.notify();
-            })
-        })
-    };
+    let signal = cx.new(|_| RemoteSignal::new());
     REGISTRY.with(|registry| {
         registry.borrow_mut().projections_by_name.insert(
             name.clone(),
             ProjectionEntry {
                 type_name: S::TYPE_NAME,
                 entity_id: None,
-                apply_snapshot,
-                replica: replica.clone().into_any(),
-                next_sequence: 0,
+                signal: signal.clone(),
                 pending_sends: Vec::new(),
-                pending_acks: Vec::new(),
                 guard: Weak::new(),
             },
         );
     });
-    Remote {
-        name,
-        replica,
-        _guard: None,
-    }
+    dispatch_outgoing(&name, SUBSCRIBE_METHOD, Vec::new(), None);
+    Remote::from_parts(signal, remote_transport(name), None)
 }
 
-/// Attach to a shared entity through a capability reference received in a payload. No name
-/// is involved: the ref's id addresses the entity directly, and a `$subscribe` control
-/// message starts the snapshot flow (its ack is the initial snapshot). Materializing the
-/// same ref twice returns the same replica.
-pub fn remote_from_ref<S: SharedSpec>(reference: SharedRef<S>, cx: &mut App) -> Remote<S> {
+/// Attach to a shared entity through a capability reference received in a payload. No
+/// name is involved: the ref's id addresses the entity directly. Connecting the same ref
+/// twice returns a handle to the same projection; when the last clone drops, the home is
+/// told to release the entity.
+pub fn connect<S: SharedSpec>(reference: SharedRef<S>, cx: &mut App) -> Remote<S> {
     let entity_id = reference.entity_id();
     let name = format!("#{entity_id}");
 
     let existing = REGISTRY.with(|registry| {
         let registry = registry.borrow();
-        registry
-            .projections_by_name
-            .get(&name)
-            .map(|entry| (entry.replica.clone(), entry.guard.upgrade()))
+        registry.projections_by_name.get(&name).and_then(|entry| {
+            Some((
+                entry.signal.clone(),
+                entry.guard.upgrade()?,
+                entry.type_name,
+            ))
+        })
     });
-    if let Some((replica, Some(guard))) = existing {
-        match replica.downcast::<SharedProjection<S::Snapshot>>() {
-            Ok(replica) => {
-                return Remote {
-                    name,
-                    replica,
-                    _guard: Some(guard),
-                };
-            }
-            Err(_) => {
-                log::error!(
-                    "embedded_gpui: ref {entity_id} materialized twice with different specs"
-                )
-            }
+    if let Some((signal, guard, type_name)) = existing {
+        if type_name != S::TYPE_NAME {
+            log::error!(
+                "embedded_gpui: ref {entity_id} connected as {} but already live as {type_name}",
+                S::TYPE_NAME
+            );
         }
+        return Remote::from_parts(signal, remote_transport(name), Some(guard));
     }
 
-    let replica = cx.new(|_| SharedProjection::<S::Snapshot> { state: None });
-    let apply_snapshot: ApplySnapshot = {
-        let replica = replica.downgrade();
-        Rc::new(move |bytes: &[u8], cx: &mut AsyncApp| {
-            let snapshot: S::Snapshot = decode(bytes).context("decoding shared snapshot")?;
-            replica.update(cx, |projection, cx| {
-                projection.state = Some(snapshot);
-                cx.notify();
-            })
-        })
-    };
+    let signal = cx.new(|_| RemoteSignal::new());
     let guard = Rc::new(ReleaseGuard { name: name.clone() });
     REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
@@ -197,130 +137,35 @@ pub fn remote_from_ref<S: SharedSpec>(reference: SharedRef<S>, cx: &mut App) -> 
             ProjectionEntry {
                 type_name: S::TYPE_NAME,
                 entity_id: Some(entity_id),
-                apply_snapshot,
-                replica: replica.clone().into_any(),
-                next_sequence: 0,
+                signal: signal.clone(),
                 pending_sends: Vec::new(),
-                pending_acks: Vec::new(),
                 guard: Rc::downgrade(&guard),
             },
         );
         registry.names_by_entity_id.insert(entity_id, name.clone());
     });
-    dispatch_outgoing(&name, SUBSCRIBE_METHOD, Vec::new(), None, None);
-    Remote {
-        name,
-        replica,
-        _guard: Some(guard),
-    }
+    dispatch_outgoing(&name, SUBSCRIBE_METHOD, Vec::new(), None);
+    Remote::from_parts(signal, remote_transport(name), Some(guard))
 }
 
-impl<S: SharedSpec> Remote<S> {
-    /// The local replica entity, for `cx.observe` and reads.
-    pub fn replica(&self) -> &Entity<SharedProjection<S::Snapshot>> {
-        &self.replica
-    }
-
-    /// Send a typed message to the entity's home side. Await the receipt for
-    /// read-your-writes; drop it for fire-and-forget.
-    pub fn send<M: SharedMessage<Spec = S>>(&self, message: M) -> SendReceipt {
-        match encode(&message) {
-            Ok(payload) => send_raw(&self.name, M::METHOD, payload),
-            Err(error) => {
-                log::error!(
-                    "embedded_gpui: failed to encode {}::{}: {error:#}",
-                    S::TYPE_NAME,
-                    M::METHOD
-                );
-                SendReceipt::dropped()
-            }
-        }
-    }
-
-    /// Call a method by name with pre-encoded payload, resolving with the raw response
-    /// bytes. This is the forwarding primitive: a caretaker pipes a caller's request
-    /// through to the entity it guards without knowing the method's types.
-    pub fn forward(&self, method: &str, payload: Vec<u8>) -> RawCallReceipt {
-        call_forward(&self.name, method, payload)
-    }
-
-    /// Call a typed method on the entity's home side, resolving with its return value. The
-    /// response is delivered after the snapshot acking this call, so the replica already
-    /// reflects the mutation when the receipt resolves.
-    pub fn call<M: SharedMessage<Spec = S>>(&self, message: M) -> CallReceipt<M::Response> {
-        match encode(&message) {
-            Ok(payload) => call_raw(&self.name, M::METHOD, payload),
-            Err(error) => {
-                log::error!(
-                    "embedded_gpui: failed to encode {}::{}: {error:#}",
-                    S::TYPE_NAME,
-                    M::METHOD
-                );
-                CallReceipt::dropped()
-            }
-        }
-    }
+/// The guest's transport: the registry is thread-local, so moving bytes toward the host
+/// needs no deferral and no context.
+fn remote_transport(name: String) -> Rc<embedded_gpui::Transport> {
+    Rc::new(
+        move |method: &str, payload: Vec<u8>, response: Option<ResponseSender>, _cx| {
+            dispatch_outgoing(&name, method, payload, response);
+        },
+    )
 }
 
-// The guest's registry is thread-local, so no context is needed; the `cx` parameters
-// exist for signature parity with the host side.
-impl<S: SharedSpec> SharedCaller<S> for Remote<S> {
-    fn shared_replica(&self) -> &Entity<SharedProjection<S::Snapshot>> {
-        self.replica()
-    }
-
-    fn send_shared<M: SharedMessage<Spec = S>>(&self, message: M, _cx: &mut App) -> SendReceipt {
-        self.send(message)
-    }
-
-    fn call_shared<M: SharedMessage<Spec = S>>(
-        &self,
-        message: M,
-        _cx: &mut App,
-    ) -> CallReceipt<M::Response> {
-        self.call(message)
-    }
-
-    fn forward_shared(&self, method: &str, payload: Vec<u8>, _cx: &mut App) -> RawCallReceipt {
-        self.forward(method, payload)
-    }
-}
-
-/// The dynamic escape hatch: send an arbitrary method and payload to a shared entity by
-/// name. The typed [`Remote::send`] is sugar over exactly this.
-pub fn send_raw(name: &str, method: &str, payload: Vec<u8>) -> SendReceipt {
-    let (ack_sender, receipt) = SendReceipt::channel();
-    dispatch_outgoing(name, method, payload, Some(ack_sender), None);
-    receipt
-}
-
-/// The dynamic call escape hatch; the typed [`Remote::call`] is sugar over this.
-pub fn call_raw<R: embedded_gpui::serde::de::DeserializeOwned>(
-    name: &str,
-    method: &str,
-    payload: Vec<u8>,
-) -> CallReceipt<R> {
-    let (response_sender, receipt) = CallReceipt::channel();
-    dispatch_outgoing(name, method, payload, None, Some(response_sender));
-    receipt
-}
-
-/// Like [`call_raw`] but resolves with the raw response bytes, undecoded.
-pub fn call_forward(name: &str, method: &str, payload: Vec<u8>) -> RawCallReceipt {
-    let (response_sender, receipt) = RawCallReceipt::channel();
-    dispatch_outgoing(name, method, payload, None, Some(response_sender));
-    receipt
-}
-
-fn dispatch_outgoing(
-    name: &str,
-    method: &str,
-    payload: Vec<u8>,
-    ack: Option<AckSender>,
-    response: Option<ResponseSender>,
-) {
+fn dispatch_outgoing(name: &str, method: &str, payload: Vec<u8>, response: Option<ResponseSender>) {
     REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
+        if !registry.projections_by_name.contains_key(name) {
+            // Dropping `response` here resolves the caller's receipt with an error.
+            log::warn!("embedded_gpui: send to unknown shared entity {name:?}");
+            return;
+        }
         let request_id = response.map(|sender| {
             registry.next_request_id += 1;
             let request_id = registry.next_request_id;
@@ -328,25 +173,17 @@ fn dispatch_outgoing(
             request_id
         });
         let Some(entry) = registry.projections_by_name.get_mut(name) else {
-            log::warn!("embedded_gpui: send to unknown shared entity {name:?}");
             return;
         };
-        entry.next_sequence += 1;
-        let sequence = entry.next_sequence;
-        if let Some(ack) = ack {
-            entry.pending_acks.push((sequence, ack));
-        }
         if let Some(entity_id) = entry.entity_id {
             wit::send_shared_message(&wit::SharedMessage {
                 entity_id,
-                sequence,
                 request_id,
                 method: method.to_string(),
                 payload,
             });
         } else {
             entry.pending_sends.push(PendingSend {
-                sequence,
                 request_id,
                 method: method.to_string(),
                 payload,
@@ -372,121 +209,156 @@ pub(crate) fn response_delivered(response: wit::SharedResponse) {
     sender.send(response.outcome).ok();
 }
 
-/// Share a guest entity with the host under a well-known name. The guest becomes the home:
-/// host messages dispatch to the handlers registered in `register`, and every `cx.notify`
-/// publishes a snapshot to the host's projections.
-pub fn share<S, T>(
+/// Share a guest entity with the host under a well-known name (a mount the host attaches
+/// to with `PluginHost::remote`). The guest becomes the home: the entity's
+/// `#[shared_home]` methods answer host messages, and its `cx.notify` / declared
+/// `cx.emit` events reach every host remote.
+pub fn share<S, T>(entity: &Entity<T>, name: impl Into<String>, cx: &mut App)
+where
+    S: SharedSpec,
+    T: SharedHome<S>,
+{
+    let mut methods = Methods::new(entity.downgrade());
+    T::methods(&mut methods);
+    let entity_id = reserve_home_id();
+    let events = T::events(entity, home_event_sink(entity_id), cx);
+    install_home::<S, T>(entity, methods, events, None, entity_id, cx);
+    wit::announce_shared_entity(&wit::SharedEntityAnnouncement {
+        entity_id,
+        type_name: S::TYPE_NAME.to_string(),
+        name: name.into(),
+    });
+}
+
+/// The dynamic escape hatch beneath [`share`]: register method handlers with a closure
+/// instead of a schema interface. `cx.notify` still crosses; typed events are not wired
+/// (implement [`SharedHome`] manually if you need both).
+pub fn share_with<S, T>(
     entity: &Entity<T>,
     name: impl Into<String>,
     register: impl FnOnce(&mut Methods<S, T>),
     cx: &mut App,
 ) where
     S: SharedSpec,
-    T: SharedEntitySource<S>,
+    T: 'static,
 {
-    let name = name.into();
     let mut methods = Methods::new(entity.downgrade());
     register(&mut methods);
-
-    let snapshot_fn: SnapshotFn = {
-        let entity = entity.downgrade();
-        Rc::new(move |cx: &App| {
-            let entity = entity.upgrade().context("shared entity dropped")?;
-            encode(&entity.read(cx).snapshot(cx))
-        })
-    };
-
-    let entity_id = insert_home(methods.into_map(), snapshot_fn, true, None);
-
-    cx.observe(entity, move |_, cx| publish_home(entity_id, cx))
-        .detach();
-
+    let entity_id = reserve_home_id();
+    install_home::<S, T>(entity, methods, Vec::new(), None, entity_id, cx);
     wit::announce_shared_entity(&wit::SharedEntityAnnouncement {
         entity_id,
         type_name: S::TYPE_NAME.to_string(),
-        name,
+        name: name.into(),
     });
-    publish_home(entity_id, cx);
 }
 
-/// Share a guest entity anonymously, returning a capability reference to embed in snapshot
-/// or message payloads. The home holds a strong handle to the entity until the reference is
-/// released; snapshots start flowing when a projection subscribes.
-pub fn share_anonymous<S, T>(
+/// Share a guest entity anonymously, returning a capability reference to embed in message
+/// or event payloads. The home holds a strong handle to the entity until the reference is
+/// released.
+pub fn share_anonymous<S, T>(entity: &Entity<T>, cx: &mut App) -> SharedRef<S>
+where
+    S: SharedSpec,
+    T: SharedHome<S>,
+{
+    let mut methods = Methods::new(entity.downgrade());
+    T::methods(&mut methods);
+    let entity_id = reserve_home_id();
+    let events = T::events(entity, home_event_sink(entity_id), cx);
+    install_home::<S, T>(
+        entity,
+        methods,
+        events,
+        Some(entity.clone().into_any()),
+        entity_id,
+        cx,
+    );
+    SharedRef::from_raw(entity_id)
+}
+
+/// [`share_anonymous`] with a closure-registered dispatch table; see [`share_with`].
+pub fn share_anonymous_with<S, T>(
     entity: &Entity<T>,
     register: impl FnOnce(&mut Methods<S, T>),
     cx: &mut App,
 ) -> SharedRef<S>
 where
     S: SharedSpec,
-    T: SharedEntitySource<S>,
+    T: 'static,
 {
     let mut methods = Methods::new(entity.downgrade());
     register(&mut methods);
-
-    let snapshot_fn: SnapshotFn = {
-        let entity = entity.downgrade();
-        Rc::new(move |cx: &App| {
-            let entity = entity.upgrade().context("shared entity dropped")?;
-            encode(&entity.read(cx).snapshot(cx))
-        })
-    };
-
-    let entity_id = insert_home(
-        methods.into_map(),
-        snapshot_fn,
-        false,
+    let entity_id = reserve_home_id();
+    install_home::<S, T>(
+        entity,
+        methods,
+        Vec::new(),
         Some(entity.clone().into_any()),
+        entity_id,
+        cx,
     );
-    cx.observe(entity, move |_, cx| publish_home(entity_id, cx))
-        .detach();
     SharedRef::from_raw(entity_id)
 }
 
-fn insert_home(
-    methods: HashMap<String, MethodHandler>,
-    snapshot_fn: SnapshotFn,
-    subscribed: bool,
-    strong: Option<AnyEntity>,
-) -> u64 {
+fn reserve_home_id() -> u64 {
     REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
         registry.next_home_id += 1;
-        let entity_id = GUEST_HOME_BIT | registry.next_home_id;
-        registry.homes.insert(
-            entity_id,
-            HomeEntry {
-                methods,
-                snapshot_fn,
-                applied_sequence: 0,
-                published_ack: 0,
-                subscribed,
-                strong,
-            },
-        );
-        entity_id
+        GUEST_HOME_BIT | registry.next_home_id
     })
 }
 
-fn publish_home(entity_id: u64, cx: &mut App) {
-    let publish = REGISTRY.with(|registry| {
-        let mut registry = registry.borrow_mut();
-        let home = registry.homes.get_mut(&entity_id)?;
-        if !home.subscribed {
-            return None;
-        }
-        home.published_ack = home.applied_sequence;
-        Some((home.snapshot_fn.clone(), home.applied_sequence))
+fn install_home<S, T>(
+    entity: &Entity<T>,
+    methods: Methods<S, T>,
+    event_forwarders: Vec<Subscription>,
+    strong: Option<AnyEntity>,
+    entity_id: u64,
+    cx: &mut App,
+) where
+    S: SharedSpec,
+    T: 'static,
+{
+    let mut subscriptions = vec![cx.observe(entity, move |_, _| {
+        emit_home_event(entity_id, NOTIFY_EVENT, Vec::new());
+    })];
+    subscriptions.extend(event_forwarders);
+    REGISTRY.with(|registry| {
+        registry.borrow_mut().homes.insert(
+            entity_id,
+            HomeEntry {
+                methods: methods.into_map(),
+                subscribed: false,
+                strong,
+                _subscriptions: subscriptions,
+            },
+        );
     });
-    if let Some((snapshot_fn, acked_sequence)) = publish {
-        match snapshot_fn(cx) {
-            Ok(payload) => wit::publish_shared_snapshot(&wit::SharedSnapshot {
-                entity_id,
-                acked_sequence,
-                payload,
-            }),
-            Err(error) => log::error!("embedded_gpui: failed to snapshot shared entity: {error:#}"),
-        }
+}
+
+/// The sink handed to schema-generated event wiring: it moves a home's typed events onto
+/// the wire.
+fn home_event_sink(entity_id: u64) -> EventSink {
+    Rc::new(move |event: &str, payload: Vec<u8>, _cx: &mut App| {
+        emit_home_event(entity_id, event, payload);
+    })
+}
+
+/// Send one event from a guest home to the host's remotes, if the host holds any.
+fn emit_home_event(entity_id: u64, event: &str, payload: Vec<u8>) {
+    let subscribed = REGISTRY.with(|registry| {
+        registry
+            .borrow()
+            .homes
+            .get(&entity_id)
+            .is_some_and(|home| home.subscribed)
+    });
+    if subscribed {
+        wit::emit_shared_event(&wit::SharedEvent {
+            entity_id,
+            name: event.to_string(),
+            payload,
+        });
     }
 }
 
@@ -517,7 +389,7 @@ pub(crate) fn entity_announced(announcement: wit::SharedEntityAnnouncement) {
         let entry = registry
             .projections_by_name
             .get_mut(&announcement.name)
-            .expect("inserted above");
+            .expect("looked up above");
         std::mem::take(&mut entry.pending_sends)
             .into_iter()
             .map(|send| (announcement.entity_id, send))
@@ -526,7 +398,6 @@ pub(crate) fn entity_announced(announcement: wit::SharedEntityAnnouncement) {
     for (entity_id, send) in flushed {
         wit::send_shared_message(&wit::SharedMessage {
             entity_id,
-            sequence: send.sequence,
             request_id: send.request_id,
             method: send.method,
             payload: send.payload,
@@ -534,52 +405,33 @@ pub(crate) fn entity_announced(announcement: wit::SharedEntityAnnouncement) {
     }
 }
 
-pub(crate) fn snapshot_delivered(snapshot: wit::SharedSnapshot, cx: &mut AsyncApp) {
-    // Clone the applier out so the registry borrow is released before user code (observers
-    // of the replica) runs; observers may re-enter this module via `send_raw`.
-    let apply_snapshot = REGISTRY.with(|registry| {
+pub(crate) fn event_delivered(event: wit::SharedEvent, cx: &mut AsyncApp) {
+    // Clone the signal out so the registry borrow is released before user code (observers
+    // and subscribers) runs; observers may re-enter this module via sends.
+    let signal = REGISTRY.with(|registry| {
         let registry = registry.borrow();
-        let name = registry.names_by_entity_id.get(&snapshot.entity_id)?;
+        let name = registry.names_by_entity_id.get(&event.entity_id)?;
         registry
             .projections_by_name
             .get(name)
-            .map(|entry| entry.apply_snapshot.clone())
+            .map(|entry| entry.signal.clone())
     });
-    let result = match apply_snapshot {
-        Some(apply_snapshot) => apply_snapshot(&snapshot.payload, cx),
-        None => Err(anyhow!(
-            "snapshot for unknown entity {}",
-            snapshot.entity_id
-        )),
-    };
-    if let Err(error) = result {
-        log::error!("embedded_gpui: failed to apply shared snapshot: {error:#}");
+    let Some(signal) = signal else {
+        log::warn!(
+            "embedded_gpui: event for unknown shared entity {}",
+            event.entity_id
+        );
         return;
-    }
-
-    // The replica now includes everything through `acked_sequence`; resolving receipts after
-    // the update above is what makes awaiting a send read-your-writes.
-    let acked = REGISTRY.with(|registry| {
-        let mut registry = registry.borrow_mut();
-        let name = registry
-            .names_by_entity_id
-            .get(&snapshot.entity_id)?
-            .clone();
-        let entry = registry.projections_by_name.get_mut(&name)?;
-        let mut acked = Vec::new();
-        entry.pending_acks.retain_mut(|(sequence, sender)| {
-            if *sequence <= snapshot.acked_sequence {
-                let (drained_sender, _drained_receiver) = futures::channel::oneshot::channel();
-                acked.push(std::mem::replace(sender, drained_sender));
-                false
-            } else {
-                true
-            }
+    };
+    if event.name == NOTIFY_EVENT {
+        signal.update(cx, |_, cx| cx.notify());
+    } else {
+        signal.update(cx, |_, cx| {
+            cx.emit(RawSharedEvent {
+                name: event.name,
+                payload: event.payload,
+            })
         });
-        Some(acked)
-    });
-    for sender in acked.into_iter().flatten() {
-        sender.send(()).ok();
     }
 }
 
@@ -594,7 +446,6 @@ pub(crate) fn message_delivered(message: wit::SharedMessage, cx: &mut AsyncApp) 
         let Some(home) = registry.homes.get_mut(&message.entity_id) else {
             return Dispatch::Unknown;
         };
-        home.applied_sequence = home.applied_sequence.max(message.sequence);
         match message.method.as_str() {
             SUBSCRIBE_METHOD => {
                 home.subscribed = true;
@@ -619,24 +470,29 @@ pub(crate) fn message_delivered(message: wit::SharedMessage, cx: &mut AsyncApp) 
             match cx.update(|cx| handler(&message.method, &message.payload, cx)) {
                 HandlerResponse::Ready(result) => result.map_err(|error| format!("{error:#}")),
                 HandlerResponse::Pending(task) => {
-                    // The handler's work continues after this delivery returns; ack and
-                    // response happen when its task resolves, preserving the same
-                    // publish-before-respond order as the synchronous path below.
-                    let entity_id = message.entity_id;
+                    // The handler's work continues after this delivery returns; the
+                    // response flows when its task resolves.
                     let request_id = message.request_id;
-                    cx.spawn(async move |cx| {
+                    cx.spawn(async move |_| {
                         let outcome = task.await.map_err(|error| format!("{error:#}"));
                         if let Err(error) = &outcome {
                             log::error!("embedded_gpui: shared message failed: {error}");
                         }
-                        finish_delivery(entity_id, request_id, outcome, cx);
+                        respond(request_id, outcome);
                     })
                     .detach();
                     return;
                 }
             }
         }
-        Dispatch::Control => encode(&()).map_err(|error| format!("{error:#}")),
+        Dispatch::Control => {
+            if message.method == SUBSCRIBE_METHOD {
+                // A subscription is answered with an initial notify, so a new remote's
+                // observers always fire at least once.
+                emit_home_event(message.entity_id, NOTIFY_EVENT, Vec::new());
+            }
+            encode(&()).map_err(|error| format!("{error:#}"))
+        }
         Dispatch::Unknown => Err(format!(
             "no handler for shared method {:?} on entity {}",
             message.method, message.entity_id
@@ -645,29 +501,10 @@ pub(crate) fn message_delivered(message: wit::SharedMessage, cx: &mut AsyncApp) 
     if let Err(error) = &outcome {
         log::error!("embedded_gpui: shared message failed: {error}");
     }
-    finish_delivery(message.entity_id, message.request_id, outcome, cx);
+    respond(message.request_id, outcome);
 }
 
-/// Publish any unacked state change, then send the response if the message was a call.
-/// The order matters: responses may only arrive after the snapshot acking their call,
-/// which is what makes calls read-your-writes.
-fn finish_delivery(
-    entity_id: u64,
-    request_id: Option<u64>,
-    outcome: Result<Vec<u8>, String>,
-    cx: &mut AsyncApp,
-) {
-    let needs_ack = REGISTRY.with(|registry| {
-        registry
-            .borrow()
-            .homes
-            .get(&entity_id)
-            .is_some_and(|home| home.published_ack < home.applied_sequence)
-    });
-    if needs_ack {
-        cx.update(|cx| publish_home(entity_id, cx));
-    }
-
+fn respond(request_id: Option<u64>, outcome: Result<Vec<u8>, String>) {
     if let Some(request_id) = request_id {
         wit::send_shared_response(&wit::SharedResponse {
             request_id,

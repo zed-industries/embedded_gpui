@@ -2,13 +2,13 @@
 //! the WIT imports, plus free-function wrappers. The object model itself lives in
 //! `registry` and is identical on both ends; this file only moves bytes.
 
-use crate::registry::{Objects, Side, WireEvent, WireMessage, WireOutgoing, WireResponse};
+use crate::registry::{Objects, WireEvent, WireMessage, WireOutgoing, WireResponse};
 use crate::wit;
 use embedded_gpui::{Methods, Remote, Shared, SharedRef, SharedSpec};
 use gpui::{App, AsyncApp, Entity};
 
 thread_local! {
-    static OBJECTS: Objects = Objects::new(Side::B, Box::new(deliver_outgoing));
+    static OBJECTS: Objects = Objects::new(Box::new(deliver_outgoing));
 }
 
 fn deliver_outgoing(outgoing: WireOutgoing) {
@@ -73,17 +73,18 @@ where
     objects().share_with(entity, register, cx)
 }
 
-/// Attach to the other end's root object (its id 0). Returns immediately; the other
-/// end installs its root before this code can run.
-pub fn remote_root<S: SharedSpec>(cx: &mut App) -> Remote<S> {
-    objects().remote_root(cx)
+/// Attach to the other end's root object: the single typed capability everything
+/// starts from. Returns immediately (root traffic queues until the other end's root is
+/// installed), so the whole bootstrap is synchronous.
+pub fn root<S: SharedSpec>() -> Remote<S> {
+    objects().root()
 }
 
 /// Attach to an entity through a capability reference received in a payload. Connecting
 /// the same ref twice returns a handle to the same projection; when the last clone
 /// drops, the home end is told to release the entity.
-pub fn connect<S: SharedSpec>(reference: SharedRef<S>, cx: &mut App) -> Remote<S> {
-    objects().connect(reference, cx)
+pub fn connect<S: SharedSpec>(reference: SharedRef<S>) -> Remote<S> {
+    objects().connect(reference)
 }
 
 /// Flush queued capability releases; called from the guest's pump so drops become

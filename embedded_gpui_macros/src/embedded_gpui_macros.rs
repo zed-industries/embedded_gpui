@@ -140,7 +140,31 @@ struct Method {
     field_names: Vec<Ident>,
     field_types: Vec<Type>,
     response: proc_macro2::TokenStream,
+    /// `Some(T)` when the response type is syntactically `SharedRef<T>`: the caller
+    /// then resolves with a connected `Remote<T>` instead of the bare ref.
+    ref_response: Option<Type>,
     is_async: bool,
+}
+
+/// Matches a response type of the shape `SharedRef<T>` (by any path), yielding `T`.
+fn shared_ref_inner(ty: &syn::Type) -> Option<Type> {
+    let syn::Type::Path(path) = ty else {
+        return None;
+    };
+    let segment = path.path.segments.last()?;
+    if segment.ident != "SharedRef" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+        return None;
+    };
+    if arguments.args.len() != 1 {
+        return None;
+    }
+    match arguments.args.first()? {
+        syn::GenericArgument::Type(inner) => Some(inner.clone()),
+        _ => None,
+    }
 }
 
 fn expand_interface(
@@ -202,9 +226,9 @@ fn expand_interface(
             field_names.push(pat.ident.clone());
             field_types.push((*arg.ty).clone());
         }
-        let response = match &sig.output {
-            syn::ReturnType::Default => quote!(()),
-            syn::ReturnType::Type(_, ty) => quote!(#ty),
+        let (response, ref_response) = match &sig.output {
+            syn::ReturnType::Default => (quote!(()), None),
+            syn::ReturnType::Type(_, ty) => (quote!(#ty), shared_ref_inner(ty)),
         };
         let method_name = sig.ident.to_string();
         methods.push(Method {
@@ -214,6 +238,7 @@ fn expand_interface(
             field_names,
             field_types,
             response,
+            ref_response,
             is_async,
         });
     }
@@ -274,6 +299,7 @@ fn expand_interface(
             field_names,
             field_types,
             response,
+            ref_response: _,
             is_async,
         } = method;
         let register_ident = format_ident!("register_{ident}");
@@ -358,14 +384,19 @@ fn expand_interface(
             field_names,
             field_types,
             response,
+            ref_response,
             ..
         } = method;
+        let receipt_of = match ref_response {
+            Some(inner) => quote!(embedded_gpui::Remote<#inner>),
+            None => quote!(#response),
+        };
         quote! {
             fn #ident(
                 &self,
                 #(#field_names: #field_types,)*
                 cx: &mut embedded_gpui::gpui::App,
-            ) -> embedded_gpui::Receipt<#response>;
+            ) -> embedded_gpui::Receipt<#receipt_of>;
         }
     });
     let caller_implementations = methods.iter().map(|method| {
@@ -375,16 +406,30 @@ fn expand_interface(
             field_names,
             field_types,
             response,
+            ref_response,
             ..
         } = method;
-        quote! {
-            fn #ident(
-                &self,
-                #(#field_names: #field_types,)*
-                cx: &mut embedded_gpui::gpui::App,
-            ) -> embedded_gpui::Receipt<#response> {
-                self.call(#message_ident { #(#field_names,)* }, cx)
-            }
+        match ref_response {
+            // A ref-returning method resolves with a live, connected Remote: object
+            // allocation across the boundary, handle in, handle out.
+            Some(inner) => quote! {
+                fn #ident(
+                    &self,
+                    #(#field_names: #field_types,)*
+                    cx: &mut embedded_gpui::gpui::App,
+                ) -> embedded_gpui::Receipt<embedded_gpui::Remote<#inner>> {
+                    self.call_connecting(#message_ident { #(#field_names,)* }, cx)
+                }
+            },
+            None => quote! {
+                fn #ident(
+                    &self,
+                    #(#field_names: #field_types,)*
+                    cx: &mut embedded_gpui::gpui::App,
+                ) -> embedded_gpui::Receipt<#response> {
+                    self.call(#message_ident { #(#field_names,)* }, cx)
+                }
+            },
         }
     });
 
@@ -396,7 +441,8 @@ fn expand_interface(
     let caller_doc = format!(
         "Typed calls to a shared `{spec_ident}` entity: implemented for \
          `Remote<{spec_ident}>`, one method per interface method, each returning a \
-         `Receipt`."
+         `Receipt`. Methods declared to return `SharedRef<T>` resolve with a connected \
+         `Remote<T>` instead: allocation over there, handle over here."
     );
 
     Ok(quote! {

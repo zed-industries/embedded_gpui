@@ -13,7 +13,7 @@
 //!   glue, display-list replay, and the byte transport for the registry;
 //! - the **guest platform** (wasm32 targets only): a GPUI `Platform` implementation over
 //!   the WIT protocol, plus [`Plugin`], [`register_plugin!`], and the guest-side
-//!   transport (`share`, `share_root`, `remote_root`, `connect`, and friends).
+//!   transport (`share`, `share_root`, `root`, `connect`, and friends).
 //!
 //! See `DESIGN.md` at the repository root for the architecture.
 
@@ -37,6 +37,7 @@ pub use guest::*;
 #[cfg(target_arch = "wasm32")]
 pub(crate) use guest::{dispatcher, platform, text_system, window, wit};
 
+use gpui::AppContext as _;
 use serde::{Serialize, de::DeserializeOwned};
 use std::marker::PhantomData;
 use std::rc::Rc;
@@ -225,7 +226,7 @@ fn missing_response<R>(_bytes: Vec<u8>) -> anyhow::Result<R> {
 ///   undecoded — the forwarding primitive a caretaker pipes straight through.
 pub struct Receipt<R = ()> {
     receiver: futures::channel::oneshot::Receiver<Result<Vec<u8>, String>>,
-    decode: fn(Vec<u8>) -> anyhow::Result<R>,
+    decode: Box<dyn Fn(Vec<u8>) -> anyhow::Result<R>>,
 }
 
 impl Receipt<Vec<u8>> {
@@ -236,16 +237,16 @@ impl Receipt<Vec<u8>> {
             sender,
             Self {
                 receiver,
-                decode: raw_response,
+                decode: Box::new(raw_response),
             },
         )
     }
 
     /// Decode the raw response as `R` when it arrives.
-    pub fn decoded<R: DeserializeOwned>(self) -> Receipt<R> {
+    pub fn decoded<R: DeserializeOwned + 'static>(self) -> Receipt<R> {
         Receipt {
             receiver: self.receiver,
-            decode: decode_response::<R>,
+            decode: Box::new(decode_response::<R>),
         }
     }
 
@@ -253,19 +254,37 @@ impl Receipt<Vec<u8>> {
     pub fn acknowledged(self) -> Receipt {
         Receipt {
             receiver: self.receiver,
-            decode: discard_response,
+            decode: Box::new(discard_response),
+        }
+    }
+
+    /// Decode the response as a [`SharedRef`] and connect it in `objects`, resolving
+    /// with a live [`Remote`]: the receipt behind every ref-returning schema method.
+    pub(crate) fn connected<S: SharedSpec>(
+        self,
+        objects: registry::WeakObjects,
+    ) -> Receipt<Remote<S>> {
+        Receipt {
+            receiver: self.receiver,
+            decode: Box::new(move |bytes| {
+                let reference: SharedRef<S> = decode(&bytes)?;
+                let objects = objects
+                    .upgrade()
+                    .ok_or_else(|| anyhow::anyhow!("the boundary was torn down"))?;
+                Ok(objects.connect(reference))
+            }),
         }
     }
 }
 
-impl<R> Receipt<R> {
+impl<R: 'static> Receipt<R> {
     /// A receipt that resolves with an error immediately; used when a message could not
     /// be encoded or dispatched at all.
     pub fn dropped() -> Self {
         let (_sender, receiver) = futures::channel::oneshot::channel();
         Self {
             receiver,
-            decode: missing_response::<R>,
+            decode: Box::new(missing_response::<R>),
         }
     }
 }
@@ -332,26 +351,27 @@ pub(crate) struct RawSharedEvent {
 
 impl gpui::EventEmitter<RawSharedEvent> for RemoteSignal {}
 
-/// How a [`Remote`] moves bytes toward its home: the host and the guest each supply
-/// their own closure, and everything above it is shared verbatim.
-pub(crate) type Transport = dyn Fn(&str, Vec<u8>, Option<ResponseSender>, &mut gpui::App);
-
 /// A typed handle to an entity homed on the other side of the boundary. The nearest
 /// thing to `Entity<T>` that can cross a sandbox wall:
 ///
 /// - **call methods** — [`Remote::send`] / [`Remote::call`], or the typed methods a
-///   schema's generated `...Caller` trait adds;
+///   schema's generated `...Caller` trait adds (methods returning refs resolve
+///   directly to connected `Remote`s);
 /// - **react to it** — [`Remote::observe`] mirrors the home's `cx.notify`,
 ///   [`Remote::subscribe`] its typed `cx.emit` events;
 /// - **refcounted** — clones share one guard; when the last clone of a ref-derived
 ///   remote drops, the home is told to let the entity go.
 ///
+/// A remote is its registry handle plus an object id: it holds its registry weakly, so
+/// it can outlive the boundary it came from (sends then resolve their receipts with
+/// errors).
+///
 /// Reads are calls: state lives at the home, and anything you want to look at is a
 /// method returning it (cache it locally with `embedded_gpui_util::Mirror` if you need
 /// synchronous reads for rendering).
 pub struct Remote<S: SharedSpec> {
-    signal: gpui::Entity<RemoteSignal>,
-    transport: Rc<Transport>,
+    objects: registry::WeakObjects,
+    entity_id: u64,
     _guard: Option<Rc<dyn std::any::Any>>,
     _spec: PhantomData<fn() -> S>,
 }
@@ -359,8 +379,8 @@ pub struct Remote<S: SharedSpec> {
 impl<S: SharedSpec> Clone for Remote<S> {
     fn clone(&self) -> Self {
         Self {
-            signal: self.signal.clone(),
-            transport: self.transport.clone(),
+            objects: self.objects.clone(),
+            entity_id: self.entity_id,
             _guard: self._guard.clone(),
             _spec: PhantomData,
         }
@@ -370,22 +390,41 @@ impl<S: SharedSpec> Clone for Remote<S> {
 impl<S: SharedSpec> Remote<S> {
     #[doc(hidden)]
     pub(crate) fn from_parts(
-        signal: gpui::Entity<RemoteSignal>,
-        transport: Rc<Transport>,
+        objects: registry::WeakObjects,
+        entity_id: u64,
         guard: Option<Rc<dyn std::any::Any>>,
     ) -> Self {
         Self {
-            signal,
-            transport,
+            objects,
+            entity_id,
             _guard: guard,
             _spec: PhantomData,
         }
     }
 
-    fn request(&self, method: &str, payload: Vec<u8>, cx: &mut gpui::App) -> Receipt<Vec<u8>> {
+    /// Mint the serializable capability reference for this entity, for embedding in
+    /// message or event payloads.
+    pub fn reference(&self) -> SharedRef<S> {
+        SharedRef::from_raw(self.entity_id)
+    }
+
+    fn request(&self, method: &str, payload: Vec<u8>, _cx: &mut gpui::App) -> Receipt<Vec<u8>> {
         let (sender, receipt) = Receipt::channel();
-        (self.transport)(method, payload, Some(sender), cx);
+        match self.objects.upgrade() {
+            // Dropping `sender` resolves the receipt with an error.
+            None => log::warn!("embedded_gpui: send after the boundary was torn down"),
+            Some(objects) => objects.send(self.entity_id, method, payload, Some(sender)),
+        }
         receipt
+    }
+
+    /// The signal this remote's events land on, created on first use; a detached,
+    /// never-firing stand-in if the boundary or projection is gone.
+    fn signal(&self, cx: &mut gpui::App) -> gpui::Entity<RemoteSignal> {
+        self.objects
+            .upgrade()
+            .and_then(|objects| objects.signal_for(self.entity_id, cx))
+            .unwrap_or_else(|| cx.new(|_| RemoteSignal::new()))
     }
 
     /// Send a typed message to the entity's home. Await the receipt to know it was
@@ -423,13 +462,37 @@ impl<S: SharedSpec> Remote<S> {
         }
     }
 
+    /// Call a typed method whose return value is a capability reference, resolving
+    /// with a live [`Remote`] already connected to it: object allocation across the
+    /// boundary, one call from handle to handle. The schema's generated caller uses
+    /// this for every `SharedRef`-returning method.
+    pub fn call_connecting<M, S2>(&self, message: M, cx: &mut gpui::App) -> Receipt<Remote<S2>>
+    where
+        M: SharedMessage<Spec = S, Response = SharedRef<S2>>,
+        S2: SharedSpec,
+    {
+        match encode(&message) {
+            Ok(payload) => self
+                .request(M::METHOD, payload, cx)
+                .connected(self.objects.clone()),
+            Err(error) => {
+                log::error!(
+                    "embedded_gpui: failed to encode {}::{}: {error:#}",
+                    S::TYPE_NAME,
+                    M::METHOD
+                );
+                Receipt::dropped()
+            }
+        }
+    }
+
     /// The dynamic escape hatch: send an arbitrary method and payload.
     pub fn send_raw(&self, method: &str, payload: Vec<u8>, cx: &mut gpui::App) -> Receipt {
         self.request(method, payload, cx).acknowledged()
     }
 
     /// The dynamic call escape hatch: call an arbitrary method and decode the response.
-    pub fn call_raw<R: DeserializeOwned>(
+    pub fn call_raw<R: DeserializeOwned + 'static>(
         &self,
         method: &str,
         payload: Vec<u8>,
@@ -452,7 +515,8 @@ impl<S: SharedSpec> Remote<S> {
         cx: &mut gpui::App,
         mut callback: impl FnMut(&mut gpui::App) + 'static,
     ) -> gpui::Subscription {
-        cx.observe(&self.signal, move |_, cx| callback(cx))
+        let signal = self.signal(cx);
+        cx.observe(&signal, move |_, cx| callback(cx))
     }
 
     /// React to a typed event the home emitted with `cx.emit`, exactly like
@@ -462,7 +526,8 @@ impl<S: SharedSpec> Remote<S> {
         cx: &mut gpui::App,
         mut callback: impl FnMut(&E, &mut gpui::App) + 'static,
     ) -> gpui::Subscription {
-        cx.subscribe(&self.signal, move |_, event: &RawSharedEvent, cx| {
+        let signal = self.signal(cx);
+        cx.subscribe(&signal, move |_, event: &RawSharedEvent, cx| {
             if event.name == E::EVENT {
                 match decode::<E>(&event.payload) {
                     Ok(event) => callback(&event, cx),
@@ -483,7 +548,8 @@ impl<S: SharedSpec> Remote<S> {
         cx: &mut gpui::App,
         mut callback: impl FnMut(&str, &[u8], &mut gpui::App) + 'static,
     ) -> gpui::Subscription {
-        cx.subscribe(&self.signal, move |_, event: &RawSharedEvent, cx| {
+        let signal = self.signal(cx);
+        cx.subscribe(&signal, move |_, event: &RawSharedEvent, cx| {
             callback(&event.name, &event.payload, cx)
         })
     }

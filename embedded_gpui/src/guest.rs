@@ -9,7 +9,7 @@ pub(crate) mod dispatcher;
 pub(crate) mod platform;
 mod shared;
 
-pub use shared::{connect, remote_root, share, share_root, share_with};
+pub use shared::{connect, root, share, share_root, share_with};
 pub(crate) mod text_system;
 pub(crate) mod window;
 
@@ -38,7 +38,7 @@ use std::rc::Rc;
 pub trait Plugin: 'static {
     /// Build the plugin's shared state. Runs once, when the host initializes the
     /// component. Construct your root object here and install it with [`share_root`]
-    /// before returning; reach the host's root with [`remote_root`].
+    /// before returning; reach the host's root with [`root`].
     fn new(cx: &mut App) -> Self
     where
         Self: Sized;

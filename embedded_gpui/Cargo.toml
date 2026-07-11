@@ -18,6 +18,9 @@ path = "src/embedded_gpui.rs"
 [dependencies]
 anyhow = "1.0"
 futures = "0.3"
+# Object ids are random u64s (see src/registry.rs); getrandom supports
+# wasm32-wasip2 natively via wasi:random.
+getrandom = "0.3"
 # gpui is consumed straight from the zed repository. The branch carries the one
 # accessor the guest runtime needs (Application::run_embedded); switch to main once
 # https://github.com/zed-industries/zed/tree/gpui-embedded-in-gpui merges.

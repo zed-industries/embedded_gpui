@@ -4,8 +4,8 @@
 
 use anyhow::anyhow;
 use embedded_gpui::{
-    Plugin, Remote, SharedRef, connect, decode, encode, register_plugin, remote_root, share,
-    share_root, share_with, shared,
+    Plugin, Remote, SharedRef, connect, decode, encode, register_plugin, root, share, share_root,
+    share_with, shared,
 };
 use embedded_gpui_util::Revocable;
 use gpui::{AnyView, App, Context, Entity, EventEmitter, Task, Window, div, prelude::*};
@@ -22,7 +22,7 @@ struct TestGuest {
 
 impl Plugin for TestGuest {
     fn new(cx: &mut App) -> Self {
-        let host = remote_root::<TestHost>(cx);
+        let host = root::<TestHost>();
         let root = cx.new(|_| Root {
             host,
             counter: None,
@@ -220,7 +220,7 @@ impl GatekeeperApi for Gatekeeper {
         // The membrane is the stock caretaker from embedded_gpui_util: every method
         // forwards to the wrapped vault capability, and revoking drops the inner remote
         // (auto-release cascades to the vault's home).
-        let vault = connect(vault, cx);
+        let vault = connect(vault);
         let revocable = Revocable::new(vault, cx);
         share_with(
             &revocable,
@@ -244,7 +244,7 @@ impl GatekeeperApi for Gatekeeper {
         payload: Vec<u8>,
         cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<Vec<u8>>> {
-        let remote = connect(target, cx);
+        let remote = connect(target);
         let receipt = remote.forward(&method, payload, cx);
         cx.spawn(async move |_, _| {
             let outcome = receipt.await;

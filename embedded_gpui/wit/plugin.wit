@@ -331,17 +331,18 @@ world plugin {
     // addressed only by id, and new objects are discovered as refs (bare ids) inside
     // message payloads.
     //
-    // Ids are u64 in one canonical namespace per connection: bit 63 says which end
-    // homes the object. This embedding assigns the embedder's objects the clear bit
-    // and the component's objects the set bit; that assignment is boundary
-    // configuration, invisible above the registry. Each end's *root* object is id 0
-    // in its own half (embedder root = 0, component root = bit 63), and the exchange
-    // of the two roots is the entire bootstrap: everything else is reached by calling
-    // root methods that return refs.
+    // Ids are random, nonzero u64s minted by whichever end homes the object, so a
+    // ref is universally applicable: nothing is namespaced per end, payloads stay
+    // opaque (a forwarder can pass bytes through verbatim and any refs inside keep
+    // meaning the same objects), and an id can only be *known*, never guessed or
+    // enumerated -- holding a ref is the authority to use it. Collisions are
+    // birthday-bounded and treated as nonexistent.
     //
-    // Ids stay canonical rather than perspective-relative so that payloads remain
-    // opaque: a forwarder (caretaker, membrane) can pass bytes through verbatim and
-    // any refs inside keep meaning the same objects.
+    // The single reserved value is 0, "your root": a connection-local *address*,
+    // never an identity in a payload. Each end installs one root object; a message
+    // addressed to id 0 goes to the receiving end's root, and the exchange of the
+    // two roots is the entire bootstrap -- everything else is reached by calling
+    // root methods that return refs.
     //
     // An entity has exactly one home end, which owns its state and dispatches messages
     // to it; the other end holds remotes that call methods on it and receive its
@@ -417,10 +418,10 @@ world plugin {
     // ------------------------------------------------------------------
 
     /// Initialize the plugin: construct the component-side GPUI app. The component is
-    /// expected to install its root object (its id 0) before returning, and may
-    /// immediately send messages to the embedder's root (id 0 on the other half of
-    /// the namespace) -- each end queues root-addressed traffic that arrives before
-    /// its own root is installed, so the two bootstraps may race freely.
+    /// expected to install its root object before returning, and may immediately send
+    /// messages to the embedder's root (address 0) -- each end queues root-addressed
+    /// traffic that arrives before its own root is installed, so the two bootstraps
+    /// may race freely.
     export init-plugin: func();
 
     /// Create a plugin view (a "GPUI plugin window" in the guest) with the given id and

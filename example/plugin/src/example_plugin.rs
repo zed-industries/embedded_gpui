@@ -2,13 +2,14 @@
 //! by the `embedded_gpui` host. The panel exercises text, SVGs, images, paths, and
 //! keyboard input. See `DESIGN.md`.
 //!
-//! The bootstrap is two root objects: this plugin installs its `DemoPlugin` root at its
-//! id 0 (`share_root`), and reaches the host through the host's `DemoHost` root
-//! (`remote_root`). Every capability in either direction is a method call from there.
+//! The bootstrap is two root objects: this plugin installs its `DemoPlugin` root at
+//! the reserved address 0 (`share_root`), and reaches the host through the host's
+//! `DemoHost` root (`root()`). Every capability in either direction is a method call
+//! from there; methods declared to return refs resolve directly with connected
+//! `Remote`s.
 
 use embedded_gpui::{
-    Plugin, Receipt, Remote, SharedRef, connect, register_plugin, remote_root, share, share_root,
-    shared,
+    Plugin, Receipt, Remote, SharedRef, register_plugin, root, share, share_root, shared,
 };
 use embedded_gpui_util::Mirror;
 use example_schema::{
@@ -51,10 +52,13 @@ struct ExamplePlugin {
 
 impl Plugin for ExamplePlugin {
     fn new(cx: &mut App) -> Self {
-        let host = remote_root::<DemoHost>(cx);
-        let root = cx.new(|_| PluginRoot::default());
-        share_root(&root, cx);
-        Self { host, root }
+        let host = root::<DemoHost>();
+        let plugin_root = cx.new(|_| PluginRoot::default());
+        share_root(&plugin_root, cx);
+        Self {
+            host,
+            root: plugin_root,
+        }
     }
 
     fn create_view(&mut self, name: &str, _window: &mut Window, cx: &mut App) -> AnyView {
@@ -205,15 +209,14 @@ impl ButtonView {
     fn new(host: Remote<DemoHost>, cx: &mut Context<Self>) -> Self {
         let receipt = host.counter(cx);
         cx.spawn(async move |this, cx| {
-            let reference = match receipt.await {
-                Ok(reference) => reference,
+            let counter = match receipt.await {
+                Ok(counter) => counter,
                 Err(error) => {
                     eprintln!("[example_plugin] counter discovery failed: {error:#}");
                     return;
                 }
             };
             this.update(cx, |view, cx| {
-                let counter = connect(reference, cx);
                 let clicks = Mirror::new(counter.clone(), Clicks {}, cx);
                 cx.observe(&clicks, |_, _, cx| cx.notify()).detach();
                 view.counter = Some(counter);
@@ -348,9 +351,8 @@ impl PanelView {
         let workspace_receipt = host.workspace(cx);
         cx.spawn(async move |this, cx| {
             match counter_receipt.await {
-                Ok(reference) => {
+                Ok(counter) => {
                     this.update(cx, |panel, cx| {
-                        let counter = connect(reference, cx);
                         let clicks = Mirror::new(counter.clone(), Clicks {}, cx);
                         cx.observe(&clicks, |_, _, cx| cx.notify()).detach();
                         // A typed event from the host home, exactly like a local
@@ -376,9 +378,9 @@ impl PanelView {
                 }
             }
             match workspace_receipt.await {
-                Ok(reference) => {
+                Ok(workspace) => {
                     this.update(cx, |panel, cx| {
-                        panel.workspace = Some(connect(reference, cx));
+                        panel.workspace = Some(workspace);
                         cx.notify();
                     })
                     .ok();

@@ -48,11 +48,13 @@ a later optimization.
 ## Object model follow-ups (from the root-object pass)
 
 - [ ] **Promise pipelining**: a ref returned by a method call round-trips before
-  you can call through it (the demo's views render a brief "connecting" state).
-  Cap'n-Proto-style promise ids — call through an unresolved ref, home-side
-  resolution table, FIFO behind the resolving call — would erase that latency.
-  The old name-based pending-send queues were this in miniature; the root pass
-  deleted them deliberately rather than keeping names alive for it.
+  you can call through it (the demo's views render a brief "connecting" state;
+  the receipts already resolve to connected `Remote`s, so only the latency is
+  left). Random ids open the cleanest design: *caller-allocated ids*, where the
+  calling end mints the id for the object a method will return and sends it in
+  the request — the returned `Remote` is usable immediately, sends FIFO behind
+  the allocating call, and no promise tables exist. Needs home-side binding of
+  the pre-minted id.
 - [ ] **Share dedup**: sharing the same entity twice mints two independent ids.
   Dedup wants a per-entity identity map (and interacts with release: both refs
   share one strong hold).
@@ -78,11 +80,9 @@ a later optimization.
   evicted; `FontId`s are host-global and session-scoped (a persisted display
   list from a previous session would replay wrong glyphs).
 - [ ] **Multi-plugin routing**: several stores behind one host. The registry is
-  already peer-to-peer (one side-blind module per connection end, namespaced by
-  one bit), so multi-plugin is "one registry pair per connection",
-  Cap'n-Proto-vat style: plugin-to-plugin traffic is either routed through the
-  host (a membrane, with id rewriting at each hop) or a fresh pairwise
-  connection. This is also the
+  already peer-to-peer, and random ids are globally unique, so the host can
+  route between plugins by looking up who homes an id — no rewriting at any
+  hop, Cap'n-Proto vats without the four tables. This is also the
   inter-plugin API story: plugins never share memory, only routed messages.
   Discovery is a host-homed registry entity - Wayland-style, a `list`
   call returns (plugin, interface, version, ref) - and being listed is opt-in, so

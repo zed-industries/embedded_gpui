@@ -10,7 +10,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::registry::{Objects, Side, WireEvent, WireMessage, WireOutgoing, WireResponse};
+use crate::registry::{Objects, WireEvent, WireMessage, WireOutgoing, WireResponse};
 use crate::{Methods, Remote, Shared, SharedRef, SharedSpec};
 use anyhow::{Context as _, Result};
 use futures::StreamExt as _;
@@ -556,37 +556,34 @@ impl PluginHost {
         });
 
         let sink = requests.clone();
-        let objects = Objects::new(
-            Side::A,
-            Box::new(move |outgoing| {
-                let request = match outgoing {
-                    WireOutgoing::Message(message) => {
-                        PluginRequest::DeliverSharedMessage(bindings::SharedMessage {
-                            entity_id: message.entity_id,
-                            request_id: message.request_id,
-                            method: message.method,
-                            payload: message.payload,
-                        })
-                    }
-                    WireOutgoing::Event(event) => {
-                        PluginRequest::DeliverSharedEvent(bindings::SharedEvent {
-                            entity_id: event.entity_id,
-                            name: event.name,
-                            payload: event.payload,
-                        })
-                    }
-                    WireOutgoing::Response(response) => {
-                        PluginRequest::DeliverSharedResponse(bindings::SharedResponse {
-                            request_id: response.request_id,
-                            outcome: response.outcome,
-                        })
-                    }
-                };
-                if sink.unbounded_send(request).is_err() {
-                    log::error!("embedded_gpui: plugin worker is gone; dropping message");
+        let objects = Objects::new(Box::new(move |outgoing| {
+            let request = match outgoing {
+                WireOutgoing::Message(message) => {
+                    PluginRequest::DeliverSharedMessage(bindings::SharedMessage {
+                        entity_id: message.entity_id,
+                        request_id: message.request_id,
+                        method: message.method,
+                        payload: message.payload,
+                    })
                 }
-            }),
-        );
+                WireOutgoing::Event(event) => {
+                    PluginRequest::DeliverSharedEvent(bindings::SharedEvent {
+                        entity_id: event.entity_id,
+                        name: event.name,
+                        payload: event.payload,
+                    })
+                }
+                WireOutgoing::Response(response) => {
+                    PluginRequest::DeliverSharedResponse(bindings::SharedResponse {
+                        request_id: response.request_id,
+                        outcome: response.outcome,
+                    })
+                }
+            };
+            if sink.unbounded_send(request).is_err() {
+                log::error!("embedded_gpui: plugin worker is gone; dropping message");
+            }
+        }));
 
         // Object traffic is applied straight to the registry, *outside* any update of
         // this entity: handlers run with the host entity un-borrowed, so user code in a
@@ -718,18 +715,20 @@ impl PluginHost {
         self.objects.share_with(entity, register, cx)
     }
 
-    /// Attach to the other end's root object (its id 0).
-    pub fn remote_root<S: SharedSpec>(&mut self, cx: &mut Context<Self>) -> Remote<S> {
-        self.objects.remote_root(cx)
+    /// Attach to the other end's root object: the single typed capability the plugin
+    /// starts everything from. Returns immediately (root traffic queues until the
+    /// other end's root is installed), so the whole bootstrap is synchronous.
+    pub fn root<S: SharedSpec>(&mut self, _cx: &mut Context<Self>) -> Remote<S> {
+        self.objects.root()
     }
 
     /// Attach to an entity through a capability reference received in a payload.
     pub fn connect<S: SharedSpec>(
         &mut self,
         reference: SharedRef<S>,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) -> Remote<S> {
-        self.objects.connect(reference, cx)
+        self.objects.connect(reference)
     }
 
     /// Flush deferred work (queued capability releases) and give the guest a turn.
@@ -896,8 +895,8 @@ pub trait PluginHostHandle {
         cx: &mut gpui::App,
     ) -> SharedRef<S>;
 
-    /// See [`PluginHost::remote_root`].
-    fn remote_root<S: SharedSpec>(&self, cx: &mut gpui::App) -> Remote<S>;
+    /// See [`PluginHost::root`].
+    fn root<S: SharedSpec>(&self, cx: &mut gpui::App) -> Remote<S>;
 
     /// See [`PluginHost::connect`].
     fn connect<S: SharedSpec>(&self, reference: SharedRef<S>, cx: &mut gpui::App) -> Remote<S>;
@@ -934,12 +933,12 @@ impl PluginHostHandle for Entity<PluginHost> {
             .share_with(entity, register, cx)
     }
 
-    fn remote_root<S: SharedSpec>(&self, cx: &mut gpui::App) -> Remote<S> {
-        self.read(cx).objects.clone().remote_root(cx)
+    fn root<S: SharedSpec>(&self, cx: &mut gpui::App) -> Remote<S> {
+        self.read(cx).objects.clone().root()
     }
 
     fn connect<S: SharedSpec>(&self, reference: SharedRef<S>, cx: &mut gpui::App) -> Remote<S> {
-        self.read(cx).objects.clone().connect(reference, cx)
+        self.read(cx).objects.clone().connect(reference)
     }
 
     fn view(&self, name: impl Into<String>, cx: &mut gpui::App) -> Entity<PluginViewState> {

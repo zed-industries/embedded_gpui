@@ -24,9 +24,11 @@ changes; nothing here is a supported API yet.
   `cx.notify`, `subscribe` for its `cx.emit` events, refcounted auto-release
   on drop, and capability references you can embed in payloads (`SharedRef`).
   The object model is symmetric and stringless: each end installs one **root
-  object** at its id 0 (`share_root`), reaches the other end's root with
-  `remote_root`, and discovers everything else as refs returned by method
-  calls — authority is reachability from your root.
+  object** at the reserved address 0 (`share_root`), attaches to the other
+  end's root with `root()`, and discovers everything else through method
+  calls — ref-returning methods resolve directly to connected `Remote`s, and
+  authority is reachability from your root. Object ids are random u64s, so a
+  ref can be known but never guessed.
 - **Typed interfaces**: one attribute on a trait (`#[shared_interface]`) makes
   one name the whole interface — `Remote<CounterApi>` for callers,
   `#[shared] impl CounterApi for MyEntity` for the implementation, both
@@ -44,12 +46,18 @@ changes; nothing here is a supported API yet.
 // Compile + instantiate on a background thread; the store never blocks your UI.
 let plugin = PluginHost::load(path, PluginOptions::new(text_system), cx);
 
-// Later: views by name, placed like any other element. Creation is lazy (the
+// The bootstrap: install your root, take theirs. Every capability either way
+// is a method call from here on.
+host.share_root(&my_root_entity, cx);
+let plugin = host.root::<DemoPlugin>(cx);
+let palette = plugin.palette(cx).await?; // a connected Remote<PaletteApi>
+
+// Views by name (for now), placed like any other element. Creation is lazy (the
 // guest sees the measured slot size), and layout changes become window resizes.
 div()
     .w(px(480.))
     .h(px(320.))
-    .child(plugin.view("panel", cx))
+    .child(host.view("panel", cx))
 ```
 
 The WASI sandbox grants nothing but stdout/stderr by default; every additional

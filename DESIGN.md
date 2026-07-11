@@ -174,20 +174,32 @@ types), so shared state is built on three rules:
 
 Identity is refs only. There are no names anywhere in the protocol: strings survive
 solely as schema method/event names (codegen vocabulary, like Wayland's interface
-names). Discovery starts from **one root object per end** — see "Bootstrap" below —
-and every other object is reached as a `SharedRef` returned by a method call.
-`SharedSpec::TYPE_NAME` survives purely as diagnostic metadata in error messages;
-nothing on the wire checks it.
+names). Object ids are random, nonzero u64s minted by the homing end — globally
+unique for practical purposes (collisions are birthday-bounded), so a ref is
+universally applicable: nothing is namespaced per end, and an id can only be
+*known*, never guessed or enumerated. Discovery starts from **one root object per
+end** — see "Bootstrap" below — and every other object is reached through a method
+call, resolving directly as a connected `Remote`. `SharedSpec::TYPE_NAME` survives
+purely as diagnostic metadata in error messages; nothing on the wire checks it.
 
 ### Bootstrap: one root object per end
 
-At boundary creation each end installs a single *root object* at its id 0
-(`share_root(&entity, cx)`), and reaches the other end's root with
-`remote_root::<S>(cx)`. That exchange is the entire bootstrap: the host calls the
-plugin root's methods for plugin features, the plugin calls the host root's methods
-for host features, and every method that returns a `SharedRef` extends the reachable
-world. Authority is reachability from your root — hand a plugin an `Attenuated` root
-and its whole world is attenuated; hand it a fake root and you have mocked the entire
+The one reserved id is 0, "your root": a connection-local *address* (never an
+identity in a payload) that each end answers with its own root object. At boundary
+creation each end installs its root (`share_root(&entity, cx)`) and attaches to the
+other end's with `root::<S>()` — synchronous, like taking a handle. That exchange is
+the entire bootstrap: the host calls the plugin root's methods for plugin features,
+the plugin calls the host root's methods for host features, and every ref-returning
+method extends the reachable world — its receipt resolves with a live, connected
+`Remote`, so discovery reads as allocation:
+
+```rust
+let plugin = host.root::<DemoPlugin>(cx);
+let palette = plugin.palette(cx).await?; // Remote<PaletteApi>, ready to call
+```
+
+Authority is reachability from your root — hand a plugin an `Attenuated` root and
+its whole world is attenuated; hand it a fake root and you have mocked the entire
 host for testing.
 
 The two bootstraps may race freely: messages addressed to a root that has not been
@@ -251,18 +263,19 @@ blesses one serialized state type per entity. State transfer is just a method ca
 ### Symmetry
 
 The object model is one side-blind module (`registry`), compiled identically into both
-ends. A registry knows exactly two things: *local* objects (homes it allocated ids
-for, its root at its 0) and *remote* objects (projections of the other end's homes).
-No API, type, or log line in it says host or guest; the ends differ only in the
-configuration the boundary hands them — a byte-transport sink and which half of the
-id namespace is theirs (bit 63, assigned by the embedding). The model is peer-to-peer;
-the wasm surface (scenes, input, ticks) is the only directional part, and it lives
-outside the object model entirely.
+ends. A registry knows exactly two things: *local* objects (homes, entities whose
+state lives here) and *remote* objects (projections of the other end's homes). No
+API, type, or log line in it says host or guest; the ends differ only in the single
+piece of configuration the boundary hands them — a byte-transport sink. Ids need no
+per-end namespace at all (they are random; "is this mine" is a map lookup), so the
+model is fully peer-to-peer; the wasm surface (scenes, input, ticks) is the only
+directional part, and it lives outside the object model entirely.
 
-Ids stay canonical per connection rather than perspective-relative so payloads remain
-opaque: a caretaker forwards bytes verbatim and any refs inside keep meaning the same
-objects. Both directions are exercised by the demo: a host-homed counter driven by
-wasm buttons, and plugin-homed text/palette entities mirrored natively.
+Because ids are global rather than perspective-relative, payloads stay opaque: a
+caretaker forwards bytes verbatim and any refs inside keep meaning the same objects,
+through any number of hands. Both directions are exercised by the demo: a host-homed
+counter driven by wasm buttons, and plugin-homed text/palette entities mirrored
+natively.
 
 ### References and capabilities (OCAP)
 
@@ -273,7 +286,11 @@ it likes, and the receiving end connects a remote to it (`connect`). The two roo
 the only refs that exist by convention; every other ref was minted by a method call.
 The demo's command palette works this way: the plugin publishes
 `[(label, SharedRef<CommandApi>)]`, the host renders native buttons for the labels,
-and clicking one invokes the ref. Holding a ref *is* the authority to use it.
+and clicking one invokes the ref. Holding a ref *is* the authority to use it — and
+because ids are random, that sentence is load-bearing: a ref can only be learned from
+a payload that carried it, so enumerating the other end's objects is infeasible.
+(This is bearer-secret authority, Waterken-style, not grant tracking; ids should be
+treated as secrets in logs.)
 
 Lifetimes are own-only, like `Entity<T>` itself: sharing holds the entity strongly in
 the registry until the other end's last remote drops, at which point a `$release`
@@ -341,7 +358,10 @@ extension trait implemented for `Remote<CounterApi>`, giving remotes typed
 ordinary methods of the entity and registers each one through schema-generated functions
 taking checked function pointers — a signature mismatch against the schema is a compile
 error — then implements `Shared`, which is what `share` and `share_root` need
-(and what makes the spec inferable at share sites: no turbofish).
+(and what makes the spec inferable at share sites: no turbofish). A method declared to
+return `SharedRef<T>` gets a caller that resolves with a connected `Remote<T>`
+instead of the bare ref — the home mints and returns the ref as data; the calling
+side's receipt connects it on arrival. Allocation over there, handle over here.
 
 Fully dynamic entities skip the schema: `share_with(&entity, |methods| ...)`
 registers handlers by name at runtime, including the `"*"` wildcard the wrappers use.

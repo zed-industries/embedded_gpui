@@ -1,9 +1,10 @@
 //! End-to-end tests for shared entities: a real wasm32-wasip2 plugin (see `test_plugin/`)
 //! loaded into a wasmtime store, driven from GPUI's deterministic test executor.
 //!
-//! The bootstrap is symmetric and stringless: each end installs a root object at its
-//! id 0 (`share_root`), and every capability below is obtained by calling methods on
-//! the other end's root (`remote_root` + `connect`).
+//! The bootstrap is symmetric and stringless: each end installs a root object at the
+//! reserved address 0 (`share_root`) and attaches to the other end's root with `root`.
+//! Every capability below is a method call on a remote: methods declared to return
+//! refs resolve directly with connected `Remote`s.
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -48,7 +49,7 @@ fn test_plugin_path() -> PathBuf {
     plugin_dir.join("target/wasm32-wasip2/debug/test_plugin.wasm")
 }
 
-/// The host's root object: what the plugin reaches through `remote_root`.
+/// The host's root object: what the plugin reaches through `root()`.
 struct HostRoot {
     pings: u32,
 }
@@ -93,16 +94,17 @@ fn settle(cx: &mut TestAppContext) {
     cx.executor().run_until_parked();
 }
 
-/// Call one of the plugin root's capability-returning methods and connect the result:
-/// the whole discovery story in one helper.
+/// Call one of the plugin root's capability-returning methods: the receipt resolves
+/// with a live, connected `Remote` — the whole discovery story in one await.
 macro_rules! from_root {
     ($fn_name:ident -> $spec:ty) => {
         async fn $fn_name(host: &Entity<PluginHost>, cx: &mut TestAppContext) -> Remote<$spec> {
-            let root = cx.update(|cx| host.remote_root::<TestPlugin>(cx));
+            let root = cx.update(|cx| host.root::<TestPlugin>(cx));
             let receipt = cx.update(|cx| root.$fn_name(cx));
             settle(cx);
-            let reference = receipt.await.expect(concat!(stringify!($fn_name), " ref"));
-            cx.update(|cx| host.connect(reference, cx))
+            receipt
+                .await
+                .expect(concat!(stringify!($fn_name), " remote"))
         }
     };
 }
@@ -117,7 +119,7 @@ async fn test_roots_bootstrap_both_directions(cx: &mut TestAppContext) {
     let host = setup(cx);
 
     // Host -> plugin: the plugin's root answers like any object.
-    let root = cx.update(|cx| host.remote_root::<TestPlugin>(cx));
+    let root = cx.update(|cx| host.root::<TestPlugin>(cx));
 
     // Plugin -> host, from inside a handler: the plugin holds a remote to the host's
     // root and calls it, so one receipt exercises both bootstraps.
@@ -128,7 +130,7 @@ async fn test_roots_bootstrap_both_directions(cx: &mut TestAppContext) {
 
 #[gpui::test]
 async fn test_bootstraps_may_race(cx: &mut TestAppContext) {
-    // Let the plugin fully boot — its `remote_root` has already subscribed to a host
+    // Let the plugin fully boot — its `root()` remote has already subscribed to a host
     // root that does not exist yet. That traffic queues instead of failing.
     let host = setup_without_root(cx);
     settle(cx);
@@ -140,7 +142,7 @@ async fn test_bootstraps_may_race(cx: &mut TestAppContext) {
         host.share_root(&root, cx);
     });
 
-    let plugin = cx.update(|cx| host.remote_root::<TestPlugin>(cx));
+    let plugin = cx.update(|cx| host.root::<TestPlugin>(cx));
     let receipt = cx.update(|cx| plugin.ping_host("late".to_string(), cx));
     settle(cx);
     assert_eq!(receipt.await.expect("ping_host"), "pong: late");
@@ -237,13 +239,11 @@ async fn test_shared_refs_build_object_graphs(cx: &mut TestAppContext) {
     let host = setup(cx);
     let factory = factory(&host, cx).await;
 
-    // A call whose response is a capability reference to a freshly shared child.
+    // A call whose response is declared as a ref: the receipt resolves with a live
+    // Remote to the freshly shared child — allocation over there, handle over here.
     let created = cx.update(|cx| factory.create("alpha".to_string(), cx));
     settle(cx);
-    let item_ref = created.await.expect("create should respond with a ref");
-
-    // Connect the ref: no names involved, the id addresses the entity directly.
-    let item = cx.update(|cx| host.connect(item_ref, cx));
+    let item = created.await.expect("create should respond with a remote");
     let bumped = cx.update(|cx| item.bump(cx));
     settle(cx);
     assert_eq!(bumped.await.expect("bump"), 1);
@@ -257,8 +257,8 @@ async fn test_shared_refs_build_object_graphs(cx: &mut TestAppContext) {
     // Distinct creations yield distinct capabilities.
     let created_again = cx.update(|cx| factory.create("beta".to_string(), cx));
     settle(cx);
-    let second_ref = created_again.await.expect("second create");
-    assert_ne!(second_ref.entity_id(), item_ref.entity_id());
+    let second = created_again.await.expect("second create");
+    assert_ne!(second.reference().entity_id(), item.reference().entity_id());
 }
 
 /// The host half of the membrane test: an entity whose secret is only reachable via a
@@ -296,12 +296,12 @@ async fn test_caretaker_membrane_forwards_and_revokes(cx: &mut TestAppContext) {
     let gatekeeper = gatekeeper(&host, cx).await;
     let guarded = cx.update(|cx| gatekeeper.guard(vault_ref, cx));
     settle(cx);
-    let guarded_ref = guarded.await.expect("guard should respond with a ref");
-    assert_ne!(guarded_ref.entity_id(), vault_ref.entity_id());
+    let guarded = guarded.await.expect("guard should respond with a remote");
+    assert_ne!(guarded.reference().entity_id(), vault_ref.entity_id());
 
-    // A read crosses the boundary four times: host -> caretaker (guest) -> vault (host),
-    // resolves in the vault's async handler, and unwinds back through the caretaker.
-    let guarded = cx.update(|cx| host.connect(guarded_ref, cx));
+    // A read crosses the boundary four times: host -> caretaker (plugin) -> vault
+    // (host), resolves in the vault's async handler, and unwinds back through the
+    // caretaker.
     let read = cx.update(|cx| guarded.read(cx));
     settle(cx);
     assert_eq!(read.await.expect("read through membrane"), "swordfish");
@@ -339,9 +339,9 @@ async fn test_dropping_last_remote_releases_the_capability(cx: &mut TestAppConte
 
     let created = cx.update(|cx| factory.create("ephemeral".to_string(), cx));
     settle(cx);
-    let item_ref = created.await.expect("create");
-
-    let item = cx.update(|cx| host.connect(item_ref, cx));
+    let item = created.await.expect("create");
+    // Keep the serializable ref around: it survives the remote it came from.
+    let item_ref = item.reference();
     let bumped = cx.update(|cx| item.bump(cx));
     settle(cx);
     assert_eq!(bumped.await.expect("bump while held"), 1);
@@ -377,18 +377,17 @@ async fn test_attenuation_is_a_library_pattern(cx: &mut TestAppContext) {
     let host = setup(cx);
     let factory = factory(&host, cx).await;
 
-    // Start from a FULL capability to a guest-homed item...
+    // Start from a FULL capability to a plugin-homed item...
     let created = cx.update(|cx| factory.create("gamma".to_string(), cx));
     settle(cx);
-    let full_ref = created.await.expect("create");
-    let full = cx.update(|cx| host.connect(full_ref, cx));
+    let full = created.await.expect("create");
 
     // ...and derive a weaker one in pure userland: wrap the remote in an Attenuated
     // with an empty allowlist, share the wrapper, and hand out ITS ref. No core
     // protocol support involved, and no cooperation from the item's author.
     let readonly = cx.update(|cx| Attenuated::new(full.clone(), &[], cx));
     let readonly_ref = cx.update(|cx| host.share(&readonly, cx));
-    assert_ne!(readonly_ref.entity_id(), full_ref.entity_id());
+    assert_ne!(readonly_ref.entity_id(), full.reference().entity_id());
 
     // The plugin probes a write through the attenuated ref: rejected by the wrapper,
     // without the item ever hearing about it.
@@ -437,8 +436,7 @@ async fn test_audited_wrapper_keeps_a_ledger(cx: &mut TestAppContext) {
 
     let created = cx.update(|cx| factory.create("ledgered".to_string(), cx));
     settle(cx);
-    let item_ref = created.await.expect("create");
-    let item = cx.update(|cx| host.connect(item_ref, cx));
+    let item = created.await.expect("create");
 
     // Wrap the capability in an Audited and hand the WRAPPER's ref to the plugin. The
     // ledger stays with us, the wrapper's owner; the plugin just sees a working item.

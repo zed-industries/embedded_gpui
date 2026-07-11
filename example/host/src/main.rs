@@ -1,9 +1,11 @@
 //! Demo host binary: opens a native GPUI window with two embedded plugin views driven by
 //! the `example_plugin` guest component.
 //!
-//! The bootstrap is two root objects: this host installs its `DemoHost` root at its
-//! id 0 (`share_root`), and reaches the plugin through the plugin's `DemoPlugin` root
-//! (`remote_root`). Every capability in either direction is a method call from there.
+//! The bootstrap is two root objects: this host installs its `DemoHost` root at the
+//! reserved address 0 (`share_root`), and reaches the plugin through the plugin's
+//! `DemoPlugin` root (`root()`). Every capability in either direction is a method call
+//! from there; methods declared to return refs resolve directly with connected
+//! `Remote`s.
 
 use std::path::{Path, PathBuf};
 
@@ -160,7 +162,7 @@ fn open_demo_window(host: gpui::Entity<PluginHost>, cx: &mut App) {
             // both reached through the plugin root's methods. Reads are calls, so
             // native rendering goes through local mirrors that refetch whenever the
             // plugin home notifies.
-            let plugin = host.remote_root::<DemoPlugin>(cx);
+            let plugin = host.root::<DemoPlugin>(cx);
             let typed_text_receipt = plugin.typed_text(cx);
             let palette_receipt = plugin.palette(cx);
             // Views by name; each fills whatever slot the host lays out for it.
@@ -169,41 +171,37 @@ fn open_demo_window(host: gpui::Entity<PluginHost>, cx: &mut App) {
             cx.new(|cx| {
                 cx.observe(&counter, |_, _, cx| cx.notify()).detach();
                 cx.observe(&workspace, |_, _, cx| cx.notify()).detach();
-                // Discovery is asynchronous: connect the mirrors when the refs arrive.
-                let discovery = cx.spawn({
-                    let host = host.clone();
-                    async move |this: gpui::WeakEntity<DemoView>, cx| {
-                        let typed_text = typed_text_receipt.await;
-                        let palette = palette_receipt.await;
-                        cx.update(|cx| {
-                            this.update(cx, |view: &mut DemoView, cx| {
-                                match typed_text {
-                                    Ok(reference) => {
-                                        let remote = host.connect(reference, cx);
-                                        let mirror = Mirror::new(remote, Text {}, cx);
-                                        cx.observe(&mirror, |_, _, cx| cx.notify()).detach();
-                                        view.typed_text = Some(mirror);
-                                    }
-                                    Err(error) => log::error!(
-                                        "embedded_gpui: typed_text discovery failed: {error:#}"
-                                    ),
+                // Discovery is asynchronous: the receipts resolve with connected
+                // remotes, and the mirrors attach when they arrive.
+                let discovery = cx.spawn(async move |this: gpui::WeakEntity<DemoView>, cx| {
+                    let typed_text = typed_text_receipt.await;
+                    let palette = palette_receipt.await;
+                    cx.update(|cx| {
+                        this.update(cx, |view: &mut DemoView, cx| {
+                            match typed_text {
+                                Ok(remote) => {
+                                    let mirror = Mirror::new(remote, Text {}, cx);
+                                    cx.observe(&mirror, |_, _, cx| cx.notify()).detach();
+                                    view.typed_text = Some(mirror);
                                 }
-                                match palette {
-                                    Ok(reference) => {
-                                        let remote = host.connect(reference, cx);
-                                        let mirror = Mirror::new(remote, Commands {}, cx);
-                                        cx.observe(&mirror, |_, _, cx| cx.notify()).detach();
-                                        view.palette = Some(mirror);
-                                    }
-                                    Err(error) => log::error!(
-                                        "embedded_gpui: palette discovery failed: {error:#}"
-                                    ),
+                                Err(error) => log::error!(
+                                    "embedded_gpui: typed_text discovery failed: {error:#}"
+                                ),
+                            }
+                            match palette {
+                                Ok(remote) => {
+                                    let mirror = Mirror::new(remote, Commands {}, cx);
+                                    cx.observe(&mirror, |_, _, cx| cx.notify()).detach();
+                                    view.palette = Some(mirror);
                                 }
-                                cx.notify();
-                            })
-                            .ok();
-                        });
-                    }
+                                Err(error) => log::error!(
+                                    "embedded_gpui: palette discovery failed: {error:#}"
+                                ),
+                            }
+                            cx.notify();
+                        })
+                        .ok();
+                    });
                 });
                 DemoView {
                     host,

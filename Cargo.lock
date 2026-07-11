@@ -1803,6 +1803,7 @@ dependencies = [
  "anyhow",
  "embedded_gpui_macros",
  "futures",
+ "getrandom 0.3.4",
  "gpui",
  "image",
  "log",

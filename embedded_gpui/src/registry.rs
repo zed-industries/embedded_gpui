@@ -9,9 +9,12 @@
 //! which half of the id namespace is theirs. Boundary creation assigns those; the object
 //! model never mentions them again.
 //!
-//! Ids are canonical per connection rather than perspective-relative (bit 63 marks which
-//! end homes the object) so that payloads stay opaque: a caretaker can forward bytes
-//! verbatim and any refs inside keep meaning the same objects.
+//! Ids are random u64s, globally unique for practical purposes, so a ref is universally
+//! applicable: payloads stay opaque (a caretaker can forward bytes verbatim and any refs
+//! inside keep meaning the same objects), nothing is namespaced per end, and an id can
+//! only be *known*, never guessed or enumerated — holding a ref is the authority. The
+//! single reserved value is 0, "your root": a connection-local address (never an
+//! identity in a payload) that each end answers with its own root object.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -21,40 +24,12 @@ use gpui::{AnyEntity, App, AppContext as _, Entity, Subscription};
 
 use crate::{
     HandlerResponse, MethodHandler, Methods, NOTIFY_EVENT, RELEASE_METHOD, RawSharedEvent, Remote,
-    RemoteSignal, ResponseSender, SUBSCRIBE_METHOD, Shared, SharedRef, SharedSpec, Transport,
-    encode,
+    RemoteSignal, ResponseSender, SUBSCRIBE_METHOD, Shared, SharedRef, SharedSpec, encode,
 };
 
-/// The id-namespace bit distinguishing the two ends of a connection. Which end gets it
-/// is boundary configuration: the wasm embedding assigns [`Side::A`] to the embedder and
-/// [`Side::B`] to the component.
-const SIDE_B_BIT: u64 = 1 << 63;
-
-/// One end of a connection, as assigned when the boundary is created. Purely an
-/// id-namespace choice; the two sides are otherwise identical. Each build constructs
-/// exactly one variant (the other end constructs the other), hence the dead-code allow.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[allow(dead_code)]
-pub(crate) enum Side {
-    A,
-    B,
-}
-
-impl Side {
-    fn local_bit(self) -> u64 {
-        match self {
-            Side::A => 0,
-            Side::B => SIDE_B_BIT,
-        }
-    }
-
-    fn remote_bit(self) -> u64 {
-        match self {
-            Side::A => SIDE_B_BIT,
-            Side::B => 0,
-        }
-    }
-}
+/// The reserved connection-local address meaning "the root object of whichever end you
+/// send it to". Never minted as an object id and never meaningful inside a payload.
+const ROOT_ADDRESS: u64 = 0;
 
 /// A message toward a home on the other end, in wire-neutral form. The boundary layer
 /// converts to its concrete wire types (wit-bindgen or wasmtime bindgen records).
@@ -106,8 +81,11 @@ struct Home {
 struct Projection {
     /// Interface name as first connected, for a diagnostic on mismatched reconnects.
     type_name: &'static str,
-    /// Where incoming events land; every `Remote` for this entity holds it.
-    signal: Entity<RemoteSignal>,
+    /// Where incoming events land. Created lazily by the first `observe`/`subscribe`
+    /// (which is what makes `connect` context-free); events arriving before anyone
+    /// listens are dropped, exactly as gpui drops events on entities with no
+    /// subscribers.
+    signal: Option<Entity<RemoteSignal>>,
     /// Live while some `Remote` still holds the projection; used to hand the same guard
     /// back when the same ref is connected twice.
     guard: Weak<ReleaseGuard>,
@@ -130,19 +108,17 @@ impl Drop for ReleaseGuard {
 
 #[derive(Default)]
 struct State {
-    next_local_id: u64,
     homes: HashMap<u64, Home>,
     projections: HashMap<u64, Projection>,
     next_request_id: u64,
     pending_responses: HashMap<u64, ResponseSender>,
     /// Messages addressed to this end's root before `share_root` ran. The other end's
-    /// bootstrap may lawfully race ours (its `remote_root` subscribes immediately), so
+    /// bootstrap may lawfully race ours (its `root()` remote subscribes immediately), so
     /// root traffic queues instead of failing; `share_root` drains it in order.
     pending_root_messages: Vec<WireMessage>,
 }
 
 struct Inner {
-    side: Side,
     sink: WireSink,
     /// Projections whose last `Remote` dropped; drained into `$release` sends.
     releases: Rc<RefCell<Vec<u64>>>,
@@ -157,15 +133,16 @@ pub(crate) struct Objects {
 }
 
 /// A non-owning handle for everything the registry itself stores (subscriptions, event
-/// sinks) or that user entities may hold indefinitely (transports): a strong capture
-/// there would cycle through `Inner` and keep every shared entity alive forever.
+/// sinks) or that user entities may hold indefinitely (every `Remote`): a strong
+/// capture there would cycle through `Inner` and keep every shared entity alive
+/// forever. Remotes outliving their boundary resolve receipts with errors.
 #[derive(Clone)]
-struct WeakObjects {
+pub(crate) struct WeakObjects {
     inner: Weak<Inner>,
 }
 
 impl WeakObjects {
-    fn upgrade(&self) -> Option<Objects> {
+    pub(crate) fn upgrade(&self) -> Option<Objects> {
         Some(Objects {
             inner: self.inner.upgrade()?,
         })
@@ -173,16 +150,15 @@ impl WeakObjects {
 }
 
 impl Objects {
-    fn downgrade(&self) -> WeakObjects {
+    pub(crate) fn downgrade(&self) -> WeakObjects {
         WeakObjects {
             inner: Rc::downgrade(&self.inner),
         }
     }
 
-    pub fn new(side: Side, sink: WireSink) -> Self {
+    pub fn new(sink: WireSink) -> Self {
         Self {
             inner: Rc::new(Inner {
-                side,
                 sink,
                 releases: Rc::default(),
                 state: RefCell::new(State::default()),
@@ -190,16 +166,8 @@ impl Objects {
         }
     }
 
-    fn local_root_id(&self) -> u64 {
-        self.inner.side.local_bit()
-    }
-
-    fn remote_root_id(&self) -> u64 {
-        self.inner.side.remote_bit()
-    }
-
     /// Install `entity` as this end's root object (its id 0). The other end reaches it
-    /// with `remote_root`; everything else it can reach is a method of this object
+    /// with `root()`; everything else it can reach is a method of this object
     /// returning refs. Root traffic that arrived first was queued and is delivered
     /// now, in order, so the two bootstraps may race freely.
     pub fn share_root<S, T>(&self, entity: &Entity<T>, cx: &mut App)
@@ -207,7 +175,7 @@ impl Objects {
         S: SharedSpec,
         T: Shared<S>,
     {
-        let entity_id = self.local_root_id();
+        let entity_id = ROOT_ADDRESS;
         if self.inner.state.borrow().homes.contains_key(&entity_id) {
             log::warn!("embedded_gpui: root object replaced");
         }
@@ -257,38 +225,36 @@ impl Objects {
         SharedRef::from_raw(entity_id)
     }
 
-    /// Attach to the other end's root object (its id 0). Returns immediately: the
-    /// remote's sends are ordered after this end's own bootstrap, so they arrive once
-    /// the other end has installed its root.
-    pub fn remote_root<S: SharedSpec>(&self, cx: &mut App) -> Remote<S> {
-        self.connect_id(self.remote_root_id(), cx)
+    /// Attach to the other end's root object (the reserved address 0 means "your root"
+    /// from either direction). Returns immediately; the other end queues root traffic
+    /// until its root is installed.
+    pub fn root<S: SharedSpec>(&self) -> Remote<S> {
+        self.connect_id(ROOT_ADDRESS)
     }
 
     /// Attach to an entity through a capability reference received in a payload.
     /// Connecting the same ref twice returns a handle to the same projection; when the
-    /// last clone drops, the home end is told to release the entity.
-    pub fn connect<S: SharedSpec>(&self, reference: SharedRef<S>, cx: &mut App) -> Remote<S> {
+    /// last clone drops, the home end is told to release the entity. Context-free:
+    /// connecting allocates nothing but a map entry.
+    pub fn connect<S: SharedSpec>(&self, reference: SharedRef<S>) -> Remote<S> {
         let entity_id = reference.entity_id();
-        if entity_id & SIDE_B_BIT == self.inner.side.local_bit() & SIDE_B_BIT {
+        if self.inner.state.borrow().homes.contains_key(&entity_id) {
             log::warn!(
                 "embedded_gpui: connecting a ref homed on this end (loopback) is not supported"
             );
         }
-        self.connect_id(entity_id, cx)
+        self.connect_id(entity_id)
     }
 
-    fn connect_id<S: SharedSpec>(&self, entity_id: u64, cx: &mut App) -> Remote<S> {
+    fn connect_id<S: SharedSpec>(&self, entity_id: u64) -> Remote<S> {
         let existing = {
             let state = self.inner.state.borrow();
-            state.projections.get(&entity_id).and_then(|projection| {
-                Some((
-                    projection.signal.clone(),
-                    projection.guard.upgrade()?,
-                    projection.type_name,
-                ))
-            })
+            state
+                .projections
+                .get(&entity_id)
+                .and_then(|projection| Some((projection.guard.upgrade()?, projection.type_name)))
         };
-        if let Some((signal, guard, type_name)) = existing {
+        if let Some((guard, type_name)) = existing {
             if type_name != S::TYPE_NAME {
                 log::error!(
                     "embedded_gpui: object {entity_id} connected as {} but already live as \
@@ -296,7 +262,7 @@ impl Objects {
                     S::TYPE_NAME
                 );
             }
-            return Remote::from_parts(signal, self.transport(entity_id), Some(guard));
+            return Remote::from_parts(self.downgrade(), entity_id, Some(guard));
         }
         // A projection whose guard died but whose release hasn't drained yet is stale;
         // releasing now and resubscribing below keeps the home end consistent.
@@ -313,7 +279,6 @@ impl Objects {
                 .retain(|pending| *pending != entity_id);
             self.release_id(entity_id);
         }
-        let signal = cx.new(|_| RemoteSignal::new());
         let guard = Rc::new(ReleaseGuard {
             entity_id,
             queue: self.inner.releases.clone(),
@@ -322,33 +287,39 @@ impl Objects {
             entity_id,
             Projection {
                 type_name: S::TYPE_NAME,
-                signal: signal.clone(),
+                signal: None,
                 guard: Rc::downgrade(&guard),
             },
         );
         self.send(entity_id, SUBSCRIBE_METHOD, Vec::new(), None);
-        Remote::from_parts(signal, self.transport(entity_id), Some(guard))
+        Remote::from_parts(self.downgrade(), entity_id, Some(guard))
     }
 
-    /// The transport handed to every `Remote`: bytes go straight to the sink, so sends
-    /// are safe from anywhere (they never re-enter the boundary entity). Holds the
-    /// registry weakly: remotes can outlive the boundary they came from, and a send
-    /// after teardown resolves the receipt with an error.
-    fn transport(&self, entity_id: u64) -> Rc<Transport> {
-        let objects = self.downgrade();
-        Rc::new(
-            move |method: &str, payload: Vec<u8>, response: Option<ResponseSender>, _cx| {
-                let Some(objects) = objects.upgrade() else {
-                    // Dropping `response` resolves the caller's receipt with an error.
-                    log::warn!("embedded_gpui: send after the boundary was torn down");
-                    return;
-                };
-                objects.send(entity_id, method, payload, response);
-            },
-        )
+    /// The signal a projection's events land on, created on first demand (from
+    /// `observe`/`subscribe`, which have a context). `None` if the projection is gone.
+    pub(crate) fn signal_for(&self, entity_id: u64, cx: &mut App) -> Option<Entity<RemoteSignal>> {
+        let existing = self
+            .inner
+            .state
+            .borrow()
+            .projections
+            .get(&entity_id)?
+            .signal
+            .clone();
+        if let Some(signal) = existing {
+            return Some(signal);
+        }
+        let signal = cx.new(|_| RemoteSignal::new());
+        self.inner
+            .state
+            .borrow_mut()
+            .projections
+            .get_mut(&entity_id)?
+            .signal = Some(signal.clone());
+        Some(signal)
     }
 
-    fn send(
+    pub(crate) fn send(
         &self,
         entity_id: u64,
         method: &str,
@@ -378,10 +349,26 @@ impl Objects {
         (self.inner.sink)(WireOutgoing::Message(message));
     }
 
+    /// Mint a fresh object id: random, nonzero, and unused here. Randomness is what
+    /// makes refs universally applicable (no per-end namespaces, so they pass through
+    /// any number of hands unrewritten) and unguessable (an id can only be learned
+    /// from a payload that carried it; enumeration is infeasible). Collisions with ids
+    /// minted by the other end are birthday-bounded at ~2^-64 per pair; the loopback
+    /// check in `connect` doubles as the tripwire.
     fn reserve_local_id(&self) -> u64 {
-        let mut state = self.inner.state.borrow_mut();
-        state.next_local_id += 1;
-        self.inner.side.local_bit() | state.next_local_id
+        let state = self.inner.state.borrow();
+        loop {
+            let mut bytes = [0u8; 8];
+            getrandom::fill(&mut bytes).expect("system entropy is unavailable");
+            let id = u64::from_le_bytes(bytes);
+            if id != ROOT_ADDRESS
+                && !state.homes.contains_key(&id)
+                && !state.projections.contains_key(&id)
+            {
+                return id;
+            }
+            log::error!("embedded_gpui: object id collision on mint; regenerating");
+        }
     }
 
     /// The sink handed to schema-generated event wiring: it moves a home's typed events
@@ -455,7 +442,7 @@ impl Objects {
         let dispatch = {
             let mut state = self.inner.state.borrow_mut();
             let Some(home) = state.homes.get_mut(&message.entity_id) else {
-                if message.entity_id == self.local_root_id() {
+                if message.entity_id == ROOT_ADDRESS {
                     // The other end's bootstrap outran ours; deliver once our root
                     // arrives.
                     state.pending_root_messages.push(message);
@@ -543,19 +530,21 @@ impl Objects {
     pub fn deliver_event(&self, event: WireEvent, cx: &mut App) {
         // Clone the signal out so the registry borrow is released before user code
         // (observers and subscribers) runs; observers may re-enter this module via sends.
-        let signal = self
-            .inner
-            .state
-            .borrow()
-            .projections
-            .get(&event.entity_id)
-            .map(|projection| projection.signal.clone());
-        let Some(signal) = signal else {
-            log::warn!(
-                "embedded_gpui: event for unknown object {}",
-                event.entity_id
-            );
-            return;
+        let signal = {
+            let state = self.inner.state.borrow();
+            let Some(projection) = state.projections.get(&event.entity_id) else {
+                log::warn!(
+                    "embedded_gpui: event for unknown object {}",
+                    event.entity_id
+                );
+                return;
+            };
+            // No signal means nobody has observed or subscribed yet; dropping the
+            // event matches gpui's behavior for entities with no subscribers.
+            let Some(signal) = projection.signal.clone() else {
+                return;
+            };
+            signal
         };
         if event.name == NOTIFY_EVENT {
             signal.update(cx, |_, cx| cx.notify());

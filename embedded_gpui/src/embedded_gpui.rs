@@ -3,7 +3,7 @@
 //! One crate serves both sides of the boundary:
 //!
 //! - the **object layer** (this file, always compiled): [`Remote`], [`Receipt`],
-//!   [`SharedRef`], specs/messages/events, and the [`Shared`] home trait — the typed
+//!   [`Ref`], specs/messages/events, and the [`Shared`] home trait — the typed
 //!   veneer over the dynamic wire, where everything is
 //!   `(entity_id, method: string, payload: bytes)`;
 //! - the **object registry** (`registry`, always compiled): one side-blind
@@ -258,7 +258,7 @@ impl Receipt<Vec<u8>> {
         }
     }
 
-    /// Decode the response as a [`SharedRef`] and connect it in `objects`, resolving
+    /// Decode the response as a [`Ref`] and connect it in `objects`, resolving
     /// with a live [`Remote`]: the receipt behind every ref-returning schema method.
     pub(crate) fn connected<S: SharedSpec>(
         self,
@@ -267,7 +267,7 @@ impl Receipt<Vec<u8>> {
         Receipt {
             receiver: self.receiver,
             decode: Box::new(move |bytes| {
-                let reference: SharedRef<S> = decode(&bytes)?;
+                let reference: Ref<S> = decode(&bytes)?;
                 let objects = objects
                     .upgrade()
                     .ok_or_else(|| anyhow::anyhow!("the boundary was torn down"))?;
@@ -404,8 +404,8 @@ impl<S: SharedSpec> Remote<S> {
 
     /// Mint the serializable capability reference for this entity, for embedding in
     /// message or event payloads.
-    pub fn reference(&self) -> SharedRef<S> {
-        SharedRef::from_raw(self.entity_id)
+    pub fn reference(&self) -> Ref<S> {
+        Ref::from_raw(self.entity_id)
     }
 
     fn request(&self, method: &str, payload: Vec<u8>, _cx: &mut gpui::App) -> Receipt<Vec<u8>> {
@@ -465,10 +465,10 @@ impl<S: SharedSpec> Remote<S> {
     /// Call a typed method whose return value is a capability reference, resolving
     /// with a live [`Remote`] already connected to it: object allocation across the
     /// boundary, one call from handle to handle. The schema's generated caller uses
-    /// this for every `SharedRef`-returning method.
+    /// this for every `Ref`-returning method.
     pub fn call_connecting<M, S2>(&self, message: M, cx: &mut gpui::App) -> Receipt<Remote<S2>>
     where
-        M: SharedMessage<Spec = S, Response = SharedRef<S2>>,
+        M: SharedMessage<Spec = S, Response = Ref<S2>>,
         S2: SharedSpec,
     {
         match encode(&message) {
@@ -555,19 +555,21 @@ impl<S: SharedSpec> Remote<S> {
     }
 }
 
-/// A serializable capability reference to a shared entity of kind `S`.
+/// A serializable capability reference to a shared entity of kind `S`: how objects
+/// travel. An entity lives on one end; a [`Remote`] is how the other end holds it; a
+/// `Ref` is how it moves through payloads (including call responses and events).
 ///
-/// On the wire this is nothing but the entity id — refs travel *inside* message payloads
-/// (including call responses) and event payloads, so object graphs never need the name
-/// namespace: names are mounts, refs are pointers. Possession of a ref is the authority
-/// to send to it; sharing the same entity twice with different method tables mints
-/// attenuated capabilities. Turn a ref back into a live handle with `connect`.
-pub struct SharedRef<S: SharedSpec> {
+/// On the wire this is nothing but the entity id — random, so possession is the
+/// authority: a ref can be known but never guessed. Sharing the same entity twice with
+/// different method tables mints attenuated capabilities. Turn a ref back into a live
+/// handle with `connect` (schema methods declared to return a `Ref` do this on arrival,
+/// resolving with a connected `Remote`).
+pub struct Ref<S: SharedSpec> {
     entity_id: u64,
     _spec: PhantomData<fn() -> S>,
 }
 
-impl<S: SharedSpec> SharedRef<S> {
+impl<S: SharedSpec> Ref<S> {
     #[doc(hidden)]
     pub fn from_raw(entity_id: u64) -> Self {
         Self {
@@ -581,35 +583,35 @@ impl<S: SharedSpec> SharedRef<S> {
     }
 }
 
-impl<S: SharedSpec> Clone for SharedRef<S> {
+impl<S: SharedSpec> Clone for Ref<S> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<S: SharedSpec> Copy for SharedRef<S> {}
+impl<S: SharedSpec> Copy for Ref<S> {}
 
-impl<S: SharedSpec> std::fmt::Debug for SharedRef<S> {
+impl<S: SharedSpec> std::fmt::Debug for Ref<S> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "SharedRef<{}>({})", S::TYPE_NAME, self.entity_id)
+        write!(formatter, "Ref<{}>({})", S::TYPE_NAME, self.entity_id)
     }
 }
 
-impl<S: SharedSpec> PartialEq for SharedRef<S> {
+impl<S: SharedSpec> PartialEq for Ref<S> {
     fn eq(&self, other: &Self) -> bool {
         self.entity_id == other.entity_id
     }
 }
 
-impl<S: SharedSpec> Eq for SharedRef<S> {}
+impl<S: SharedSpec> Eq for Ref<S> {}
 
-impl<S: SharedSpec> Serialize for SharedRef<S> {
+impl<S: SharedSpec> Serialize for Ref<S> {
     fn serialize<Ser: serde::Serializer>(&self, serializer: Ser) -> Result<Ser::Ok, Ser::Error> {
         serializer.serialize_u64(self.entity_id)
     }
 }
 
-impl<'de, S: SharedSpec> serde::Deserialize<'de> for SharedRef<S> {
+impl<'de, S: SharedSpec> serde::Deserialize<'de> for Ref<S> {
     fn deserialize<De: serde::Deserializer<'de>>(deserializer: De) -> Result<Self, De::Error> {
         Ok(Self::from_raw(u64::deserialize(deserializer)?))
     }

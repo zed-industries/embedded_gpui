@@ -4,16 +4,16 @@
 //! id 0, and every other capability below is reached by calling root methods that
 //! return refs.
 
-use embedded_gpui::{SharedRef, shared_data, shared_interface};
+use embedded_gpui::{Ref, shared_data, shared_interface};
 
 /// The plugin's root object: the host's entire view of the plugin. The methods create
 /// their entities lazily on first call and return the same ref thereafter.
 #[shared_interface]
 pub trait TestPlugin {
-    fn counter(&mut self, cx: &mut gpui::Context<Self>) -> SharedRef<TestCounterApi>;
-    fn factory(&mut self, cx: &mut gpui::Context<Self>) -> SharedRef<FactoryApi>;
-    fn gatekeeper(&mut self, cx: &mut gpui::Context<Self>) -> SharedRef<GatekeeperApi>;
-    fn chameleon(&mut self, cx: &mut gpui::Context<Self>) -> SharedRef<ChameleonApi>;
+    fn counter(&mut self, cx: &mut gpui::Context<Self>) -> Ref<TestCounterApi>;
+    fn factory(&mut self, cx: &mut gpui::Context<Self>) -> Ref<FactoryApi>;
+    fn gatekeeper(&mut self, cx: &mut gpui::Context<Self>) -> Ref<GatekeeperApi>;
+    fn chameleon(&mut self, cx: &mut gpui::Context<Self>) -> Ref<ChameleonApi>;
 
     /// Calls `ping` on the host's root and relays the reply: the bootstrap exercised
     /// in the other direction, from inside a handler.
@@ -54,7 +54,7 @@ pub struct ItemInfo {
 
 #[shared_interface]
 pub trait FactoryApi {
-    fn create(&mut self, label: String, cx: &mut gpui::Context<Self>) -> SharedRef<ItemApi>;
+    fn create(&mut self, label: String, cx: &mut gpui::Context<Self>) -> Ref<ItemApi>;
 }
 
 /// Declared with an `async fn`: the home implements it as a method returning a
@@ -68,17 +68,13 @@ pub trait VaultApi {
 pub trait GatekeeperApi {
     /// Wrap the given vault capability in a guest-side caretaker and return a ref to
     /// *that*; the caller can't tell the difference.
-    fn guard(
-        &mut self,
-        vault: SharedRef<VaultApi>,
-        cx: &mut gpui::Context<Self>,
-    ) -> SharedRef<VaultApi>;
+    fn guard(&mut self, vault: Ref<VaultApi>, cx: &mut gpui::Context<Self>) -> Ref<VaultApi>;
 
     /// Call an arbitrary method on an arbitrary item capability from the guest side, so
     /// tests can verify what a ref does and does not permit from across the boundary.
     async fn probe(
         &mut self,
-        target: SharedRef<ItemApi>,
+        target: Ref<ItemApi>,
         method: String,
         payload: Vec<u8>,
         cx: &mut gpui::Context<Self>,

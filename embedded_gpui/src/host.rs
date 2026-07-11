@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::registry::{Objects, WireEvent, WireMessage, WireOutgoing, WireResponse};
-use crate::{Methods, Remote, Shared, SharedRef, SharedSpec};
+use crate::{Methods, Ref, Remote, Shared, SharedSpec};
 use anyhow::{Context as _, Result};
 use futures::StreamExt as _;
 use futures::channel::mpsc;
@@ -691,7 +691,7 @@ impl PluginHost {
     /// Share a local entity, returning a capability reference to embed in message or
     /// event payloads. The registry holds the entity alive until the other end's last
     /// remote drops.
-    pub fn share<S, T>(&mut self, entity: &Entity<T>, cx: &mut Context<Self>) -> SharedRef<S>
+    pub fn share<S, T>(&mut self, entity: &Entity<T>, cx: &mut Context<Self>) -> Ref<S>
     where
         S: SharedSpec,
         T: Shared<S>,
@@ -707,7 +707,7 @@ impl PluginHost {
         entity: &Entity<T>,
         register: impl FnOnce(&mut Methods<S, T>),
         cx: &mut Context<Self>,
-    ) -> SharedRef<S>
+    ) -> Ref<S>
     where
         S: SharedSpec,
         T: 'static,
@@ -725,7 +725,7 @@ impl PluginHost {
     /// Attach to an entity through a capability reference received in a payload.
     pub fn connect<S: SharedSpec>(
         &mut self,
-        reference: SharedRef<S>,
+        reference: Ref<S>,
         _cx: &mut Context<Self>,
     ) -> Remote<S> {
         self.objects.connect(reference)
@@ -881,11 +881,7 @@ pub trait PluginHostHandle {
     fn share_root<S: SharedSpec, T: Shared<S>>(&self, entity: &Entity<T>, cx: &mut gpui::App);
 
     /// See [`PluginHost::share`].
-    fn share<S: SharedSpec, T: Shared<S>>(
-        &self,
-        entity: &Entity<T>,
-        cx: &mut gpui::App,
-    ) -> SharedRef<S>;
+    fn share<S: SharedSpec, T: Shared<S>>(&self, entity: &Entity<T>, cx: &mut gpui::App) -> Ref<S>;
 
     /// See [`PluginHost::share_with`].
     fn share_with<S: SharedSpec, T: 'static>(
@@ -893,13 +889,13 @@ pub trait PluginHostHandle {
         entity: &Entity<T>,
         register: impl FnOnce(&mut Methods<S, T>),
         cx: &mut gpui::App,
-    ) -> SharedRef<S>;
+    ) -> Ref<S>;
 
     /// See [`PluginHost::root`].
     fn root<S: SharedSpec>(&self, cx: &mut gpui::App) -> Remote<S>;
 
     /// See [`PluginHost::connect`].
-    fn connect<S: SharedSpec>(&self, reference: SharedRef<S>, cx: &mut gpui::App) -> Remote<S>;
+    fn connect<S: SharedSpec>(&self, reference: Ref<S>, cx: &mut gpui::App) -> Remote<S>;
 
     /// See [`PluginHost::view`].
     fn view(&self, name: impl Into<String>, cx: &mut gpui::App) -> Entity<PluginViewState>;
@@ -913,11 +909,7 @@ impl PluginHostHandle for Entity<PluginHost> {
         self.read(cx).objects.clone().share_root(entity, cx);
     }
 
-    fn share<S: SharedSpec, T: Shared<S>>(
-        &self,
-        entity: &Entity<T>,
-        cx: &mut gpui::App,
-    ) -> SharedRef<S> {
+    fn share<S: SharedSpec, T: Shared<S>>(&self, entity: &Entity<T>, cx: &mut gpui::App) -> Ref<S> {
         self.read(cx).objects.clone().share(entity, cx)
     }
 
@@ -926,7 +918,7 @@ impl PluginHostHandle for Entity<PluginHost> {
         entity: &Entity<T>,
         register: impl FnOnce(&mut Methods<S, T>),
         cx: &mut gpui::App,
-    ) -> SharedRef<S> {
+    ) -> Ref<S> {
         self.read(cx)
             .objects
             .clone()
@@ -937,7 +929,7 @@ impl PluginHostHandle for Entity<PluginHost> {
         self.read(cx).objects.clone().root()
     }
 
-    fn connect<S: SharedSpec>(&self, reference: SharedRef<S>, cx: &mut gpui::App) -> Remote<S> {
+    fn connect<S: SharedSpec>(&self, reference: Ref<S>, cx: &mut gpui::App) -> Remote<S> {
         self.read(cx).objects.clone().connect(reference)
     }
 

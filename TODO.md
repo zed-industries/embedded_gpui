@@ -18,7 +18,7 @@ element tree.
   returning a renderable ref — the roots exist now, so this is the last string
   identifier in the protocol; no view names, no view ids.
 - Inline surfaces are anonymous renderable refs traveling in payloads:
-  `Vec<(BufferRow, SharedRef<InlayWidget>)>`, connected and mounted by the
+  `Vec<(BufferRow, Ref<InlayWidget>)>`, connected and mounted by the
   host wherever its own layout puts them.
 - Input flows backward along the same identity: mouse/key messages addressed to
   the entity, not a view id. Each mount drives resize like a window, as today.
@@ -96,7 +96,7 @@ a later optimization.
 
 ## Advanced OCAPs
 
-- [ ] **Tagged refs on the wire**: `SharedRef` crosses as a bare u64 inside
+- [ ] **Tagged refs on the wire**: `Ref` crosses as a bare u64 inside
   opaque payloads, so nothing can find refs in transit. Making refs a
   distinguished wire type enables everything below, plus host-side capability
   accounting (knowing exactly which refs each plugin holds).

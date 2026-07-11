@@ -4,7 +4,7 @@
 
 use anyhow::anyhow;
 use embedded_gpui::{
-    Plugin, Remote, SharedRef, connect, decode, encode, register_plugin, root, share, share_root,
+    Plugin, Ref, Remote, connect, decode, encode, register_plugin, root, share, share_root,
     share_with, shared,
 };
 use embedded_gpui_util::Revocable;
@@ -46,15 +46,15 @@ register_plugin!(TestGuest);
 /// release (last remote dropped on the other end) does not invalidate the cached ref.
 struct Root {
     host: Remote<TestHost>,
-    counter: Option<(Entity<Counter>, SharedRef<TestCounterApi>)>,
-    factory: Option<(Entity<Factory>, SharedRef<FactoryApi>)>,
-    gatekeeper: Option<(Entity<Gatekeeper>, SharedRef<GatekeeperApi>)>,
-    chameleon: Option<(Entity<Chameleon>, SharedRef<ChameleonApi>)>,
+    counter: Option<(Entity<Counter>, Ref<TestCounterApi>)>,
+    factory: Option<(Entity<Factory>, Ref<FactoryApi>)>,
+    gatekeeper: Option<(Entity<Gatekeeper>, Ref<GatekeeperApi>)>,
+    chameleon: Option<(Entity<Chameleon>, Ref<ChameleonApi>)>,
 }
 
 #[shared]
 impl TestPlugin for Root {
-    fn counter(&mut self, cx: &mut Context<Self>) -> SharedRef<TestCounterApi> {
+    fn counter(&mut self, cx: &mut Context<Self>) -> Ref<TestCounterApi> {
         if let Some((_, reference)) = &self.counter {
             return *reference;
         }
@@ -64,7 +64,7 @@ impl TestPlugin for Root {
         reference
     }
 
-    fn factory(&mut self, cx: &mut Context<Self>) -> SharedRef<FactoryApi> {
+    fn factory(&mut self, cx: &mut Context<Self>) -> Ref<FactoryApi> {
         if let Some((_, reference)) = &self.factory {
             return *reference;
         }
@@ -74,7 +74,7 @@ impl TestPlugin for Root {
         reference
     }
 
-    fn gatekeeper(&mut self, cx: &mut Context<Self>) -> SharedRef<GatekeeperApi> {
+    fn gatekeeper(&mut self, cx: &mut Context<Self>) -> Ref<GatekeeperApi> {
         if let Some((_, reference)) = &self.gatekeeper {
             return *reference;
         }
@@ -84,7 +84,7 @@ impl TestPlugin for Root {
         reference
     }
 
-    fn chameleon(&mut self, cx: &mut Context<Self>) -> SharedRef<ChameleonApi> {
+    fn chameleon(&mut self, cx: &mut Context<Self>) -> Ref<ChameleonApi> {
         if let Some((_, reference)) = &self.chameleon {
             return *reference;
         }
@@ -200,7 +200,7 @@ struct Factory {
 
 #[shared]
 impl FactoryApi for Factory {
-    fn create(&mut self, label: String, cx: &mut Context<Self>) -> SharedRef<ItemApi> {
+    fn create(&mut self, label: String, cx: &mut Context<Self>) -> Ref<ItemApi> {
         self.created += 1;
         cx.notify();
         let item: Entity<Item> = cx.new(|_| Item { label, bumps: 0 });
@@ -214,7 +214,7 @@ struct Gatekeeper {
 
 #[shared]
 impl GatekeeperApi for Gatekeeper {
-    fn guard(&mut self, vault: SharedRef<VaultApi>, cx: &mut Context<Self>) -> SharedRef<VaultApi> {
+    fn guard(&mut self, vault: Ref<VaultApi>, cx: &mut Context<Self>) -> Ref<VaultApi> {
         self.guarded += 1;
         cx.notify();
         // The membrane is the stock caretaker from embedded_gpui_util: every method
@@ -239,7 +239,7 @@ impl GatekeeperApi for Gatekeeper {
 
     fn probe(
         &mut self,
-        target: SharedRef<ItemApi>,
+        target: Ref<ItemApi>,
         method: String,
         payload: Vec<u8>,
         cx: &mut Context<Self>,

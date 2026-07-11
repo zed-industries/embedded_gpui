@@ -9,7 +9,7 @@
 //! `Remote`s.
 
 use embedded_gpui::{
-    Plugin, Receipt, Remote, SharedRef, register_plugin, root, share, share_root, shared,
+    Plugin, Receipt, Ref, Remote, register_plugin, root, share, share_root, shared,
 };
 use embedded_gpui_util::Mirror;
 use example_schema::{
@@ -91,9 +91,9 @@ register_plugin!(ExamplePlugin);
 #[derive(Default)]
 struct PluginRoot {
     input_line: Option<Entity<InputLine>>,
-    input_line_ref: Option<SharedRef<TextApi>>,
+    input_line_ref: Option<Ref<TextApi>>,
     wave: Option<Entity<Wave>>,
-    palette: Option<(Entity<Palette>, SharedRef<PaletteApi>)>,
+    palette: Option<(Entity<Palette>, Ref<PaletteApi>)>,
     /// The root owns the command entities whose refs travel in the palette.
     commands: Vec<Entity<WaveCommand>>,
 }
@@ -123,7 +123,7 @@ impl PluginRoot {
 
 #[shared]
 impl DemoPlugin for PluginRoot {
-    fn typed_text(&mut self, cx: &mut Context<Self>) -> SharedRef<TextApi> {
+    fn typed_text(&mut self, cx: &mut Context<Self>) -> Ref<TextApi> {
         if let Some(reference) = self.input_line_ref {
             return reference;
         }
@@ -133,7 +133,7 @@ impl DemoPlugin for PluginRoot {
         reference
     }
 
-    fn palette(&mut self, cx: &mut Context<Self>) -> SharedRef<PaletteApi> {
+    fn palette(&mut self, cx: &mut Context<Self>) -> Ref<PaletteApi> {
         if let Some((_, reference)) = &self.palette {
             return *reference;
         }

@@ -22,7 +22,7 @@ changes; nothing here is a supported API yet.
   holds a `Remote` that behaves as much like an `Entity<T>` as a sandbox wall
   allows — typed method calls with responses, `observe` for the home's
   `cx.notify`, `subscribe` for its `cx.emit` events, refcounted auto-release
-  on drop, and capability references you can embed in payloads (`SharedRef`).
+  on drop, and capability references you can embed in payloads (`Ref`).
   The object model is symmetric and stringless: each end installs one **root
   object** at the reserved address 0 (`share_root`), attaches to the other
   end's root with `root()`, and discovers everything else through method

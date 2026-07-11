@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use embedded_gpui::{
-    PluginHost, PluginHostHandle as _, PluginOptions, PluginViewState, Remote, SharedRef, shared,
+    PluginHost, PluginHostHandle as _, PluginOptions, PluginViewState, Ref, Remote, shared,
 };
 use embedded_gpui_util::Mirror;
 use example_schema::{
@@ -65,13 +65,13 @@ struct HostRoot {
     host: Entity<PluginHost>,
     counter: Entity<Counter>,
     workspace: Entity<Workspace>,
-    counter_ref: Option<SharedRef<CounterApi>>,
-    workspace_ref: Option<SharedRef<WorkspaceApi>>,
+    counter_ref: Option<Ref<CounterApi>>,
+    workspace_ref: Option<Ref<WorkspaceApi>>,
 }
 
 #[shared]
 impl DemoHost for HostRoot {
-    fn counter(&mut self, cx: &mut Context<Self>) -> SharedRef<CounterApi> {
+    fn counter(&mut self, cx: &mut Context<Self>) -> Ref<CounterApi> {
         if let Some(reference) = self.counter_ref {
             return reference;
         }
@@ -80,7 +80,7 @@ impl DemoHost for HostRoot {
         reference
     }
 
-    fn workspace(&mut self, cx: &mut Context<Self>) -> SharedRef<WorkspaceApi> {
+    fn workspace(&mut self, cx: &mut Context<Self>) -> Ref<WorkspaceApi> {
         if let Some(reference) = self.workspace_ref {
             return reference;
         }
@@ -285,7 +285,7 @@ struct DemoView {
 impl DemoView {
     /// Invoke a palette command through its capability ref: connect (or reuse) a remote,
     /// call the schema-generated `invoke`, and surface the plugin's reply.
-    fn run_command(&mut self, reference: SharedRef<CommandApi>, cx: &mut Context<Self>) {
+    fn run_command(&mut self, reference: Ref<CommandApi>, cx: &mut Context<Self>) {
         let command = self
             .command_remotes
             .entry(reference.entity_id())

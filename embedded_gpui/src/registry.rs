@@ -23,8 +23,8 @@ use std::rc::{Rc, Weak};
 use gpui::{AnyEntity, App, AppContext as _, Entity, Subscription};
 
 use crate::{
-    HandlerResponse, MethodHandler, Methods, NOTIFY_EVENT, RELEASE_METHOD, RawSharedEvent, Remote,
-    RemoteSignal, ResponseSender, SUBSCRIBE_METHOD, Shared, SharedRef, SharedSpec, encode,
+    HandlerResponse, MethodHandler, Methods, NOTIFY_EVENT, RELEASE_METHOD, RawSharedEvent, Ref,
+    Remote, RemoteSignal, ResponseSender, SUBSCRIBE_METHOD, Shared, SharedSpec, encode,
 };
 
 /// The reserved connection-local address meaning "the root object of whichever end you
@@ -192,7 +192,7 @@ impl Objects {
     /// Share a local entity, returning a capability reference to embed in message or
     /// event payloads. The registry holds the entity alive until the other end's last
     /// remote drops.
-    pub fn share<S, T>(&self, entity: &Entity<T>, cx: &mut App) -> SharedRef<S>
+    pub fn share<S, T>(&self, entity: &Entity<T>, cx: &mut App) -> Ref<S>
     where
         S: SharedSpec,
         T: Shared<S>,
@@ -202,7 +202,7 @@ impl Objects {
         let entity_id = self.reserve_local_id();
         let events = T::events(entity, self.event_sink(entity_id), cx);
         self.install::<S, T>(entity, methods, events, entity_id, cx);
-        SharedRef::from_raw(entity_id)
+        Ref::from_raw(entity_id)
     }
 
     /// [`Objects::share`] with a closure-registered dispatch table instead of a schema
@@ -213,7 +213,7 @@ impl Objects {
         entity: &Entity<T>,
         register: impl FnOnce(&mut Methods<S, T>),
         cx: &mut App,
-    ) -> SharedRef<S>
+    ) -> Ref<S>
     where
         S: SharedSpec,
         T: 'static,
@@ -222,7 +222,7 @@ impl Objects {
         register(&mut methods);
         let entity_id = self.reserve_local_id();
         self.install::<S, T>(entity, methods, Vec::new(), entity_id, cx);
-        SharedRef::from_raw(entity_id)
+        Ref::from_raw(entity_id)
     }
 
     /// Attach to the other end's root object (the reserved address 0 means "your root"
@@ -236,7 +236,7 @@ impl Objects {
     /// Connecting the same ref twice returns a handle to the same projection; when the
     /// last clone drops, the home end is told to release the entity. Context-free:
     /// connecting allocates nothing but a map entry.
-    pub fn connect<S: SharedSpec>(&self, reference: SharedRef<S>) -> Remote<S> {
+    pub fn connect<S: SharedSpec>(&self, reference: Ref<S>) -> Remote<S> {
         let entity_id = reference.entity_id();
         if self.inner.state.borrow().homes.contains_key(&entity_id) {
             log::warn!(

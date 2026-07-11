@@ -19,7 +19,7 @@ use syn::{FnArg, Ident, ItemImpl, ItemTrait, Token, TraitItem, Type, bracketed};
 /// One name is the whole interface. The trait syntax is consumed and replaced by:
 ///
 /// - `pub struct CounterApi` implementing `SharedSpec` — so handles read
-///   `Remote<CounterApi>`, refs read `SharedRef<CounterApi>`, and homes are declared
+///   `Remote<CounterApi>`, refs read `Ref<CounterApi>`, and homes are declared
 ///   `#[shared] impl CounterApi for MyEntity { ... }`;
 /// - one message struct per method (`Increment { ... }`), named by PascalCasing the
 ///   method, with `SharedMessage` wired to the method's return type;
@@ -140,19 +140,19 @@ struct Method {
     field_names: Vec<Ident>,
     field_types: Vec<Type>,
     response: proc_macro2::TokenStream,
-    /// `Some(T)` when the response type is syntactically `SharedRef<T>`: the caller
+    /// `Some(T)` when the response type is syntactically `Ref<T>`: the caller
     /// then resolves with a connected `Remote<T>` instead of the bare ref.
     ref_response: Option<Type>,
     is_async: bool,
 }
 
-/// Matches a response type of the shape `SharedRef<T>` (by any path), yielding `T`.
-fn shared_ref_inner(ty: &syn::Type) -> Option<Type> {
+/// Matches a response type of the shape `Ref<T>` (by any path), yielding `T`.
+fn ref_inner(ty: &syn::Type) -> Option<Type> {
     let syn::Type::Path(path) = ty else {
         return None;
     };
     let segment = path.path.segments.last()?;
-    if segment.ident != "SharedRef" {
+    if segment.ident != "Ref" {
         return None;
     }
     let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
@@ -228,7 +228,7 @@ fn expand_interface(
         }
         let (response, ref_response) = match &sig.output {
             syn::ReturnType::Default => (quote!(()), None),
-            syn::ReturnType::Type(_, ty) => (quote!(#ty), shared_ref_inner(ty)),
+            syn::ReturnType::Type(_, ty) => (quote!(#ty), ref_inner(ty)),
         };
         let method_name = sig.ident.to_string();
         methods.push(Method {
@@ -435,13 +435,13 @@ fn expand_interface(
 
     let spec_doc = format!(
         "\n\nThe `{spec_ident}` shared interface: hold one as `Remote<{spec_ident}>`, \
-         reference one as `SharedRef<{spec_ident}>`, implement one with \
+         reference one as `Ref<{spec_ident}>`, implement one with \
          `#[shared] impl {spec_ident} for ...`."
     );
     let caller_doc = format!(
         "Typed calls to a shared `{spec_ident}` entity: implemented for \
          `Remote<{spec_ident}>`, one method per interface method, each returning a \
-         `Receipt`. Methods declared to return `SharedRef<T>` resolve with a connected \
+         `Receipt`. Methods declared to return `Ref<T>` resolve with a connected \
          `Remote<T>` instead: allocation over there, handle over here."
     );
 

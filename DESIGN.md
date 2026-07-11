@@ -16,7 +16,7 @@ app alive and re-enter it whenever the external run loop yields control).
   - `wit/plugin.wit` — the wire protocol (package `gpui:embedded`, world `plugin`); the
     single source of truth both sides bind against.
   - `src/embedded_gpui.rs` — the always-compiled object layer: `Remote`, `Receipt`,
-    `SharedRef`, specs/messages/events, and the `Shared` home trait.
+    `Ref`, specs/messages/events, and the `Shared` home trait.
   - `src/host.rs` (+ `src/host/`) — native targets only: wasmtime glue, host-side shared
     entities, and the element that replays guest display lists.
   - `src/guest.rs` (+ `src/guest/`) — wasm32 targets only: GPUI's
@@ -212,8 +212,10 @@ probe-and-degrade — before anything ships against it.
 
 ### The `Entity<T>` analogy
 
-`Remote<S>` is deliberately shaped like holding an `Entity<T>` that happens to live in
-another sandbox:
+The whole model is three ordinary words: an **entity** lives on one end, a **`Remote`**
+is how the other end holds it, and a **`Ref`** is how it travels. `Remote<S>` is
+deliberately shaped like holding an `Entity<T>` that happens to live in another
+sandbox:
 
 | local gpui                   | across the boundary                                     |
 | ---------------------------- | ------------------------------------------------------- |
@@ -279,13 +281,13 @@ natively.
 
 ### References and capabilities (OCAP)
 
-Everything moves by reference: `SharedRef<S>` is a serializable entity reference (a
+Everything moves by reference: `Ref<S>` is a serializable entity reference (a
 bare id on the wire) that travels *inside* message and event payloads, including call
 responses. A home shares an entity (`share` returns the ref), embeds the ref wherever
 it likes, and the receiving end connects a remote to it (`connect`). The two roots are
 the only refs that exist by convention; every other ref was minted by a method call.
 The demo's command palette works this way: the plugin publishes
-`[(label, SharedRef<CommandApi>)]`, the host renders native buttons for the labels,
+`[(label, Ref<CommandApi>)]`, the host renders native buttons for the labels,
 and clicking one invokes the ref. Holding a ref *is* the authority to use it — and
 because ids are random, that sentence is load-bearing: a ref can only be learned from
 a payload that carried it, so enumerating the other end's objects is infeasible.
@@ -344,7 +346,7 @@ pub trait CounterApi {
 ```
 
 One name is the whole interface: hold a `Remote<CounterApi>`, reference a
-`SharedRef<CounterApi>`, and implement a home by keeping the same name on the impl block:
+`Ref<CounterApi>`, and implement a home by keeping the same name on the impl block:
 
 ```rust
 #[shared]
@@ -359,7 +361,7 @@ ordinary methods of the entity and registers each one through schema-generated f
 taking checked function pointers — a signature mismatch against the schema is a compile
 error — then implements `Shared`, which is what `share` and `share_root` need
 (and what makes the spec inferable at share sites: no turbofish). A method declared to
-return `SharedRef<T>` gets a caller that resolves with a connected `Remote<T>`
+return `Ref<T>` gets a caller that resolves with a connected `Remote<T>`
 instead of the bare ref — the home mints and returns the ref as data; the calling
 side's receipt connects it on arrival. Allocation over there, handle over here.
 

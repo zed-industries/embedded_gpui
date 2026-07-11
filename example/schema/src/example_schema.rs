@@ -1,21 +1,21 @@
 //! Schemas for the demo: the interfaces both ends compile against. Each
 //! `#[shared_interface]` is one name for the whole thing — hold a `Remote<CounterApi>`,
-//! reference a `SharedRef<CommandApi>`, implement `#[shared] impl CounterApi for ...`.
+//! reference a `Ref<CommandApi>`, implement `#[shared] impl CounterApi for ...`.
 //!
 //! The two root interfaces are the entire bootstrap: each end installs its root object
 //! at its id 0, and every other capability here is reached by calling a root method
 //! that returns a ref. No names, no registries — discovery *is* the root schema.
 
-use embedded_gpui::{SharedRef, shared_data, shared_interface};
+use embedded_gpui::{Ref, shared_data, shared_interface};
 
 /// The host's root object: everything the plugin can reach on the host.
 #[shared_interface]
 pub trait DemoHost {
     /// The shared click counter, homed on the host.
-    fn counter(&mut self, cx: &mut gpui::Context<Self>) -> SharedRef<CounterApi>;
+    fn counter(&mut self, cx: &mut gpui::Context<Self>) -> Ref<CounterApi>;
 
     /// The workspace service the plugin drives (toasts, accent color).
-    fn workspace(&mut self, cx: &mut gpui::Context<Self>) -> SharedRef<WorkspaceApi>;
+    fn workspace(&mut self, cx: &mut gpui::Context<Self>) -> Ref<WorkspaceApi>;
 }
 
 /// The plugin's root object: everything the host can reach in the plugin. The methods
@@ -24,10 +24,10 @@ pub trait DemoHost {
 #[shared_interface]
 pub trait DemoPlugin {
     /// The wasm input line's text, mirrored natively by the host.
-    fn typed_text(&mut self, cx: &mut gpui::Context<Self>) -> SharedRef<TextApi>;
+    fn typed_text(&mut self, cx: &mut gpui::Context<Self>) -> Ref<TextApi>;
 
     /// The plugin's command palette, rendered natively by the host.
-    fn palette(&mut self, cx: &mut gpui::Context<Self>) -> SharedRef<PaletteApi>;
+    fn palette(&mut self, cx: &mut gpui::Context<Self>) -> Ref<PaletteApi>;
 }
 
 /// The click counter homed on the HOST: the wasm views call `increment`, mirror
@@ -57,7 +57,7 @@ pub trait TextApi {
 #[shared_data]
 pub struct PaletteEntry {
     pub label: String,
-    pub command: SharedRef<CommandApi>,
+    pub command: Ref<CommandApi>,
 }
 
 /// The registry the host renders natively: plugin-homed, mirrored by the host.

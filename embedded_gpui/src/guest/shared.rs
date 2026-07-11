@@ -4,7 +4,7 @@
 
 use crate::registry::{Objects, WireEvent, WireMessage, WireOutgoing, WireResponse};
 use crate::wit;
-use embedded_gpui::{Methods, Remote, Shared, SharedRef, SharedSpec};
+use embedded_gpui::{Methods, Ref, Remote, Shared, SharedSpec};
 use gpui::{App, AsyncApp, Entity};
 
 thread_local! {
@@ -50,7 +50,7 @@ where
 /// Share a local entity, returning a capability reference to embed in message or event
 /// payloads. The registry holds the entity alive until the other end's last remote
 /// drops.
-pub fn share<S, T>(entity: &Entity<T>, cx: &mut App) -> SharedRef<S>
+pub fn share<S, T>(entity: &Entity<T>, cx: &mut App) -> Ref<S>
 where
     S: SharedSpec,
     T: Shared<S>,
@@ -65,7 +65,7 @@ pub fn share_with<S, T>(
     entity: &Entity<T>,
     register: impl FnOnce(&mut Methods<S, T>),
     cx: &mut App,
-) -> SharedRef<S>
+) -> Ref<S>
 where
     S: SharedSpec,
     T: 'static,
@@ -83,7 +83,7 @@ pub fn root<S: SharedSpec>() -> Remote<S> {
 /// Attach to an entity through a capability reference received in a payload. Connecting
 /// the same ref twice returns a handle to the same projection; when the last clone
 /// drops, the home end is told to release the entity.
-pub fn connect<S: SharedSpec>(reference: SharedRef<S>) -> Remote<S> {
+pub fn connect<S: SharedSpec>(reference: Ref<S>) -> Remote<S> {
     objects().connect(reference)
 }
 

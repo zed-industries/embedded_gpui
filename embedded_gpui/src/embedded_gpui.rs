@@ -235,12 +235,12 @@ fn missing_response<R>(_bytes: Vec<u8>) -> anyhow::Result<R> {
 
 /// The future returned by every send and call on a [`Remote`].
 ///
-/// - `Receipt` (of `()`) is a send's acknowledgement: it resolves once the home has
-///   applied the message. Dropping it is fire-and-forget; the message is unaffected.
 /// - `Receipt<R>` is a call's response: it resolves with the home handler's return
-///   value. Handler errors arrive as `Err`, crossing the boundary as strings.
-/// - `Receipt<Vec<u8>>` from [`Remote::forward`] resolves with the raw response bytes,
-///   undecoded — the forwarding primitive a caretaker pipes straight through.
+///   value. Handler errors arrive as `Err`, crossing the boundary as strings. Dropping
+///   a receipt is fire-and-forget; the message is unaffected.
+/// - `Receipt<Vec<u8>>` from [`Remote::call_raw`] resolves with the raw response bytes,
+///   undecoded — the forwarding primitive a caretaker pipes straight through; chain
+///   [`Receipt::decoded`] or [`Receipt::acknowledged`] to interpret it.
 pub struct Receipt<R = ()> {
     receiver: futures::channel::oneshot::Receiver<Result<Vec<u8>, String>>,
     decode: Box<dyn Fn(Vec<u8>) -> anyhow::Result<R>>,
@@ -371,9 +371,9 @@ impl gpui::EventEmitter<RawEvent> for RemoteSignal {}
 /// A typed handle to an entity homed on the other side of the boundary. The nearest
 /// thing to `Entity<T>` that can cross a sandbox wall:
 ///
-/// - **call methods** — [`Remote::send`] / [`Remote::call`], or the typed methods a
-///   schema's generated `...Caller` trait adds (methods returning refs resolve
-///   directly to connected `Remote`s);
+/// - **call methods** — [`Remote::call`] / [`Remote::call_raw`], or the typed methods
+///   a schema's generated `...Caller` trait adds (methods returning refs resolve
+///   directly to connected `Remote`s); fire-and-forget is dropping the receipt;
 /// - **react to it** — [`Remote::observe`] mirrors the home's `cx.notify`,
 ///   [`Remote::subscribe`] its typed `cx.emit` events;
 /// - **refcounted** — clones share one guard; when the last clone of a ref-derived
@@ -444,23 +444,9 @@ impl<S: Interface> Remote<S> {
             .unwrap_or_else(|| cx.new(|_| RemoteSignal::new()))
     }
 
-    /// Send a typed message to the entity's home. Await the receipt to know it was
-    /// applied; drop it for fire-and-forget.
-    pub fn send<M: Message<Spec = S>>(&self, message: M, cx: &mut gpui::App) -> Receipt {
-        match encode(&message) {
-            Ok(payload) => self.request(M::METHOD, payload, cx).acknowledged(),
-            Err(error) => {
-                log::error!(
-                    "embedded_gpui: failed to encode {}::{}: {error:#}",
-                    S::TYPE_NAME,
-                    M::METHOD
-                );
-                Receipt::dropped()
-            }
-        }
-    }
-
     /// Call a typed method on the entity's home, resolving with its return value.
+    /// Await the receipt for the value (or the error), or drop it for fire-and-forget;
+    /// the message is applied either way.
     pub fn call<M: Message<Spec = S>>(
         &self,
         message: M,
@@ -503,24 +489,12 @@ impl<S: Interface> Remote<S> {
         }
     }
 
-    /// The dynamic escape hatch: send an arbitrary method and payload.
-    pub fn send_raw(&self, method: &str, payload: Vec<u8>, cx: &mut gpui::App) -> Receipt {
-        self.request(method, payload, cx).acknowledged()
-    }
-
-    /// The dynamic call escape hatch: call an arbitrary method and decode the response.
-    pub fn call_raw<R: DeserializeOwned + 'static>(
-        &self,
-        method: &str,
-        payload: Vec<u8>,
-        cx: &mut gpui::App,
-    ) -> Receipt<R> {
-        self.request(method, payload, cx).decoded()
-    }
-
-    /// Call a method by name with a pre-encoded payload, resolving with the raw response
-    /// bytes. The forwarding primitive: a caretaker pipes these straight through.
-    pub fn forward(&self, method: &str, payload: Vec<u8>, cx: &mut gpui::App) -> Receipt<Vec<u8>> {
+    /// The dynamic escape hatch: call a method by name with a pre-encoded payload,
+    /// resolving with the raw response bytes. This is the forwarding primitive — a
+    /// caretaker pipes these straight through — and the base of the typed verbs: chain
+    /// [`Receipt::decoded`] for a typed value or [`Receipt::acknowledged`] for a bare
+    /// ack.
+    pub fn call_raw(&self, method: &str, payload: Vec<u8>, cx: &mut gpui::App) -> Receipt<Vec<u8>> {
         self.request(method, payload, cx)
     }
 
@@ -559,7 +533,7 @@ impl<S: Interface> Remote<S> {
     }
 
     /// React to every event from the home, undecoded: the forwarding primitive for
-    /// events, mirroring [`Remote::forward`] for calls.
+    /// events, mirroring [`Remote::call_raw`] for calls.
     pub fn subscribe_raw(
         &self,
         cx: &mut gpui::App,

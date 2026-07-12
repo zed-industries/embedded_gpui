@@ -163,7 +163,7 @@ types), so shared state is built on three rules:
    `(entity_id, method: string, payload: bytes)` one way and events
    `(entity_id, name: string, payload: bytes)` the other. The schema layer types this —
    `#[interface]` generates the spec, the message types, and typed caller
-   methods — while `send_raw` / `call_raw` / `Methods::on` (with a `"*"` wildcard)
+   methods — while `call_raw` / `Methods::on` (with a `"*"` wildcard)
    remain available, so plugins can define their own entity kinds and methods without
    protocol changes. The registry itself stores exactly one dispatch closure per
    object and never interprets method names: the name-keyed table (and its wildcard)
@@ -222,7 +222,7 @@ sandbox:
 
 | local gpui                   | across the boundary                                     |
 | ---------------------------- | ------------------------------------------------------- |
-| calling methods in `update`  | `remote.call(...)` / `.send(...)`, or typed caller fns  |
+| calling methods in `update`  | `remote.call(...)` (drop the receipt to fire-and-forget) |
 | `cx.observe(&entity, ...)`   | `remote.observe(cx, ...)`                               |
 | `cx.subscribe(&entity, ...)` | `remote.subscribe::<Event>(cx, ...)`                    |
 | clones share the entity      | clones share the projection (auto-release on last drop) |
@@ -237,11 +237,12 @@ refetches on every notify and holds the latest value in an ordinary observable e
 There are no sequence numbers, no acks, and no replicas to keep consistent: both
 directions are FIFO end to end, and that alone carries the consistency story. A read
 issued after a write is itself a message, so it observes the write — read-your-writes by
-ordering. `send` returns a `Receipt` that resolves once the home has applied the message
-(handler errors arrive as `Err`, crossing the boundary as strings); `call` returns a
-`Receipt<R>` carrying the handler's decoded return value; `forward` returns
-`Receipt<Vec<u8>>`, the undecoded forwarding primitive. One type, three decoders.
-Dropping a receipt is fire-and-forget; the message is unaffected.
+ordering. There are exactly two verbs: `call` returns a `Receipt<R>` carrying the
+handler's decoded return value (handler errors arrive as `Err`, crossing the boundary
+as strings), and `call_raw` returns `Receipt<Vec<u8>>`, the undecoded forwarding
+primitive — chain `.decoded::<R>()` or `.acknowledged()` to interpret it. The decoder
+lives in the receipt, not the verb. Dropping a receipt is fire-and-forget; the message
+is unaffected.
 
 Every projection is born bound — `connect` always has the ref's id, and root ids are
 fixed — so there is no unresolved-name state and no pending-send queue. The cost is
@@ -330,7 +331,7 @@ entity):
 - **Revocation** is `embedded_gpui_util::Revocable`: wrap any capability you hold in a
   caretaker entity, share the wrapper, hand out *its* ref. Notifies and events pass
   through, and a wildcard handler forwards every method — including ones the wrapper has
-  never heard of — to the wrapped capability as raw bytes (`Remote::forward`).
+  never heard of — to the wrapped capability as raw bytes (`Remote::call_raw`).
   `revoke()` drops the inner remote (auto-release
   cascades to its home) and fails all further calls. The integration tests drive a full
   membrane (host vault → guest caretaker → host caller) through it.

@@ -153,7 +153,7 @@ async fn test_send_is_read_your_writes_by_ordering(cx: &mut TestAppContext) {
     let host = setup(cx);
     let counter = counter(&host, cx).await;
 
-    let receipt = cx.update(|cx| counter.send(Increment { by: 3 }, cx));
+    let receipt = cx.update(|cx| counter.call(Increment { by: 3 }, cx));
     settle(cx);
     receipt.await.expect("send should be acknowledged");
 
@@ -194,7 +194,7 @@ async fn test_mirror_keeps_an_observable_local_copy(cx: &mut TestAppContext) {
     let observed = count.read_with(cx, |mirror, _| mirror.latest().copied());
     assert_eq!(observed, Some(0), "initial value arrives on its own");
 
-    let receipt = cx.update(|cx| counter.send(Increment { by: 4 }, cx));
+    let receipt = cx.update(|cx| counter.call(Increment { by: 4 }, cx));
     settle(cx);
     receipt.await.expect("send");
     settle(cx);
@@ -308,8 +308,11 @@ async fn test_caretaker_membrane_forwards_and_revokes(cx: &mut TestAppContext) {
 
     // Revocation: the caretaker drops the wrapped capability. Its auto-release cascades
     // to the vault's home, which drops its strong handle.
-    let revoked =
-        cx.update(|cx| guarded.call_raw::<()>("revoke", encode(&()).expect("encode unit"), cx));
+    let revoked = cx.update(|cx| {
+        guarded
+            .call_raw("revoke", encode(&()).expect("encode unit"), cx)
+            .acknowledged()
+    });
     settle(cx);
     revoked.await.expect("revoke");
 
@@ -478,29 +481,43 @@ async fn test_chameleon_handles_methods_dynamically(cx: &mut TestAppContext) {
     let chameleon = chameleon(&host, cx).await;
 
     // Default mode echoes.
-    let poke = cx.update(|cx| chameleon.call_raw::<String>("poke", encode(&"hello").unwrap(), cx));
+    let poke = cx.update(|cx| {
+        chameleon
+            .call_raw("poke", encode(&"hello").unwrap(), cx)
+            .decoded::<String>()
+    });
     settle(cx);
     assert_eq!(poke.await.expect("poke"), "hello");
 
     // The entity reinterprets its own dispatch at runtime.
-    let become_shout = cx.update(|cx| chameleon.send_raw("become", encode(&"shout").unwrap(), cx));
+    let become_shout = cx.update(|cx| {
+        chameleon
+            .call_raw("become", encode(&"shout").unwrap(), cx)
+            .acknowledged()
+    });
     settle(cx);
     become_shout.await.expect("become");
 
-    let poke = cx.update(|cx| chameleon.call_raw::<String>("poke", encode(&"hello").unwrap(), cx));
+    let poke = cx.update(|cx| {
+        chameleon
+            .call_raw("poke", encode(&"hello").unwrap(), cx)
+            .decoded::<String>()
+    });
     settle(cx);
     assert_eq!(poke.await.expect("poke"), "HELLO");
 
     // Unknown methods surface the entity's own error, not a protocol failure.
-    let nonsense =
-        cx.update(|cx| chameleon.call_raw::<String>("transmogrify", encode(&"x").unwrap(), cx));
+    let nonsense = cx.update(|cx| chameleon.call_raw("transmogrify", encode(&"x").unwrap(), cx));
     settle(cx);
     let error = nonsense.await.expect_err("must be rejected");
     assert!(error.to_string().contains("does not understand"));
 
     // The dynamic "state" method observed the writes: two pokes, shout mode.
-    let state =
-        cx.update(|cx| chameleon.call_raw::<ChameleonState>("state", encode(&()).unwrap(), cx));
+    let state = cx.update(|cx| {
+        chameleon
+            .call_raw("state", encode(&()).unwrap(), cx)
+            .decoded::<ChameleonState>()
+    });
     settle(cx);
     let state = state.await.expect("state");
     assert_eq!(state.pokes, 2);
@@ -528,7 +545,7 @@ async fn test_random_interleavings_stay_consistent(cx: &mut TestAppContext, mut 
             1 => {
                 let by = rng.random_range(1..10);
                 expected_total += by;
-                let receipt = cx.update(|cx| counter.send(Increment { by }, cx));
+                let receipt = cx.update(|cx| counter.call(Increment { by }, cx));
                 pending_sends.push(receipt);
             }
             _ => settle(cx),

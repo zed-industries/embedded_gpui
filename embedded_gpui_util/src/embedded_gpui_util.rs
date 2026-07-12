@@ -80,7 +80,7 @@ impl<S: Interface> Revocable<S> {
             .clone()
         {
             Some(target) => {
-                let receipt = target.forward(method, payload.to_vec(), cx);
+                let receipt = target.call_raw(method, payload.to_vec(), cx);
                 cx.spawn(async move |_| receipt.await)
             }
             None => Task::ready(Err(anyhow!("capability revoked"))),
@@ -160,7 +160,7 @@ impl<S: Interface> Attenuated<S> {
                 )));
             }
             let target = entity.read(cx).target.clone();
-            let receipt = target.forward(method, payload.to_vec(), cx);
+            let receipt = target.call_raw(method, payload.to_vec(), cx);
             cx.spawn(async move |_| receipt.await)
         });
     }
@@ -241,7 +241,7 @@ impl<S: Interface> Audited<S> {
                 audited.records.len() - 1
             });
             let target = entity.read(cx).target.clone();
-            let receipt = target.forward(method, payload.to_vec(), cx);
+            let receipt = target.call_raw(method, payload.to_vec(), cx);
             let entity = entity.downgrade();
             cx.spawn(async move |cx| {
                 let outcome = receipt.await;

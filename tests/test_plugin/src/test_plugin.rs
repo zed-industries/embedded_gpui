@@ -245,7 +245,7 @@ impl GatekeeperApi for Gatekeeper {
         cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<Vec<u8>>> {
         let remote = connect(target);
-        let receipt = remote.forward(&method, payload, cx);
+        let receipt = remote.call_raw(&method, payload, cx);
         cx.spawn(async move |_, _| {
             let outcome = receipt.await;
             drop(remote);

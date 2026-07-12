@@ -6,10 +6,10 @@
 //! `DESIGN.md`.
 
 pub(crate) mod dispatcher;
+mod objects;
 pub(crate) mod platform;
-mod shared;
 
-pub use shared::{connect, root, share, share_root, share_with};
+pub use objects::{connect, root, share, share_root, share_with};
 pub(crate) mod text_system;
 pub(crate) mod window;
 
@@ -149,7 +149,7 @@ fn runtime_handles() -> Option<(AsyncApp, Rc<PluginPlatform>, SharedPlugin)> {
 /// Wakeup requests are suppressed for the duration: everything queued during the pump is
 /// drained before it returns, so only the earliest remaining timer needs a host tick.
 fn pump(platform: &PluginPlatform) {
-    shared::drain_releases();
+    objects::drain_releases();
     let dispatcher = platform.dispatcher();
     dispatcher.set_wakeups_suppressed(true);
     dispatcher.run_until_idle();
@@ -158,7 +158,7 @@ fn pump(platform: &PluginPlatform) {
     }
     dispatcher.run_until_idle();
     dispatcher.set_wakeups_suppressed(false);
-    shared::drain_releases();
+    objects::drain_releases();
     if let Some(delay) = dispatcher.next_timer_delay() {
         wit::request_tick(delay.as_millis().min(u32::MAX as u128) as u32);
     }
@@ -259,27 +259,27 @@ impl wit::Guest for Component {
         pump(&platform);
     }
 
-    fn deliver_shared_message(message: wit::SharedMessage) {
+    fn deliver_object_message(message: wit::ObjectMessage) {
         let Some((mut async_app, platform, _)) = runtime_handles() else {
             return;
         };
-        shared::message_delivered(message, &mut async_app);
+        objects::message_delivered(message, &mut async_app);
         pump(&platform);
     }
 
-    fn deliver_shared_event(event: wit::SharedEvent) {
+    fn deliver_object_event(event: wit::ObjectEvent) {
         let Some((mut async_app, platform, _)) = runtime_handles() else {
             return;
         };
-        shared::event_delivered(event, &mut async_app);
+        objects::event_delivered(event, &mut async_app);
         pump(&platform);
     }
 
-    fn deliver_shared_response(response: wit::SharedResponse) {
+    fn deliver_object_response(response: wit::ObjectResponse) {
         let Some((_, platform, _)) = runtime_handles() else {
             return;
         };
-        shared::response_delivered(response);
+        objects::response_delivered(response);
         pump(&platform);
     }
 }

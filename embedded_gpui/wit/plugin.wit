@@ -322,7 +322,7 @@ world plugin {
     }
 
     // ------------------------------------------------------------------
-    // Shared entities
+    // Objects
     //
     // A symmetric object channel. Each end of the connection owns *local* objects
     // (homes: entities whose state lives here and whose methods answer messages) and
@@ -353,53 +353,53 @@ world plugin {
     // effects/tick machinery, never mid-render).
     // ------------------------------------------------------------------
 
-    /// A dynamically dispatched message for a shared entity's home end. Delivery is
+    /// A dynamically dispatched message for an object's home end. Delivery is
     /// FIFO over a single thread, so the home applies messages in send order. A message
-    /// with a `request-id` expects a `shared-response` carrying the handler's return
+    /// with a `request-id` expects a `object-response` carrying the handler's return
     /// value (or an error). FIFO is also the consistency story: any read made after a
     /// message is itself a message, so it observes the write (read-your-writes by
     /// ordering, no sequence numbers required).
-    record shared-message {
+    record object-message {
         entity-id: u64,
         request-id: option<u64>,
         method: string,
         payload: list<u8>,
     }
 
-    /// The answer to a `shared-message` that carried a `request-id`.
-    record shared-response {
+    /// The answer to a `object-message` that carried a `request-id`.
+    record object-response {
         request-id: u64,
         outcome: result<list<u8>, string>,
     }
 
-    /// An event flowing from an entity's home to the remotes on the other end: the
-    /// mirror image of `shared-message`. The reserved name `$notify` carries the home
+    /// An event flowing from an object's home to the remotes on the other end: the
+    /// mirror image of `object-message`. The reserved name `$notify` carries the home
     /// entity's `cx.notify` across the boundary; every other name is a schema-defined
     /// typed event (`cx.emit` on the home side). Events only flow while the other end
     /// holds at least one live remote.
-    record shared-event {
+    record object-event {
         entity-id: u64,
         name: string,
         payload: list<u8>,
     }
 
     /// Send a message to an embedder-homed entity.
-    import send-shared-message: func(message: shared-message);
+    import send-object-message: func(message: object-message);
 
     /// Emit an event from a component-homed entity to the embedder's remotes.
-    import emit-shared-event: func(event: shared-event);
+    import emit-object-event: func(event: object-event);
 
     /// Answer a call that the embedder made to a component-homed entity.
-    import send-shared-response: func(response: shared-response);
+    import send-object-response: func(response: object-response);
 
     /// Deliver a message to a component-homed entity.
-    export deliver-shared-message: func(message: shared-message);
+    export deliver-object-message: func(message: object-message);
 
     /// Deliver an embedder-homed entity's event to the component's remotes.
-    export deliver-shared-event: func(event: shared-event);
+    export deliver-object-event: func(event: object-event);
 
     /// Answer a call that the component made to an embedder-homed entity.
-    export deliver-shared-response: func(response: shared-response);
+    export deliver-object-response: func(response: object-response);
 
     /// Ask the host to call the `tick` export after at least `delay-ms` milliseconds.
     /// A delay of zero means "as soon as possible, but not re-entrantly".

@@ -23,14 +23,14 @@ app alive and re-enter it whenever the external run loop yields control).
     `Platform`/`PlatformWindow`/`PlatformDispatcher`/`PlatformTextSystem`/`PlatformAtlas`
     over the WIT boundary, `Plugin`/`register_plugin!`, and the guest half of shared
     entities.
-- `embedded_gpui_macros/` — the `#[shared_interface]` / `#[shared]` / `#[shared_data]`
+- `embedded_gpui_macros/` — the `#[interface]` / `#[shared]` / `#[data]`
   proc macros.
 - `embedded_gpui_util/` — side-agnostic OCAP patterns (`Revocable`, `Attenuated`,
   `Audited`, `Mirror`) built on `Remote`.
 - `example/` — the demo pair: `host/` (native window, `cargo run -p example_host`;
   builds the plugin automatically) and `plugin/` (the wasm component, its own workspace
   since it only compiles to `wasm32-wasip2`).
-- `tests/` — the host-driven integration tests for the shared-entity protocol, with
+- `tests/` — the host-driven integration tests for the object protocol, with
   their guest fixture in `tests/test_plugin/`.
 
 ## Architecture (agreed invariants)
@@ -79,7 +79,7 @@ positioning), tessellated paths, images (premultiplied-BGRA payloads shipped onc
 per instance), SVGs (guest-rasterized alpha masks, tint baked per color), keyboard input
 (host focus → forwarded keystrokes → guest focus dispatch, with unhandled printable keys
 falling through to the focused `EntityInputHandler`, Linux-backend style), hover styles,
-mouse input, cursor styles, and shared entity state across two plugin views backed by one
+mouse input, cursor styles, and shared object state across two plugin views backed by one
 guest App. The release component (all of gpui + taffy, no fonts, no glyph rasterizers) is
 ~3.8 MB.
 
@@ -91,7 +91,7 @@ cargo run -p example_host
 
 ## Why two type systems? (WIT and the object model)
 
-A fair question: the WIT interface is a type system, and the shared-entity schema layer
+A fair question: the WIT interface is a type system, and the object schema layer
 is another. Why both? Because they type different things, with opposite change profiles:
 
 - **WIT is the syscall boundary** — display lists, input, text shaping, scheduling, and
@@ -107,7 +107,7 @@ is another. Why both? Because they type different things, with opposite change p
   defaulting, a plugin built against an old schema degrades at specific calls instead of
   failing to load. Evolution is a library release, not a flag day: old and new methods are just
   entries in the same dispatch table. Wayland-style version negotiation is expressible
-  as a plain shared entity (a registry whose `list` call returns interface/version/ref) —
+  as a plain shared object (a registry whose `list` call returns interface/version/ref) —
   and the bootstrap primitive already exists as the root object (Wayland's object 1,
   Cap'n Proto's bootstrap capability), with refs (objects) below it.
 
@@ -134,7 +134,7 @@ fast-and-static where the GPU is the clock:
   paint path — no wasm call, no serialization, no dispatch. Animating views cost one
   wasm render plus one binary display-list ship per *dirty* frame. Pixels, text, and
   input never touch JSON or string dispatch.
-- **The control path is slow only by hot-loop standards.** A shared-entity call is
+- **The control path is slow only by hot-loop standards.** An object call is
   serde_json on a small payload, a HashMap method lookup, and a few executor turns of
   queueing — unmeasurable at human interaction rates, and far cheaper than the
   inter-process JSON-RPC that the largest existing extension ecosystem (VS Code) runs
@@ -149,7 +149,7 @@ fast-and-static where the GPU is the clock:
   under chatty state, and turn-taking latency in deep synchronous call chains. All are
   "optimize when observed"; none are architectural.
 
-## Shared entities
+## Shared objects
 
 Entities cannot literally cross the boundary (separate linear memories, separately compiled
 types), so shared state is built on three rules:
@@ -162,7 +162,7 @@ types), so shared state is built on three rules:
 2. **Dynamic dispatch on the wire, types on top.** All traffic is actor-style messages
    `(entity_id, method: string, payload: bytes)` one way and events
    `(entity_id, name: string, payload: bytes)` the other. The schema layer types this —
-   `#[shared_interface]` generates the spec, the message types, and typed caller
+   `#[interface]` generates the spec, the message types, and typed caller
    methods — while `send_raw` / `call_raw` / `Methods::on` (with a `"*"` wildcard)
    remain available, so plugins can define their own entity kinds and methods without
    protocol changes. What crosses the boundary is data with a name, never memory with a
@@ -333,12 +333,12 @@ A handler can return work instead of a value: an `async fn` in the schema (or a 
 it resolves. The response flows only then, so an entity can await calls on *other* refs
 while answering one. Forwarders, aggregators, and caretakers are all this pattern.
 
-### Typed interfaces: `#[shared_interface]`
+### Typed interfaces: `#[interface]`
 
 The wire stays dynamic; types are sugar, and the sugar is one attribute:
 
 ```rust
-#[shared_interface(events = [Milestone])]
+#[interface(events = [Milestone])]
 pub trait CounterApi {
     fn increment(&mut self, by: u32, cx: &mut Context<Self>) -> u32;
     fn clicks(&mut self, cx: &mut Context<Self>) -> u32;

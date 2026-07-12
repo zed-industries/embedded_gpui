@@ -10,7 +10,7 @@ Today views are addressed by name (`host.view("panel")`) over a dedicated
 scene channel. That has the same weakness names always have: surfaces that are
 *data* — a widget per buffer line, a decoration per diagnostic — can't be a
 naming convention. The unification: **renderability becomes a feature of a
-shared entity**. A home entity that implements `Render` streams its display
+shared object**. A home entity that implements `Render` streams its display
 list to the other side, where a remote to it can be mounted anywhere in the
 element tree.
 

@@ -6,9 +6,7 @@
 //! entity: `share(&wrapper, cx)`.
 
 use anyhow::anyhow;
-use embedded_gpui::{
-    EventSink, Methods, Remote, Shared, SharedMessage, SharedSpec, WILDCARD_METHOD,
-};
+use embedded_gpui::{EventSink, Interface, Message, Methods, Remote, Shared, WILDCARD_METHOD};
 use gpui::{App, AppContext as _, Context, Entity, Subscription, Task, WeakEntity};
 
 /// A revocable forwarder (OCAP "caretaker") around any capability you hold.
@@ -39,12 +37,12 @@ use gpui::{App, AppContext as _, Context, Entity, Subscription, Task, WeakEntity
 ///     cx,
 /// );
 /// ```
-pub struct Revocable<S: SharedSpec> {
+pub struct Revocable<S: Interface> {
     target: Option<Remote<S>>,
     _notify: Option<Subscription>,
 }
 
-impl<S: SharedSpec> Revocable<S> {
+impl<S: Interface> Revocable<S> {
     /// Wrap `target`. The wrapped capability's notifies republish through the wrapper.
     pub fn new(target: Remote<S>, cx: &mut App) -> Entity<Self> {
         cx.new(|cx| {
@@ -90,7 +88,7 @@ impl<S: SharedSpec> Revocable<S> {
     }
 }
 
-impl<S: SharedSpec> Shared<S> for Revocable<S> {
+impl<S: Interface> Shared<S> for Revocable<S> {
     fn methods(methods: &mut Methods<S, Self>) {
         Self::register(methods);
     }
@@ -124,13 +122,13 @@ impl<S: SharedSpec> Shared<S> for Revocable<S> {
 /// let readonly = Attenuated::new(item_remote, &["describe"], cx);
 /// let readonly_ref = share(&readonly, cx);
 /// ```
-pub struct Attenuated<S: SharedSpec> {
+pub struct Attenuated<S: Interface> {
     target: Remote<S>,
     allowed: Vec<String>,
     _notify: Subscription,
 }
 
-impl<S: SharedSpec> Attenuated<S> {
+impl<S: Interface> Attenuated<S> {
     /// Wrap `target`, permitting only the listed methods through.
     pub fn new(target: Remote<S>, allowed: &[&str], cx: &mut App) -> Entity<Self> {
         let allowed = allowed.iter().map(|method| method.to_string()).collect();
@@ -168,7 +166,7 @@ impl<S: SharedSpec> Attenuated<S> {
     }
 }
 
-impl<S: SharedSpec> Shared<S> for Attenuated<S> {
+impl<S: Interface> Shared<S> for Attenuated<S> {
     fn methods(methods: &mut Methods<S, Self>) {
         Self::register(methods);
     }
@@ -198,13 +196,13 @@ pub struct AuditRecord {
 /// Reading the ledger is itself an authority: it stays with whoever holds this entity.
 /// Exposing it over the wire (or to a UI) is an explicit choice, exactly like
 /// revocation on [`Revocable`].
-pub struct Audited<S: SharedSpec> {
+pub struct Audited<S: Interface> {
     target: Remote<S>,
     records: Vec<AuditRecord>,
     _notify: Subscription,
 }
 
-impl<S: SharedSpec> Audited<S> {
+impl<S: Interface> Audited<S> {
     /// Wrap `target`; every call forwarded through the wrapper is recorded.
     pub fn new(target: Remote<S>, cx: &mut App) -> Entity<Self> {
         cx.new(|cx| {
@@ -261,7 +259,7 @@ impl<S: SharedSpec> Audited<S> {
     }
 }
 
-impl<S: SharedSpec> Shared<S> for Audited<S> {
+impl<S: Interface> Shared<S> for Audited<S> {
     fn methods(methods: &mut Methods<S, Self>) {
         Self::register(methods);
     }
@@ -302,8 +300,8 @@ impl<T: 'static> Mirror<T> {
     /// value arrives without any explicit kick.
     pub fn new<S, M>(remote: Remote<S>, request: M, cx: &mut App) -> Entity<Self>
     where
-        S: SharedSpec,
-        M: SharedMessage<Spec = S, Response = T> + Clone,
+        S: Interface,
+        M: Message<Spec = S, Response = T> + Clone,
     {
         let mirror = cx.new(|cx| {
             let this = cx.weak_entity();
@@ -332,8 +330,8 @@ impl<T: 'static> Mirror<T> {
 
     fn refresh<S, M>(this: WeakEntity<Self>, remote: &Remote<S>, request: &M, cx: &mut App)
     where
-        S: SharedSpec,
-        M: SharedMessage<Spec = S, Response = T> + Clone,
+        S: Interface,
+        M: Message<Spec = S, Response = T> + Clone,
     {
         let started = this
             .update(cx, |mirror, _| {

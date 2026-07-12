@@ -23,8 +23,8 @@ use std::rc::{Rc, Weak};
 use gpui::{AnyEntity, App, AppContext as _, Entity, Subscription};
 
 use crate::{
-    HandlerResponse, MethodHandler, Methods, NOTIFY_EVENT, RELEASE_METHOD, RawSharedEvent, Ref,
-    Remote, RemoteSignal, ResponseSender, SUBSCRIBE_METHOD, Shared, SharedSpec, encode,
+    HandlerResponse, Interface, MethodHandler, Methods, NOTIFY_EVENT, RELEASE_METHOD, RawEvent,
+    Ref, Remote, RemoteSignal, ResponseSender, SUBSCRIBE_METHOD, Shared, encode,
 };
 
 /// The reserved connection-local address meaning "the root object of whichever end you
@@ -65,7 +65,7 @@ pub(crate) enum WireOutgoing {
 pub(crate) type WireSink = Box<dyn Fn(WireOutgoing)>;
 
 /// A local object: an entity homed on this end, with its dynamic dispatch table.
-struct Home {
+struct HomeEntry {
     /// Interface name, kept purely as diagnostic metadata for error messages.
     type_name: &'static str,
     methods: HashMap<String, MethodHandler>,
@@ -108,7 +108,7 @@ impl Drop for ReleaseGuard {
 
 #[derive(Default)]
 struct State {
-    homes: HashMap<u64, Home>,
+    homes: HashMap<u64, HomeEntry>,
     projections: HashMap<u64, Projection>,
     next_request_id: u64,
     pending_responses: HashMap<u64, ResponseSender>,
@@ -134,7 +134,7 @@ pub(crate) struct Objects {
 
 /// A non-owning handle for everything the registry itself stores (subscriptions, event
 /// sinks) or that user entities may hold indefinitely (every `Remote`): a strong
-/// capture there would cycle through `Inner` and keep every shared entity alive
+/// capture there would cycle through `Inner` and keep every shared object alive
 /// forever. Remotes outliving their boundary resolve receipts with errors.
 #[derive(Clone)]
 pub(crate) struct WeakObjects {
@@ -172,7 +172,7 @@ impl Objects {
     /// now, in order, so the two bootstraps may race freely.
     pub fn share_root<S, T>(&self, entity: &Entity<T>, cx: &mut App)
     where
-        S: SharedSpec,
+        S: Interface,
         T: Shared<S>,
     {
         let entity_id = ROOT_ADDRESS;
@@ -194,7 +194,7 @@ impl Objects {
     /// remote drops.
     pub fn share<S, T>(&self, entity: &Entity<T>, cx: &mut App) -> Ref<S>
     where
-        S: SharedSpec,
+        S: Interface,
         T: Shared<S>,
     {
         let mut methods = Methods::new(entity.downgrade());
@@ -215,7 +215,7 @@ impl Objects {
         cx: &mut App,
     ) -> Ref<S>
     where
-        S: SharedSpec,
+        S: Interface,
         T: 'static,
     {
         let mut methods = Methods::new(entity.downgrade());
@@ -228,7 +228,7 @@ impl Objects {
     /// Attach to the other end's root object (the reserved address 0 means "your root"
     /// from either direction). Returns immediately; the other end queues root traffic
     /// until its root is installed.
-    pub fn root<S: SharedSpec>(&self) -> Remote<S> {
+    pub fn root<S: Interface>(&self) -> Remote<S> {
         self.connect_id(ROOT_ADDRESS)
     }
 
@@ -236,7 +236,7 @@ impl Objects {
     /// Connecting the same ref twice returns a handle to the same projection; when the
     /// last clone drops, the home end is told to release the entity. Context-free:
     /// connecting allocates nothing but a map entry.
-    pub fn connect<S: SharedSpec>(&self, reference: Ref<S>) -> Remote<S> {
+    pub fn connect<S: Interface>(&self, reference: Ref<S>) -> Remote<S> {
         let entity_id = reference.entity_id();
         if self.inner.state.borrow().homes.contains_key(&entity_id) {
             log::warn!(
@@ -246,7 +246,7 @@ impl Objects {
         self.connect_id(entity_id)
     }
 
-    fn connect_id<S: SharedSpec>(&self, entity_id: u64) -> Remote<S> {
+    fn connect_id<S: Interface>(&self, entity_id: u64) -> Remote<S> {
         let existing = {
             let state = self.inner.state.borrow();
             state
@@ -390,7 +390,7 @@ impl Objects {
         entity_id: u64,
         cx: &mut App,
     ) where
-        S: SharedSpec,
+        S: Interface,
         T: 'static,
     {
         let objects = self.downgrade();
@@ -402,7 +402,7 @@ impl Objects {
         subscriptions.extend(event_forwarders);
         self.inner.state.borrow_mut().homes.insert(
             entity_id,
-            Home {
+            HomeEntry {
                 type_name: S::TYPE_NAME,
                 methods: methods.into_map(),
                 subscribed: false,
@@ -492,7 +492,7 @@ impl Objects {
                         cx.spawn(async move |_| {
                             let outcome = task.await.map_err(|error| format!("{error:#}"));
                             if let Err(error) = &outcome {
-                                log::error!("embedded_gpui: shared message failed: {error}");
+                                log::error!("embedded_gpui: method call failed: {error}");
                             }
                             objects.respond(request_id, outcome);
                         })
@@ -512,7 +512,7 @@ impl Objects {
             Dispatch::Unknown(error) => Err(error),
         };
         if let Err(error) = &outcome {
-            log::error!("embedded_gpui: shared message failed: {error}");
+            log::error!("embedded_gpui: method call failed: {error}");
         }
         self.respond(message.request_id, outcome);
     }
@@ -550,7 +550,7 @@ impl Objects {
             signal.update(cx, |_, cx| cx.notify());
         } else {
             signal.update(cx, |_, cx| {
-                cx.emit(RawSharedEvent {
+                cx.emit(RawEvent {
                     name: event.name,
                     payload: event.payload,
                 })

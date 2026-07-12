@@ -1,4 +1,4 @@
-//! End-to-end tests for shared entities: a real wasm32-wasip2 plugin (see `test_plugin/`)
+//! End-to-end tests for the object model: a real wasm32-wasip2 plugin (see `test_plugin/`)
 //! loaded into a wasmtime store, driven from GPUI's deterministic test executor.
 //!
 //! The bootstrap is symmetric and stringless: each end installs a root object at the
@@ -367,7 +367,7 @@ async fn test_dropping_last_remote_releases_the_capability(cx: &mut TestAppConte
     settle(cx);
     let error = bumped.await.expect_err("bump after release must fail");
     assert!(
-        error.to_string().contains("shared entity dropped"),
+        error.to_string().contains("entity dropped"),
         "unexpected error: {error:#}"
     );
 }

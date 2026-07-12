@@ -10,8 +10,8 @@ description = "Integration tests for embedded_gpui (with their wasm guest fixtur
 workspace = true
 
 [[test]]
-name = "shared_entities"
-path = "shared_entities.rs"
+name = "objects"
+path = "objects.rs"
 
 [dev-dependencies]
 anyhow = "1.0"

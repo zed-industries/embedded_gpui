@@ -4,7 +4,7 @@
 
 use crate::registry::{Objects, WireEvent, WireMessage, WireOutgoing, WireResponse};
 use crate::wit;
-use embedded_gpui::{Methods, Ref, Remote, Shared, SharedSpec};
+use embedded_gpui::{Interface, Methods, Ref, Remote, Shared};
 use gpui::{App, AsyncApp, Entity};
 
 thread_local! {
@@ -13,18 +13,18 @@ thread_local! {
 
 fn deliver_outgoing(outgoing: WireOutgoing) {
     match outgoing {
-        WireOutgoing::Message(message) => wit::send_shared_message(&wit::SharedMessage {
+        WireOutgoing::Message(message) => wit::send_object_message(&wit::ObjectMessage {
             entity_id: message.entity_id,
             request_id: message.request_id,
             method: message.method,
             payload: message.payload,
         }),
-        WireOutgoing::Event(event) => wit::emit_shared_event(&wit::SharedEvent {
+        WireOutgoing::Event(event) => wit::emit_object_event(&wit::ObjectEvent {
             entity_id: event.entity_id,
             name: event.name,
             payload: event.payload,
         }),
-        WireOutgoing::Response(response) => wit::send_shared_response(&wit::SharedResponse {
+        WireOutgoing::Response(response) => wit::send_object_response(&wit::ObjectResponse {
             request_id: response.request_id,
             outcome: response.outcome,
         }),
@@ -41,7 +41,7 @@ fn objects() -> Objects {
 /// delivered in order once the root exists.
 pub fn share_root<S, T>(entity: &Entity<T>, cx: &mut App)
 where
-    S: SharedSpec,
+    S: Interface,
     T: Shared<S>,
 {
     objects().share_root(entity, cx);
@@ -52,7 +52,7 @@ where
 /// drops.
 pub fn share<S, T>(entity: &Entity<T>, cx: &mut App) -> Ref<S>
 where
-    S: SharedSpec,
+    S: Interface,
     T: Shared<S>,
 {
     objects().share(entity, cx)
@@ -67,7 +67,7 @@ pub fn share_with<S, T>(
     cx: &mut App,
 ) -> Ref<S>
 where
-    S: SharedSpec,
+    S: Interface,
     T: 'static,
 {
     objects().share_with(entity, register, cx)
@@ -76,14 +76,14 @@ where
 /// Attach to the other end's root object: the single typed capability everything
 /// starts from. Returns immediately (root traffic queues until the other end's root is
 /// installed), so the whole bootstrap is synchronous.
-pub fn root<S: SharedSpec>() -> Remote<S> {
+pub fn root<S: Interface>() -> Remote<S> {
     objects().root()
 }
 
 /// Attach to an entity through a capability reference received in a payload. Connecting
 /// the same ref twice returns a handle to the same projection; when the last clone
 /// drops, the home end is told to release the entity.
-pub fn connect<S: SharedSpec>(reference: Ref<S>) -> Remote<S> {
+pub fn connect<S: Interface>(reference: Ref<S>) -> Remote<S> {
     objects().connect(reference)
 }
 
@@ -93,7 +93,7 @@ pub(crate) fn drain_releases() {
     objects().drain_releases();
 }
 
-pub(crate) fn message_delivered(message: wit::SharedMessage, cx: &mut AsyncApp) {
+pub(crate) fn message_delivered(message: wit::ObjectMessage, cx: &mut AsyncApp) {
     let objects = objects();
     cx.update(|cx| {
         objects.deliver_message(
@@ -108,7 +108,7 @@ pub(crate) fn message_delivered(message: wit::SharedMessage, cx: &mut AsyncApp) 
     });
 }
 
-pub(crate) fn event_delivered(event: wit::SharedEvent, cx: &mut AsyncApp) {
+pub(crate) fn event_delivered(event: wit::ObjectEvent, cx: &mut AsyncApp) {
     let objects = objects();
     cx.update(|cx| {
         objects.deliver_event(
@@ -122,7 +122,7 @@ pub(crate) fn event_delivered(event: wit::SharedEvent, cx: &mut AsyncApp) {
     });
 }
 
-pub(crate) fn response_delivered(response: wit::SharedResponse) {
+pub(crate) fn response_delivered(response: wit::ObjectResponse) {
     objects().deliver_response(WireResponse {
         request_id: response.request_id,
         outcome: response.outcome,

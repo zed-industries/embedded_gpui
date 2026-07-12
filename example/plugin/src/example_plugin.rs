@@ -137,7 +137,7 @@ impl DemoPlugin for PluginRoot {
         if let Some((_, reference)) = &self.palette {
             return *reference;
         }
-        // The command palette: each command is an anonymously shared entity, and the
+        // The command palette: each command is a shared entity whose ref travels in the
         // palette carries their refs. The host renders the labels as native buttons;
         // clicking one calls straight back into these closures, which mutate the wave
         // model the panel view observes.

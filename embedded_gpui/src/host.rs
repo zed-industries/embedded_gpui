@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::registry::{Objects, WireEvent, WireMessage, WireOutgoing, WireResponse};
-use crate::{Methods, Ref, Remote, Shared, SharedSpec};
+use crate::{Interface, Methods, Ref, Remote, Shared};
 use anyhow::{Context as _, Result};
 use futures::StreamExt as _;
 use futures::channel::mpsc;
@@ -41,9 +41,9 @@ pub struct PendingEffects {
     pub scene_updates: Vec<(u32, bindings::DisplayList)>,
     pub tick_delay_ms: Option<u32>,
     pub cursor_style: Option<gpui::CursorStyle>,
-    pub shared_messages: Vec<bindings::SharedMessage>,
-    pub shared_events: Vec<bindings::SharedEvent>,
-    pub shared_responses: Vec<bindings::SharedResponse>,
+    pub messages: Vec<bindings::ObjectMessage>,
+    pub events: Vec<bindings::ObjectEvent>,
+    pub responses: Vec<bindings::ObjectResponse>,
 }
 
 /// Alias used for the value returned from the `PluginInstance` methods after they drain the
@@ -236,16 +236,16 @@ impl PluginImports for HostState {
         self.pending.scene_updates.push((view_id, list));
     }
 
-    fn send_shared_message(&mut self, message: bindings::SharedMessage) {
-        self.pending.shared_messages.push(message);
+    fn send_object_message(&mut self, message: bindings::ObjectMessage) {
+        self.pending.messages.push(message);
     }
 
-    fn emit_shared_event(&mut self, event: bindings::SharedEvent) {
-        self.pending.shared_events.push(event);
+    fn emit_object_event(&mut self, event: bindings::ObjectEvent) {
+        self.pending.events.push(event);
     }
 
-    fn send_shared_response(&mut self, response: bindings::SharedResponse) {
-        self.pending.shared_responses.push(response);
+    fn send_object_response(&mut self, response: bindings::ObjectResponse) {
+        self.pending.responses.push(response);
     }
 
     fn set_cursor_style(&mut self, style: bindings::CursorStyle) {
@@ -428,24 +428,24 @@ impl PluginInstance {
         Ok(self.take_effects())
     }
 
-    pub fn deliver_shared_event(&mut self, event: &bindings::SharedEvent) -> Result<Effects> {
+    pub fn deliver_object_event(&mut self, event: &bindings::ObjectEvent) -> Result<Effects> {
         self.bindings
-            .call_deliver_shared_event(&mut self.store, event)?;
+            .call_deliver_object_event(&mut self.store, event)?;
         Ok(self.take_effects())
     }
 
-    pub fn deliver_shared_message(&mut self, message: &bindings::SharedMessage) -> Result<Effects> {
+    pub fn deliver_object_message(&mut self, message: &bindings::ObjectMessage) -> Result<Effects> {
         self.bindings
-            .call_deliver_shared_message(&mut self.store, message)?;
+            .call_deliver_object_message(&mut self.store, message)?;
         Ok(self.take_effects())
     }
 
-    pub fn deliver_shared_response(
+    pub fn deliver_object_response(
         &mut self,
-        response: &bindings::SharedResponse,
+        response: &bindings::ObjectResponse,
     ) -> Result<Effects> {
         self.bindings
-            .call_deliver_shared_response(&mut self.store, response)?;
+            .call_deliver_object_response(&mut self.store, response)?;
         Ok(self.take_effects())
     }
 }
@@ -485,9 +485,9 @@ enum PluginRequest {
         event: bindings::KeyEvent,
     },
     Tick,
-    DeliverSharedMessage(bindings::SharedMessage),
-    DeliverSharedEvent(bindings::SharedEvent),
-    DeliverSharedResponse(bindings::SharedResponse),
+    DeliverMessage(bindings::ObjectMessage),
+    DeliverEvent(bindings::ObjectEvent),
+    DeliverResponse(bindings::ObjectResponse),
 }
 
 impl PluginInstance {
@@ -508,11 +508,9 @@ impl PluginInstance {
             PluginRequest::HandleMouse { view_id, event } => self.handle_mouse(view_id, event),
             PluginRequest::HandleKey { view_id, event } => self.handle_key(view_id, event),
             PluginRequest::Tick => self.tick(),
-            PluginRequest::DeliverSharedMessage(message) => self.deliver_shared_message(&message),
-            PluginRequest::DeliverSharedEvent(event) => self.deliver_shared_event(&event),
-            PluginRequest::DeliverSharedResponse(response) => {
-                self.deliver_shared_response(&response)
-            }
+            PluginRequest::DeliverMessage(message) => self.deliver_object_message(&message),
+            PluginRequest::DeliverEvent(event) => self.deliver_object_event(&event),
+            PluginRequest::DeliverResponse(response) => self.deliver_object_response(&response),
         }
     }
 }
@@ -559,22 +557,20 @@ impl PluginHost {
         let objects = Objects::new(Box::new(move |outgoing| {
             let request = match outgoing {
                 WireOutgoing::Message(message) => {
-                    PluginRequest::DeliverSharedMessage(bindings::SharedMessage {
+                    PluginRequest::DeliverMessage(bindings::ObjectMessage {
                         entity_id: message.entity_id,
                         request_id: message.request_id,
                         method: message.method,
                         payload: message.payload,
                     })
                 }
-                WireOutgoing::Event(event) => {
-                    PluginRequest::DeliverSharedEvent(bindings::SharedEvent {
-                        entity_id: event.entity_id,
-                        name: event.name,
-                        payload: event.payload,
-                    })
-                }
+                WireOutgoing::Event(event) => PluginRequest::DeliverEvent(bindings::ObjectEvent {
+                    entity_id: event.entity_id,
+                    name: event.name,
+                    payload: event.payload,
+                }),
                 WireOutgoing::Response(response) => {
-                    PluginRequest::DeliverSharedResponse(bindings::SharedResponse {
+                    PluginRequest::DeliverResponse(bindings::ObjectResponse {
                         request_id: response.request_id,
                         outcome: response.outcome,
                     })
@@ -593,9 +589,9 @@ impl PluginHost {
         let pump_objects = objects.clone();
         let pump = cx.spawn(async move |host, cx| {
             while let Some(mut effects) = effects_rx.next().await {
-                let events = std::mem::take(&mut effects.shared_events);
-                let responses = std::mem::take(&mut effects.shared_responses);
-                let messages = std::mem::take(&mut effects.shared_messages);
+                let events = std::mem::take(&mut effects.events);
+                let responses = std::mem::take(&mut effects.responses);
+                let messages = std::mem::take(&mut effects.messages);
                 let applied = cx.update(|cx| {
                     pump_objects.drain_releases();
 
@@ -682,7 +678,7 @@ impl PluginHost {
     /// exists, so the two ends' bootstraps may race freely.
     pub fn share_root<S, T>(&mut self, entity: &Entity<T>, cx: &mut Context<Self>)
     where
-        S: SharedSpec,
+        S: Interface,
         T: Shared<S>,
     {
         self.objects.share_root(entity, cx);
@@ -693,7 +689,7 @@ impl PluginHost {
     /// remote drops.
     pub fn share<S, T>(&mut self, entity: &Entity<T>, cx: &mut Context<Self>) -> Ref<S>
     where
-        S: SharedSpec,
+        S: Interface,
         T: Shared<S>,
     {
         self.objects.share(entity, cx)
@@ -709,7 +705,7 @@ impl PluginHost {
         cx: &mut Context<Self>,
     ) -> Ref<S>
     where
-        S: SharedSpec,
+        S: Interface,
         T: 'static,
     {
         self.objects.share_with(entity, register, cx)
@@ -718,12 +714,12 @@ impl PluginHost {
     /// Attach to the other end's root object: the single typed capability the plugin
     /// starts everything from. Returns immediately (root traffic queues until the
     /// other end's root is installed), so the whole bootstrap is synchronous.
-    pub fn root<S: SharedSpec>(&mut self, _cx: &mut Context<Self>) -> Remote<S> {
+    pub fn root<S: Interface>(&mut self, _cx: &mut Context<Self>) -> Remote<S> {
         self.objects.root()
     }
 
     /// Attach to an entity through a capability reference received in a payload.
-    pub fn connect<S: SharedSpec>(
+    pub fn connect<S: Interface>(
         &mut self,
         reference: Ref<S>,
         _cx: &mut Context<Self>,
@@ -878,13 +874,13 @@ impl PluginHost {
 /// including inside method handlers.
 pub trait PluginHostHandle {
     /// See [`PluginHost::share_root`].
-    fn share_root<S: SharedSpec, T: Shared<S>>(&self, entity: &Entity<T>, cx: &mut gpui::App);
+    fn share_root<S: Interface, T: Shared<S>>(&self, entity: &Entity<T>, cx: &mut gpui::App);
 
     /// See [`PluginHost::share`].
-    fn share<S: SharedSpec, T: Shared<S>>(&self, entity: &Entity<T>, cx: &mut gpui::App) -> Ref<S>;
+    fn share<S: Interface, T: Shared<S>>(&self, entity: &Entity<T>, cx: &mut gpui::App) -> Ref<S>;
 
     /// See [`PluginHost::share_with`].
-    fn share_with<S: SharedSpec, T: 'static>(
+    fn share_with<S: Interface, T: 'static>(
         &self,
         entity: &Entity<T>,
         register: impl FnOnce(&mut Methods<S, T>),
@@ -892,10 +888,10 @@ pub trait PluginHostHandle {
     ) -> Ref<S>;
 
     /// See [`PluginHost::root`].
-    fn root<S: SharedSpec>(&self, cx: &mut gpui::App) -> Remote<S>;
+    fn root<S: Interface>(&self, cx: &mut gpui::App) -> Remote<S>;
 
     /// See [`PluginHost::connect`].
-    fn connect<S: SharedSpec>(&self, reference: Ref<S>, cx: &mut gpui::App) -> Remote<S>;
+    fn connect<S: Interface>(&self, reference: Ref<S>, cx: &mut gpui::App) -> Remote<S>;
 
     /// See [`PluginHost::view`].
     fn view(&self, name: impl Into<String>, cx: &mut gpui::App) -> Entity<PluginViewState>;
@@ -905,15 +901,15 @@ pub trait PluginHostHandle {
 }
 
 impl PluginHostHandle for Entity<PluginHost> {
-    fn share_root<S: SharedSpec, T: Shared<S>>(&self, entity: &Entity<T>, cx: &mut gpui::App) {
+    fn share_root<S: Interface, T: Shared<S>>(&self, entity: &Entity<T>, cx: &mut gpui::App) {
         self.read(cx).objects.clone().share_root(entity, cx);
     }
 
-    fn share<S: SharedSpec, T: Shared<S>>(&self, entity: &Entity<T>, cx: &mut gpui::App) -> Ref<S> {
+    fn share<S: Interface, T: Shared<S>>(&self, entity: &Entity<T>, cx: &mut gpui::App) -> Ref<S> {
         self.read(cx).objects.clone().share(entity, cx)
     }
 
-    fn share_with<S: SharedSpec, T: 'static>(
+    fn share_with<S: Interface, T: 'static>(
         &self,
         entity: &Entity<T>,
         register: impl FnOnce(&mut Methods<S, T>),
@@ -925,11 +921,11 @@ impl PluginHostHandle for Entity<PluginHost> {
             .share_with(entity, register, cx)
     }
 
-    fn root<S: SharedSpec>(&self, cx: &mut gpui::App) -> Remote<S> {
+    fn root<S: Interface>(&self, cx: &mut gpui::App) -> Remote<S> {
         self.read(cx).objects.clone().root()
     }
 
-    fn connect<S: SharedSpec>(&self, reference: Ref<S>, cx: &mut gpui::App) -> Remote<S> {
+    fn connect<S: Interface>(&self, reference: Ref<S>, cx: &mut gpui::App) -> Remote<S> {
         self.read(cx).objects.clone().connect(reference)
     }
 

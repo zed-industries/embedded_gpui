@@ -18,7 +18,7 @@ changes; nothing here is a supported API yet.
 - A host runtime: loads a component with wasmtime, replays its display
   lists as native GPUI primitives (text hits the host's real rasterizer), and
   never calls into wasm from the frame path.
-- **Shared entities**: an entity lives on one end ("home"); the other end
+- **Shared objects**: an entity lives on one end (its "home"); the other end
   holds a `Remote` that behaves as much like an `Entity<T>` as a sandbox wall
   allows — typed method calls with responses, `observe` for the home's
   `cx.notify`, `subscribe` for its `cx.emit` events, refcounted auto-release
@@ -29,7 +29,7 @@ changes; nothing here is a supported API yet.
   calls — ref-returning methods resolve directly to connected `Remote`s, and
   authority is reachability from your root. Object ids are random u64s, so a
   ref can be known but never guessed.
-- **Typed interfaces**: one attribute on a trait (`#[shared_interface]`) makes
+- **Typed interfaces**: one attribute on a trait (`#[interface]`) makes
   one name the whole interface — `Remote<CounterApi>` for callers,
   `#[shared] impl CounterApi for MyEntity` for the implementation, both
   compile-time checked against the same schema.
@@ -89,8 +89,8 @@ cargo test -p tests -- --test-threads 1   # protocol tests
 
 - `embedded_gpui/` — the one crate both sides use: schema layer (always), host runtime
   (native), guest platform (wasm32). The WIT protocol lives in `embedded_gpui/wit/`.
-- `embedded_gpui_macros/` — the `#[shared_interface]` / `#[shared]` /
-  `#[shared_data]` proc macros.
+- `embedded_gpui_macros/` — the `#[interface]` / `#[shared]` / `#[data]`
+  proc macros.
 - `embedded_gpui_util/` — object-capability patterns (`Revocable`, `Attenuated`,
   `Audited`, `Mirror`).
 - `example/` — the demo: `host/` (native window) and `plugin/` (the wasm component).

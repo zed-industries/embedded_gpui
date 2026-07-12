@@ -40,23 +40,16 @@ pub(crate) struct WireMessage {
     pub payload: Vec<u8>,
 }
 
-/// An event from a local home toward the other end's remotes.
-pub(crate) struct WireEvent {
-    pub entity_id: u64,
-    pub name: String,
-    pub payload: Vec<u8>,
-}
-
 /// The answer to a [`WireMessage`] that carried a `request_id`.
 pub(crate) struct WireResponse {
     pub request_id: u64,
     pub outcome: Result<Vec<u8>, String>,
 }
 
-/// Everything the registry ever emits toward the other end.
+/// Everything the registry ever emits toward the other end. Events are not a case:
+/// they are messages to observer objects.
 pub(crate) enum WireOutgoing {
     Message(WireMessage),
-    Event(WireEvent),
     Response(WireResponse),
 }
 
@@ -69,8 +62,10 @@ pub(crate) type WireSink = Box<dyn Fn(WireOutgoing)>;
 /// the object's business (usually a [`Methods`] table, by convention).
 struct HomeEntry {
     handler: MethodHandler,
-    /// Whether the other end holds a live remote; events only flow while true.
-    subscribed: bool,
+    /// Observer objects on the other end (registered via `$subscribe`); the home's
+    /// `cx.notify` and typed events are sent to each as ordinary messages. Cleared on
+    /// `$release`.
+    observers: Vec<u64>,
     /// The registry keeps the entity alive until the other end releases it.
     strong: Option<AnyEntity>,
     /// The notify observation plus any typed-event forwarders wired at share time.
@@ -81,11 +76,11 @@ struct HomeEntry {
 struct Projection {
     /// Interface name as first connected, for a diagnostic on mismatched reconnects.
     type_name: &'static str,
-    /// Where incoming events land. Created lazily by the first `observe`/`subscribe`
-    /// (which is what makes `connect` context-free); events arriving before anyone
-    /// listens are dropped, exactly as gpui drops events on entities with no
-    /// subscribers.
-    signal: Option<Entity<RemoteSignal>>,
+    /// Where the home's notifies and events land locally, plus the id of the hidden
+    /// observer object that receives them. Created lazily by the first
+    /// `observe`/`subscribe`, which is also when `$subscribe` is sent — a projection
+    /// nobody listens to costs the wire nothing.
+    signal: Option<(Entity<RemoteSignal>, u64)>,
     /// Live while some `Remote` still holds the projection; used to hand the same guard
     /// back when the same ref is connected twice.
     guard: Weak<ReleaseGuard>,
@@ -291,12 +286,14 @@ impl Objects {
                 guard: Rc::downgrade(&guard),
             },
         );
-        self.send(entity_id, SUBSCRIBE_METHOD, Vec::new(), None);
         Remote::from_parts(self.downgrade(), entity_id, Some(guard))
     }
 
-    /// The signal a projection's events land on, created on first demand (from
-    /// `observe`/`subscribe`, which have a context). `None` if the projection is gone.
+    /// The signal a projection's notifies and events land on, created on first demand
+    /// (from `observe`/`subscribe`, which have a context). Creation mints the hidden
+    /// observer object that receives them as ordinary messages, and sends
+    /// `$subscribe(observer_ref)` — subscription is lazy, so a projection nobody
+    /// listens to costs the wire nothing. `None` if the projection is gone.
     pub(crate) fn signal_for(&self, entity_id: u64, cx: &mut App) -> Option<Entity<RemoteSignal>> {
         let existing = self
             .inner
@@ -306,17 +303,52 @@ impl Objects {
             .get(&entity_id)?
             .signal
             .clone();
-        if let Some(signal) = existing {
+        if let Some((signal, _)) = existing {
             return Some(signal);
         }
         let signal = cx.new(|_| RemoteSignal::new());
+        let observer_id = self.install_observer(signal.clone());
         self.inner
             .state
             .borrow_mut()
             .projections
             .get_mut(&entity_id)?
-            .signal = Some(signal.clone());
+            .signal = Some((signal.clone(), observer_id));
+        match encode(&observer_id) {
+            Ok(payload) => self.send(entity_id, SUBSCRIBE_METHOD, payload, None),
+            Err(error) => log::error!("embedded_gpui: failed to encode observer ref: {error:#}"),
+        }
         Some(signal)
+    }
+
+    /// Install the hidden observer object behind a projection's signal: a home whose
+    /// handler turns incoming messages back into gpui reactivity — `$notify` becomes
+    /// `cx.notify`, any other method name is a typed event for `cx.emit`.
+    fn install_observer(&self, signal: Entity<RemoteSignal>) -> u64 {
+        let entity_id = self.reserve_local_id();
+        let handler: MethodHandler = Rc::new(move |method, payload, cx| {
+            if method == NOTIFY_EVENT {
+                signal.update(cx, |_, cx| cx.notify());
+            } else {
+                signal.update(cx, |_, cx| {
+                    cx.emit(RawEvent {
+                        name: method.to_string(),
+                        payload: payload.to_vec(),
+                    })
+                });
+            }
+            HandlerResponse::Ready(Ok(Vec::new()))
+        });
+        self.inner.state.borrow_mut().homes.insert(
+            entity_id,
+            HomeEntry {
+                handler,
+                observers: Vec::new(),
+                strong: None,
+                _subscriptions: Vec::new(),
+            },
+        );
+        entity_id
     }
 
     pub(crate) fn send(
@@ -377,7 +409,7 @@ impl Objects {
         let objects = self.downgrade();
         Rc::new(move |event: &str, payload: Vec<u8>, _cx: &mut App| {
             if let Some(objects) = objects.upgrade() {
-                objects.emit_home_event(entity_id, event, payload);
+                objects.notify_observers(entity_id, event, payload);
             }
         })
     }
@@ -396,7 +428,7 @@ impl Objects {
         let objects = self.downgrade();
         let mut subscriptions = vec![cx.observe(entity, move |_, _| {
             if let Some(objects) = objects.upgrade() {
-                objects.emit_home_event(entity_id, NOTIFY_EVENT, Vec::new());
+                objects.notify_observers(entity_id, NOTIFY_EVENT, Vec::new());
             }
         })];
         subscriptions.extend(event_forwarders);
@@ -404,27 +436,30 @@ impl Objects {
             entity_id,
             HomeEntry {
                 handler: methods.into_handler(),
-                subscribed: false,
+                observers: Vec::new(),
                 strong: Some(entity.clone().into_any()),
                 _subscriptions: subscriptions,
             },
         );
     }
 
-    /// Send one event from a local home to the other end's remotes, if any are live.
-    fn emit_home_event(&self, entity_id: u64, event: &str, payload: Vec<u8>) {
-        let subscribed = self
+    /// Send one notify or typed event from a local home to every observer object the
+    /// other end registered: plain messages, fire-and-forget.
+    fn notify_observers(&self, entity_id: u64, method: &str, payload: Vec<u8>) {
+        let observers = self
             .inner
             .state
             .borrow()
             .homes
             .get(&entity_id)
-            .is_some_and(|home| home.subscribed);
-        if subscribed {
-            (self.inner.sink)(WireOutgoing::Event(WireEvent {
-                entity_id,
-                name: event.to_string(),
-                payload,
+            .map(|home| home.observers.clone())
+            .unwrap_or_default();
+        for observer in observers {
+            (self.inner.sink)(WireOutgoing::Message(WireMessage {
+                entity_id: observer,
+                request_id: None,
+                method: method.to_string(),
+                payload: payload.clone(),
             }));
         }
     }
@@ -456,12 +491,17 @@ impl Objects {
             };
             match message.method.as_str() {
                 SUBSCRIBE_METHOD => {
-                    home.subscribed = true;
+                    match crate::decode::<u64>(&message.payload) {
+                        Ok(observer) => home.observers.push(observer),
+                        Err(error) => {
+                            log::error!("embedded_gpui: malformed $subscribe: {error:#}")
+                        }
+                    }
                     Dispatch::Control
                 }
                 RELEASE_METHOD => {
-                    home.subscribed = false;
                     home.strong = None;
+                    home.observers.clear();
                     Dispatch::Control
                 }
                 // Everything else goes to the object's one handler; how it
@@ -494,8 +534,15 @@ impl Objects {
             Dispatch::Control => {
                 if message.method == SUBSCRIBE_METHOD {
                     // A subscription is answered with an initial notify, so a new
-                    // remote's observers always fire at least once.
-                    self.emit_home_event(message.entity_id, NOTIFY_EVENT, Vec::new());
+                    // observer always fires at least once.
+                    if let Ok(observer) = crate::decode::<u64>(&message.payload) {
+                        (self.inner.sink)(WireOutgoing::Message(WireMessage {
+                            entity_id: observer,
+                            request_id: None,
+                            method: NOTIFY_EVENT.to_string(),
+                            payload: Vec::new(),
+                        }));
+                    }
                 }
                 encode(&()).map_err(|error| format!("{error:#}"))
             }
@@ -516,37 +563,6 @@ impl Objects {
     }
 
     /// Deliver an incoming event from the other end to this end's remotes.
-    pub fn deliver_event(&self, event: WireEvent, cx: &mut App) {
-        // Clone the signal out so the registry borrow is released before user code
-        // (observers and subscribers) runs; observers may re-enter this module via sends.
-        let signal = {
-            let state = self.inner.state.borrow();
-            let Some(projection) = state.projections.get(&event.entity_id) else {
-                log::warn!(
-                    "embedded_gpui: event for unknown object {}",
-                    event.entity_id
-                );
-                return;
-            };
-            // No signal means nobody has observed or subscribed yet; dropping the
-            // event matches gpui's behavior for entities with no subscribers.
-            let Some(signal) = projection.signal.clone() else {
-                return;
-            };
-            signal
-        };
-        if event.name == NOTIFY_EVENT {
-            signal.update(cx, |_, cx| cx.notify());
-        } else {
-            signal.update(cx, |_, cx| {
-                cx.emit(RawEvent {
-                    name: event.name,
-                    payload: event.payload,
-                })
-            });
-        }
-    }
-
     /// Resolve the receipt waiting on an incoming response.
     pub fn deliver_response(&self, response: WireResponse) {
         let sender = self
@@ -583,20 +599,20 @@ impl Objects {
     /// Send `$release` for a projection and forget it locally. The home end drops its
     /// strong handle; events stop flowing.
     fn release_id(&self, entity_id: u64) {
-        let existed = self
-            .inner
-            .state
-            .borrow_mut()
-            .projections
-            .remove(&entity_id)
-            .is_some();
-        if existed {
-            (self.inner.sink)(WireOutgoing::Message(WireMessage {
-                entity_id,
-                request_id: None,
-                method: RELEASE_METHOD.to_string(),
-                payload: Vec::new(),
-            }));
+        let removed = self.inner.state.borrow_mut().projections.remove(&entity_id);
+        let Some(projection) = removed else {
+            return;
+        };
+        // The projection's hidden observer object goes with it; the home end forgets
+        // its side on `$release`.
+        if let Some((_, observer_id)) = projection.signal {
+            self.inner.state.borrow_mut().homes.remove(&observer_id);
         }
+        (self.inner.sink)(WireOutgoing::Message(WireMessage {
+            entity_id,
+            request_id: None,
+            method: RELEASE_METHOD.to_string(),
+            payload: Vec::new(),
+        }));
     }
 }

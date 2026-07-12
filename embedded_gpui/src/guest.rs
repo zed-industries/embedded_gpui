@@ -267,14 +267,6 @@ impl wit::Guest for Component {
         pump(&platform);
     }
 
-    fn deliver_object_event(event: wit::ObjectEvent) {
-        let Some((mut async_app, platform, _)) = runtime_handles() else {
-            return;
-        };
-        objects::event_delivered(event, &mut async_app);
-        pump(&platform);
-    }
-
     fn deliver_object_response(response: wit::ObjectResponse) {
         let Some((_, platform, _)) = runtime_handles() else {
             return;

@@ -345,12 +345,21 @@ world plugin {
     // root methods that return refs.
     //
     // An entity has exactly one home end, which owns its state and dispatches messages
-    // to it; the other end holds remotes that call methods on it and receive its
-    // events. All dispatch is dynamic on the wire -- a method or event name plus
-    // serialized payload -- with typed wrappers layered on in each language. Everything
-    // is single-threaded and queued, so ordering is deterministic and there are no
-    // synchronization concerns, only reentrancy rules (messages are delivered from the
-    // effects/tick machinery, never mid-render).
+    // to it; the other end holds remotes that call methods on it. All dispatch is
+    // dynamic on the wire -- a method name plus serialized payload -- with typed
+    // wrappers layered on in each language.
+    //
+    // Events are not a channel: they are messages flowing the other way. A remote that
+    // wants the home's `cx.notify` / `cx.emit` sends the reserved `$subscribe` method
+    // whose payload is a ref to an *observer object* on its own end; the home then
+    // calls that observer -- `$notify` for notifies, the schema event name for typed
+    // events -- as ordinary messages (answered first with one initial `$notify`). The
+    // reserved `$release` method tells a home its last remote dropped: it lets go of
+    // its strong handle and forgets its observers.
+    //
+    // Everything is single-threaded and queued, so ordering is deterministic and there
+    // are no synchronization concerns, only reentrancy rules (messages are delivered
+    // from the effects/tick machinery, never mid-render).
     // ------------------------------------------------------------------
 
     /// A dynamically dispatched message for an object's home end. Delivery is
@@ -372,31 +381,14 @@ world plugin {
         outcome: result<list<u8>, string>,
     }
 
-    /// An event flowing from an object's home to the remotes on the other end: the
-    /// mirror image of `object-message`. The reserved name `$notify` carries the home
-    /// entity's `cx.notify` across the boundary; every other name is a schema-defined
-    /// typed event (`cx.emit` on the home side). Events only flow while the other end
-    /// holds at least one live remote.
-    record object-event {
-        entity-id: u64,
-        name: string,
-        payload: list<u8>,
-    }
-
     /// Send a message to an embedder-homed entity.
     import send-object-message: func(message: object-message);
-
-    /// Emit an event from a component-homed entity to the embedder's remotes.
-    import emit-object-event: func(event: object-event);
 
     /// Answer a call that the embedder made to a component-homed entity.
     import send-object-response: func(response: object-response);
 
     /// Deliver a message to a component-homed entity.
     export deliver-object-message: func(message: object-message);
-
-    /// Deliver an embedder-homed entity's event to the component's remotes.
-    export deliver-object-event: func(event: object-event);
 
     /// Answer a call that the component made to an embedder-homed entity.
     export deliver-object-response: func(response: object-response);

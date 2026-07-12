@@ -2,7 +2,7 @@
 //! the WIT imports, plus free-function wrappers. The object model itself lives in
 //! `registry` and is identical on both ends; this file only moves bytes.
 
-use crate::registry::{Objects, WireEvent, WireMessage, WireOutgoing, WireResponse};
+use crate::registry::{Objects, WireMessage, WireOutgoing, WireResponse};
 use crate::wit;
 use embedded_gpui::{Interface, Methods, Ref, Remote, Shared};
 use gpui::{App, AsyncApp, Entity};
@@ -18,11 +18,6 @@ fn deliver_outgoing(outgoing: WireOutgoing) {
             request_id: message.request_id,
             method: message.method,
             payload: message.payload,
-        }),
-        WireOutgoing::Event(event) => wit::emit_object_event(&wit::ObjectEvent {
-            entity_id: event.entity_id,
-            name: event.name,
-            payload: event.payload,
         }),
         WireOutgoing::Response(response) => wit::send_object_response(&wit::ObjectResponse {
             request_id: response.request_id,
@@ -102,20 +97,6 @@ pub(crate) fn message_delivered(message: wit::ObjectMessage, cx: &mut AsyncApp) 
                 request_id: message.request_id,
                 method: message.method,
                 payload: message.payload,
-            },
-            cx,
-        )
-    });
-}
-
-pub(crate) fn event_delivered(event: wit::ObjectEvent, cx: &mut AsyncApp) {
-    let objects = objects();
-    cx.update(|cx| {
-        objects.deliver_event(
-            WireEvent {
-                entity_id: event.entity_id,
-                name: event.name,
-                payload: event.payload,
             },
             cx,
         )

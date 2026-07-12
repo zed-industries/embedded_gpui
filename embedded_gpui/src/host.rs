@@ -10,7 +10,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::registry::{Objects, WireEvent, WireMessage, WireOutgoing, WireResponse};
+use crate::registry::{Objects, WireMessage, WireOutgoing, WireResponse};
 use crate::{Interface, Methods, Ref, Remote, Shared};
 use anyhow::{Context as _, Result};
 use futures::StreamExt as _;
@@ -42,7 +42,6 @@ pub struct PendingEffects {
     pub tick_delay_ms: Option<u32>,
     pub cursor_style: Option<gpui::CursorStyle>,
     pub messages: Vec<bindings::ObjectMessage>,
-    pub events: Vec<bindings::ObjectEvent>,
     pub responses: Vec<bindings::ObjectResponse>,
 }
 
@@ -240,10 +239,6 @@ impl PluginImports for HostState {
         self.pending.messages.push(message);
     }
 
-    fn emit_object_event(&mut self, event: bindings::ObjectEvent) {
-        self.pending.events.push(event);
-    }
-
     fn send_object_response(&mut self, response: bindings::ObjectResponse) {
         self.pending.responses.push(response);
     }
@@ -428,12 +423,6 @@ impl PluginInstance {
         Ok(self.take_effects())
     }
 
-    pub fn deliver_object_event(&mut self, event: &bindings::ObjectEvent) -> Result<Effects> {
-        self.bindings
-            .call_deliver_object_event(&mut self.store, event)?;
-        Ok(self.take_effects())
-    }
-
     pub fn deliver_object_message(&mut self, message: &bindings::ObjectMessage) -> Result<Effects> {
         self.bindings
             .call_deliver_object_message(&mut self.store, message)?;
@@ -486,7 +475,6 @@ enum PluginRequest {
     },
     Tick,
     DeliverMessage(bindings::ObjectMessage),
-    DeliverEvent(bindings::ObjectEvent),
     DeliverResponse(bindings::ObjectResponse),
 }
 
@@ -509,7 +497,6 @@ impl PluginInstance {
             PluginRequest::HandleKey { view_id, event } => self.handle_key(view_id, event),
             PluginRequest::Tick => self.tick(),
             PluginRequest::DeliverMessage(message) => self.deliver_object_message(&message),
-            PluginRequest::DeliverEvent(event) => self.deliver_object_event(&event),
             PluginRequest::DeliverResponse(response) => self.deliver_object_response(&response),
         }
     }
@@ -564,11 +551,6 @@ impl PluginHost {
                         payload: message.payload,
                     })
                 }
-                WireOutgoing::Event(event) => PluginRequest::DeliverEvent(bindings::ObjectEvent {
-                    entity_id: event.entity_id,
-                    name: event.name,
-                    payload: event.payload,
-                }),
                 WireOutgoing::Response(response) => {
                     PluginRequest::DeliverResponse(bindings::ObjectResponse {
                         request_id: response.request_id,
@@ -589,24 +571,10 @@ impl PluginHost {
         let pump_objects = objects.clone();
         let pump = cx.spawn(async move |host, cx| {
             while let Some(mut effects) = effects_rx.next().await {
-                let events = std::mem::take(&mut effects.events);
                 let responses = std::mem::take(&mut effects.responses);
                 let messages = std::mem::take(&mut effects.messages);
                 let applied = cx.update(|cx| {
                     pump_objects.drain_releases();
-
-                    // Events before responses, mirroring the order the home end
-                    // produced them in.
-                    for event in events {
-                        pump_objects.deliver_event(
-                            WireEvent {
-                                entity_id: event.entity_id,
-                                name: event.name,
-                                payload: event.payload,
-                            },
-                            cx,
-                        );
-                    }
 
                     for response in responses {
                         pump_objects.deliver_response(WireResponse {

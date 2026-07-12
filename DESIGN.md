@@ -170,9 +170,10 @@ types), so shared state is built on three rules:
    is a userspace convention that `Methods` compiles down to. What crosses the
    boundary is data with a name, never memory with a type.
 3. **Single-threaded, queue-ordered, reentrancy-safe.** Everything runs on the host main
-   thread; messages, responses, and events ride the same deferred-effects machinery as
-   display lists, so there are no synchronization concerns and wasm is never re-entered
-   from within a render or another delivery.
+   thread; messages and responses ride the same deferred-effects machinery as display
+   lists (events are just messages to observer objects), so there are no
+   synchronization concerns and wasm is never re-entered from within a render or
+   another delivery.
 
 Identity is refs only. There are no names anywhere in the protocol: strings survive
 solely as schema method/event names (codegen vocabulary, like Wayland's interface
@@ -258,11 +259,17 @@ A home entity's reactivity crosses the boundary in the same shape gpui gives it 
   provided the schema declares it (`events = [SomeEvent]`) and the home type is an
   ordinary gpui `EventEmitter<SomeEvent>` — emitting is completely standard GPUI code.
 
-Events only flow while the other side holds a live remote: a remote's creation sends a
-`$subscribe` control message, answered by an initial notify, so a new remote's observers
-always fire at least once. This is what replaced snapshots: the protocol no longer
-blesses one serialized state type per entity. State transfer is just a method call, and
-*when to look again* is the only thing the wire signals.
+Under the hood there is no event channel at all — events are messages flowing the
+other way. The first `observe`/`subscribe` on a projection mints a hidden *observer
+object* and sends `$subscribe` with its ref; the home then calls that observer
+(`$notify`, or the typed event's name) as ordinary messages, starting with one initial
+`$notify` so observers always fire at least once. Lifetime is the ordinary release
+machinery: `$release` makes the home forget its observers, and releasing a projection
+removes its observer object. A projection nobody listens to costs the wire nothing,
+and homes naturally support any number of observers (the multi-plugin future). This is
+what replaced snapshots: the protocol no longer blesses one serialized state type per
+entity. State transfer is just a method call, and *when to look again* is the only
+thing the wire signals.
 
 ### Symmetry
 

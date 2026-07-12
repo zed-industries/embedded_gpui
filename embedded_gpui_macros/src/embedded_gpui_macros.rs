@@ -175,9 +175,6 @@ fn expand_interface(
 
     let vis = item_trait.vis.clone();
     let spec_ident = item_trait.ident.clone();
-    // The interface's own name doubles as the diagnostic type name; nothing on the
-    // wire checks it.
-    let type_name = spec_ident.to_string();
     let doc_attrs: Vec<_> = item_trait
         .attrs
         .iter()
@@ -450,9 +447,7 @@ fn expand_interface(
         #[doc = #spec_doc]
         #vis struct #spec_ident;
 
-        impl embedded_gpui::Interface for #spec_ident {
-            const TYPE_NAME: &'static str = #type_name;
-        }
+        impl embedded_gpui::Interface for #spec_ident {}
 
         impl #spec_ident {
             #(#register_fns)*

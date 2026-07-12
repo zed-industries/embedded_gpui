@@ -61,6 +61,10 @@ pub(crate) type WireSink = Box<dyn Fn(WireOutgoing)>;
 /// registry stores exactly one handler per object — how it interprets method names is
 /// the object's business (usually a [`Methods`] table, by convention).
 struct HomeEntry {
+    /// Interface name (`std::any::type_name`), kept for diagnostics and as node labels
+    /// for the (future) object-graph inspector.
+    #[allow(dead_code)]
+    type_name: &'static str,
     handler: MethodHandler,
     /// Observer objects on the other end (registered via `$subscribe`); the home's
     /// `cx.notify` and typed events are sent to each as ordinary messages. Cleared on
@@ -250,11 +254,11 @@ impl Objects {
                 .and_then(|projection| Some((projection.guard.upgrade()?, projection.type_name)))
         };
         if let Some((guard, type_name)) = existing {
-            if type_name != S::TYPE_NAME {
+            if type_name != crate::interface_name::<S>() {
                 log::error!(
                     "embedded_gpui: object {entity_id} connected as {} but already live as \
                      {type_name}",
-                    S::TYPE_NAME
+                    crate::interface_name::<S>()
                 );
             }
             return Remote::from_parts(self.downgrade(), entity_id, Some(guard));
@@ -281,7 +285,7 @@ impl Objects {
         self.inner.state.borrow_mut().projections.insert(
             entity_id,
             Projection {
-                type_name: S::TYPE_NAME,
+                type_name: crate::interface_name::<S>(),
                 signal: None,
                 guard: Rc::downgrade(&guard),
             },
@@ -342,6 +346,7 @@ impl Objects {
         self.inner.state.borrow_mut().homes.insert(
             entity_id,
             HomeEntry {
+                type_name: "observer",
                 handler,
                 observers: Vec::new(),
                 strong: None,
@@ -435,6 +440,7 @@ impl Objects {
         self.inner.state.borrow_mut().homes.insert(
             entity_id,
             HomeEntry {
+                type_name: crate::interface_name::<S>(),
                 handler: methods.into_handler(),
                 observers: Vec::new(),
                 strong: Some(entity.clone().into_any()),

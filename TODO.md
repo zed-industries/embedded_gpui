@@ -66,6 +66,12 @@ a later optimization.
   functions (plugin) expose the same operations with the same names; a shared
   `Peer`-style handle type both ends hand out would finish the symmetry at the
   API-surface level too.
+- [ ] **Object-graph inspector**: the registry already holds the whole graph —
+  homes (with `std::any::type_name` labels), projections, observers, strong vs
+  released, pending requests. Expose it as *another shared object* (a debug
+  `Interface` whose home is the registry itself) and any end — or a dev-tools
+  plugin — can render a live object-graph view. Dogfooding as observability;
+  pairs with tagged refs (below), which add the who-holds-what edges.
 
 ## Platform completeness
 

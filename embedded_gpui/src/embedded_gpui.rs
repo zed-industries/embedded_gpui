@@ -95,13 +95,19 @@ pub enum HandlerResponse {
 /// identically by the native host and the wasm guest.
 pub type MethodHandler = Rc<dyn Fn(&str, &[u8], &mut gpui::App) -> HandlerResponse>;
 
-/// Registering a handler under this name makes it the fallback for any method that has no
-/// explicit entry: fully dynamic dispatch, decided by the entity at runtime.
+/// Registering a handler under this name makes it the fallback for any method that has
+/// no explicit entry: fully dynamic dispatch, decided by the entity at runtime. Purely a
+/// [`Methods`] convention — the registry stores exactly one handler per object and never
+/// interprets method names itself.
 pub const WILDCARD_METHOD: &str = "*";
 
 /// A dispatch table under construction: the dynamic escape hatch beneath the typed
 /// [`Shared`] registration. Entities that interpret method names at runtime (or
 /// wrappers that forward them wholesale via [`WILDCARD_METHOD`]) register here.
+///
+/// This is userspace: the table compiles down to the single dispatch closure the
+/// registry actually stores, so name-keyed dispatch is one library convention among
+/// possible ones, not a protocol feature.
 pub struct Methods<S: Interface, T> {
     entity: gpui::WeakEntity<T>,
     map: std::collections::HashMap<String, MethodHandler>,
@@ -167,8 +173,19 @@ impl<S: Interface, T: 'static> Methods<S, T> {
     }
 
     #[doc(hidden)]
-    pub fn into_map(self) -> std::collections::HashMap<String, MethodHandler> {
-        self.map
+    /// Compile the table into the one handler the registry stores: look the method up
+    /// by name, fall back to the wildcard entry, or fail with a "no method" error.
+    pub fn into_handler(self) -> MethodHandler {
+        let map = self.map;
+        Rc::new(move |method, payload, cx| {
+            let Some(handler) = map.get(method).or_else(|| map.get(WILDCARD_METHOD)) else {
+                return HandlerResponse::Ready(Err(anyhow::anyhow!(
+                    "{} has no method {method:?}",
+                    S::TYPE_NAME
+                )));
+            };
+            handler(method, payload, cx)
+        })
     }
 }
 

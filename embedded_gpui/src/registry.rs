@@ -64,11 +64,11 @@ pub(crate) enum WireOutgoing {
 /// supplied at boundary creation.
 pub(crate) type WireSink = Box<dyn Fn(WireOutgoing)>;
 
-/// A local object: an entity homed on this end, with its dynamic dispatch table.
+/// A local object: an entity homed on this end, with its dispatch closure. The
+/// registry stores exactly one handler per object — how it interprets method names is
+/// the object's business (usually a [`Methods`] table, by convention).
 struct HomeEntry {
-    /// Interface name, kept purely as diagnostic metadata for error messages.
-    type_name: &'static str,
-    methods: HashMap<String, MethodHandler>,
+    handler: MethodHandler,
     /// Whether the other end holds a live remote; events only flow while true.
     subscribed: bool,
     /// The registry keeps the entity alive until the other end releases it.
@@ -403,8 +403,7 @@ impl Objects {
         self.inner.state.borrow_mut().homes.insert(
             entity_id,
             HomeEntry {
-                type_name: S::TYPE_NAME,
-                methods: methods.into_map(),
+                handler: methods.into_handler(),
                 subscribed: false,
                 strong: Some(entity.clone().into_any()),
                 _subscriptions: subscriptions,
@@ -437,7 +436,6 @@ impl Objects {
         enum Dispatch {
             Handler(MethodHandler),
             Control,
-            Unknown(String),
         }
         let dispatch = {
             let mut state = self.inner.state.borrow_mut();
@@ -466,18 +464,10 @@ impl Objects {
                     home.strong = None;
                     Dispatch::Control
                 }
-                method => home
-                    .methods
-                    .get(method)
-                    .or_else(|| home.methods.get(crate::WILDCARD_METHOD))
-                    .cloned()
-                    .map(Dispatch::Handler)
-                    .unwrap_or_else(|| {
-                        Dispatch::Unknown(format!(
-                            "object {} ({}) has no method {method:?}",
-                            message.entity_id, home.type_name
-                        ))
-                    }),
+                // Everything else goes to the object's one handler; how it
+                // interprets the name (a `Methods` table, a wildcard, anything) is
+                // its business, never the registry's.
+                _ => Dispatch::Handler(home.handler.clone()),
             }
         };
         let outcome = match dispatch {
@@ -509,7 +499,6 @@ impl Objects {
                 }
                 encode(&()).map_err(|error| format!("{error:#}"))
             }
-            Dispatch::Unknown(error) => Err(error),
         };
         if let Err(error) = &outcome {
             log::error!("embedded_gpui: method call failed: {error}");

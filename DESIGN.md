@@ -165,8 +165,10 @@ types), so shared state is built on three rules:
    `#[interface]` generates the spec, the message types, and typed caller
    methods — while `send_raw` / `call_raw` / `Methods::on` (with a `"*"` wildcard)
    remain available, so plugins can define their own entity kinds and methods without
-   protocol changes. What crosses the boundary is data with a name, never memory with a
-   type.
+   protocol changes. The registry itself stores exactly one dispatch closure per
+   object and never interprets method names: the name-keyed table (and its wildcard)
+   is a userspace convention that `Methods` compiles down to. What crosses the
+   boundary is data with a name, never memory with a type.
 3. **Single-threaded, queue-ordered, reentrancy-safe.** Everything runs on the host main
    thread; messages, responses, and events ride the same deferred-effects machinery as
    display lists, so there are no synchronization concerns and wasm is never re-entered

@@ -66,6 +66,26 @@ a later optimization.
   functions (plugin) expose the same operations with the same names; a shared
   `Peer`-style handle type both ends hand out would finish the symmetry at the
   API-surface level too.
+- [ ] **Payload codec: evolvable schemas (after views-as-objects)**: method calls
+  are RPC, and the published schema crates are the protocol, so payloads need
+  protobuf-style evolution — a hand-rolled protobuf-subset codec owned by the
+  `#[interface]`/`#[data]` macros (field tags from declaration order, explicit
+  `#[tag(n)]` override, skip-unknown-fields, append-only discipline as lintable
+  API rules). Methods and payloads are one versioned axis underneath (the wire
+  method *is* the message type), so message-name + field-tags covers all of it;
+  keeping the wire format an honest protobuf subset lets non-Rust ends speak it
+  with stock tooling. Encoding moves into the schema layer (`Message` owns its
+  bytes); core never mentions a codec.
+- [ ] **Ref-table packets (before views)**: the message packet becomes
+  `(method, payload, refs: list<u64>)` — a capability table, Cap'n-Proto style.
+  Inside payloads a `Ref` serializes as an index into the table via a
+  thread-local encode/decode context wired into `encode`/`decode` (strict:
+  serializing a `Ref` outside a packet context is an error — refs are
+  session-scoped bearer secrets). The boundary then sees every capability
+  crossing without parsing payloads: accounting, the inspector's who-holds-what
+  edges, deep membranes (a caretaker rewrites the table — wrapping each entry —
+  without understanding the payload), and hop-by-hop rewriting for multi-plugin
+  routing, all from one wire-shape change, independent of codec.
 - [ ] **Object-graph inspector**: the registry already holds the whole graph —
   homes (with `std::any::type_name` labels), projections, observers, strong vs
   released, pending requests. Expose it as *another shared object* (a debug

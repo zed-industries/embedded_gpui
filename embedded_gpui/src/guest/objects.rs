@@ -2,7 +2,7 @@
 //! the WIT imports, plus free-function wrappers. The object model itself lives in
 //! `registry` and is identical on both ends; this file only moves bytes.
 
-use crate::registry::{Objects, WireMessage, WireOutgoing, WireResponse};
+use crate::registry::{Objects, WireCall, WireMessage, WireOutgoing, WireResponse};
 use crate::wit;
 use embedded_gpui::{Interface, Methods, Ref, Remote, Shared};
 use gpui::{App, AsyncApp, Entity};
@@ -13,16 +13,51 @@ thread_local! {
 
 fn deliver_outgoing(outgoing: WireOutgoing) {
     match outgoing {
-        WireOutgoing::Message(message) => wit::send_object_message(&wit::ObjectMessage {
-            entity_id: message.entity_id,
-            request_id: message.request_id,
-            method: message.method,
-            payload: message.payload,
-        }),
+        WireOutgoing::Message(message) => wit::send_object_message(&message_to_wire(message)),
         WireOutgoing::Response(response) => wit::send_object_response(&wit::ObjectResponse {
             request_id: response.request_id,
             outcome: response.outcome,
         }),
+    }
+}
+
+/// Registry frames -> wit-bindgen wire variants, and back. Purely structural.
+fn message_to_wire(message: WireMessage) -> wit::ObjectMessage {
+    match message {
+        WireMessage::Call(call) => wit::ObjectMessage::Call(wit::ObjectCall {
+            entity_id: call.entity_id,
+            request_id: call.request_id,
+            method: call.method,
+            payload: call.payload,
+        }),
+        WireMessage::Subscribe {
+            entity_id,
+            observer_id,
+        } => wit::ObjectMessage::Subscribe(wit::ObjectSubscribe {
+            entity_id,
+            observer_id,
+        }),
+        WireMessage::Release { entity_id } => {
+            wit::ObjectMessage::Release(wit::ObjectRelease { entity_id })
+        }
+    }
+}
+
+fn message_from_wire(message: wit::ObjectMessage) -> WireMessage {
+    match message {
+        wit::ObjectMessage::Call(call) => WireMessage::Call(WireCall {
+            entity_id: call.entity_id,
+            request_id: call.request_id,
+            method: call.method,
+            payload: call.payload,
+        }),
+        wit::ObjectMessage::Subscribe(subscribe) => WireMessage::Subscribe {
+            entity_id: subscribe.entity_id,
+            observer_id: subscribe.observer_id,
+        },
+        wit::ObjectMessage::Release(release) => WireMessage::Release {
+            entity_id: release.entity_id,
+        },
     }
 }
 
@@ -90,17 +125,7 @@ pub(crate) fn drain_releases() {
 
 pub(crate) fn message_delivered(message: wit::ObjectMessage, cx: &mut AsyncApp) {
     let objects = objects();
-    cx.update(|cx| {
-        objects.deliver_message(
-            WireMessage {
-                entity_id: message.entity_id,
-                request_id: message.request_id,
-                method: message.method,
-                payload: message.payload,
-            },
-            cx,
-        )
-    });
+    cx.update(|cx| objects.deliver_message(message_from_wire(message), cx));
 }
 
 pub(crate) fn response_delivered(response: wit::ObjectResponse) {

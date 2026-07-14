@@ -23,21 +23,31 @@ use std::rc::{Rc, Weak};
 use gpui::{AnyEntity, App, AppContext as _, Entity, Subscription};
 
 use crate::{
-    HandlerResponse, Interface, MethodHandler, Methods, NOTIFY_EVENT, RELEASE_METHOD, RawEvent,
-    Ref, Remote, RemoteSignal, ResponseSender, SUBSCRIBE_METHOD, Shared, encode,
+    HandlerResponse, Interface, MethodHandler, Methods, NOTIFY_EVENT, RawEvent, Ref, Remote,
+    RemoteSignal, ResponseSender, Shared,
 };
 
 /// The reserved connection-local address meaning "the root object of whichever end you
 /// send it to". Never minted as an object id and never meaningful inside a payload.
 const ROOT_ADDRESS: u64 = 0;
 
-/// A message toward a home on the other end, in wire-neutral form. The boundary layer
-/// converts to its concrete wire types (wit-bindgen or wasmtime bindgen records).
-pub(crate) struct WireMessage {
+/// A method call toward a home on the other end, in wire-neutral form. The boundary
+/// layer converts to its concrete wire types (wit-bindgen or wasmtime bindgen records).
+pub(crate) struct WireCall {
     pub entity_id: u64,
     pub request_id: Option<u64>,
     pub method: String,
     pub payload: Vec<u8>,
+}
+
+/// Everything that flows toward an object: calls, plus the two operations that are
+/// *constitutive* of objecthood — structural frames, not reserved method names, so the
+/// method namespace belongs entirely to user schemas. All variants share one FIFO
+/// stream: subscribe and release order with calls.
+pub(crate) enum WireMessage {
+    Call(WireCall),
+    Subscribe { entity_id: u64, observer_id: u64 },
+    Release { entity_id: u64 },
 }
 
 /// The answer to a [`WireMessage`] that carried a `request_id`.
@@ -318,10 +328,10 @@ impl Objects {
             .projections
             .get_mut(&entity_id)?
             .signal = Some((signal.clone(), observer_id));
-        match encode(&observer_id) {
-            Ok(payload) => self.send(entity_id, SUBSCRIBE_METHOD, payload, None),
-            Err(error) => log::error!("embedded_gpui: failed to encode observer ref: {error:#}"),
-        }
+        (self.inner.sink)(WireOutgoing::Message(WireMessage::Subscribe {
+            entity_id,
+            observer_id,
+        }));
         Some(signal)
     }
 
@@ -376,14 +386,14 @@ impl Objects {
                 state.pending_responses.insert(request_id, sender);
                 request_id
             });
-            WireMessage {
+            WireCall {
                 entity_id,
                 request_id,
                 method: method.to_string(),
                 payload,
             }
         };
-        (self.inner.sink)(WireOutgoing::Message(message));
+        (self.inner.sink)(WireOutgoing::Message(WireMessage::Call(message)));
     }
 
     /// Mint a fresh object id: random, nonzero, and unused here. Randomness is what
@@ -461,12 +471,12 @@ impl Objects {
             .map(|home| home.observers.clone())
             .unwrap_or_default();
         for observer in observers {
-            (self.inner.sink)(WireOutgoing::Message(WireMessage {
+            (self.inner.sink)(WireOutgoing::Message(WireMessage::Call(WireCall {
                 entity_id: observer,
                 request_id: None,
                 method: method.to_string(),
                 payload: payload.clone(),
-            }));
+            })));
         }
     }
 
@@ -474,89 +484,97 @@ impl Objects {
     /// else through the dispatch table. Responses (for messages carrying a request id)
     /// flow back through the sink, after any sends the handler itself made.
     pub fn deliver_message(&self, message: WireMessage, cx: &mut App) {
-        enum Dispatch {
-            Handler(MethodHandler),
-            Control,
-        }
-        let dispatch = {
-            let mut state = self.inner.state.borrow_mut();
-            let Some(home) = state.homes.get_mut(&message.entity_id) else {
-                if message.entity_id == ROOT_ADDRESS {
-                    // The other end's bootstrap outran ours; deliver once our root
-                    // arrives.
-                    state.pending_root_messages.push(message);
-                    return;
-                }
-                let id = message.entity_id;
-                drop(state);
-                self.respond(
-                    message.request_id,
-                    Err(format!("message for unknown object {id}")),
-                );
-                return;
-            };
-            match message.method.as_str() {
-                SUBSCRIBE_METHOD => {
-                    match crate::decode::<u64>(&message.payload) {
-                        Ok(observer) => home.observers.push(observer),
-                        Err(error) => {
-                            log::error!("embedded_gpui: malformed $subscribe: {error:#}")
+        // The constitutive frames first: they never touch a handler and never respond.
+        let call = match message {
+            WireMessage::Subscribe {
+                entity_id,
+                observer_id,
+            } => {
+                let known = {
+                    let mut state = self.inner.state.borrow_mut();
+                    match state.homes.get_mut(&entity_id) {
+                        Some(home) => {
+                            home.observers.push(observer_id);
+                            true
+                        }
+                        None if entity_id == ROOT_ADDRESS => {
+                            // The other end's bootstrap outran ours; deliver once our
+                            // root arrives.
+                            state.pending_root_messages.push(WireMessage::Subscribe {
+                                entity_id,
+                                observer_id,
+                            });
+                            return;
+                        }
+                        None => {
+                            log::warn!("embedded_gpui: subscribe to unknown object {entity_id}");
+                            false
                         }
                     }
-                    Dispatch::Control
-                }
-                RELEASE_METHOD => {
-                    home.strong = None;
-                    home.observers.clear();
-                    Dispatch::Control
-                }
-                // Everything else goes to the object's one handler; how it
-                // interprets the name (a `Methods` table, a wildcard, anything) is
-                // its business, never the registry's.
-                _ => Dispatch::Handler(home.handler.clone()),
-            }
-        };
-        let outcome = match dispatch {
-            Dispatch::Handler(handler) => {
-                match handler(&message.method, &message.payload, cx) {
-                    HandlerResponse::Ready(result) => result.map_err(|error| format!("{error:#}")),
-                    HandlerResponse::Pending(task) => {
-                        // The handler's work outlives this delivery; the response flows
-                        // when its task resolves.
-                        let objects = self.clone();
-                        let request_id = message.request_id;
-                        cx.spawn(async move |_| {
-                            let outcome = task.await.map_err(|error| format!("{error:#}"));
-                            if let Err(error) = &outcome {
-                                log::error!("embedded_gpui: method call failed: {error}");
-                            }
-                            objects.respond(request_id, outcome);
-                        })
-                        .detach();
-                        return;
-                    }
-                }
-            }
-            Dispatch::Control => {
-                if message.method == SUBSCRIBE_METHOD {
+                };
+                if known {
                     // A subscription is answered with an initial notify, so a new
                     // observer always fires at least once.
-                    if let Ok(observer) = crate::decode::<u64>(&message.payload) {
-                        (self.inner.sink)(WireOutgoing::Message(WireMessage {
-                            entity_id: observer,
-                            request_id: None,
-                            method: NOTIFY_EVENT.to_string(),
-                            payload: Vec::new(),
-                        }));
-                    }
+                    (self.inner.sink)(WireOutgoing::Message(WireMessage::Call(WireCall {
+                        entity_id: observer_id,
+                        request_id: None,
+                        method: NOTIFY_EVENT.to_string(),
+                        payload: Vec::new(),
+                    })));
                 }
-                encode(&()).map_err(|error| format!("{error:#}"))
+                return;
+            }
+            WireMessage::Release { entity_id } => {
+                if let Some(home) = self.inner.state.borrow_mut().homes.get_mut(&entity_id) {
+                    home.strong = None;
+                    home.observers.clear();
+                }
+                return;
+            }
+            WireMessage::Call(call) => call,
+        };
+
+        let handler = {
+            let mut state = self.inner.state.borrow_mut();
+            let Some(home) = state.homes.get_mut(&call.entity_id) else {
+                if call.entity_id == ROOT_ADDRESS {
+                    // The other end's bootstrap outran ours; deliver once our root
+                    // arrives.
+                    state.pending_root_messages.push(WireMessage::Call(call));
+                    return;
+                }
+                let id = call.entity_id;
+                drop(state);
+                self.respond(call.request_id, Err(format!("call to unknown object {id}")));
+                return;
+            };
+            // Straight to the object's one handler; how it interprets the name (a
+            // `Methods` table, a wildcard, anything) is its business, never the
+            // registry's.
+            home.handler.clone()
+        };
+        let outcome = match handler(&call.method, &call.payload, cx) {
+            HandlerResponse::Ready(result) => result.map_err(|error| format!("{error:#}")),
+            HandlerResponse::Pending(task) => {
+                // The handler's work outlives this delivery; the response flows when
+                // its task resolves.
+                let objects = self.clone();
+                let request_id = call.request_id;
+                cx.spawn(async move |_| {
+                    let outcome = task.await.map_err(|error| format!("{error:#}"));
+                    if let Err(error) = &outcome {
+                        log::error!("embedded_gpui: method call failed: {error}");
+                    }
+                    objects.respond(request_id, outcome);
+                })
+                .detach();
+                return;
             }
         };
         if let Err(error) = &outcome {
             log::error!("embedded_gpui: method call failed: {error}");
         }
-        self.respond(message.request_id, outcome);
+        self.respond(call.request_id, outcome);
     }
 
     fn respond(&self, request_id: Option<u64>, outcome: Result<Vec<u8>, String>) {
@@ -614,11 +632,6 @@ impl Objects {
         if let Some((_, observer_id)) = projection.signal {
             self.inner.state.borrow_mut().homes.remove(&observer_id);
         }
-        (self.inner.sink)(WireOutgoing::Message(WireMessage {
-            entity_id,
-            request_id: None,
-            method: RELEASE_METHOD.to_string(),
-            payload: Vec::new(),
-        }));
+        (self.inner.sink)(WireOutgoing::Message(WireMessage::Release { entity_id }));
     }
 }

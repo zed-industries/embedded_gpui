@@ -335,20 +335,11 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> anyhow::Result<T> {
     Ok(serde_json::from_slice(bytes)?)
 }
 
-/// Reserved method name (runtime plumbing): the home entity's `cx.notify`, sent as a
-/// plain message to each registered observer object so remotes' observers fire.
+/// The one method-name convention between the two registries' own observer objects
+/// (user objects never see it, and user schemas may use any method name whatsoever):
+/// the home entity's `cx.notify`, sent as a plain call to each registered observer.
+/// Subscribe and release are not names at all — they are structural wire frames.
 pub(crate) const NOTIFY_EVENT: &str = "$notify";
-
-/// Reserved control method (runtime plumbing, never sent by user code): a remote
-/// registering interest in an entity. The payload is a ref to an observer object on
-/// the sender's end; the home calls it — `$notify`, or a typed event's name — as
-/// ordinary messages, starting with one initial `$notify`.
-pub(crate) const SUBSCRIBE_METHOD: &str = "$subscribe";
-
-/// Reserved control method (runtime plumbing, never sent by user code): a remote
-/// relinquishing an entity. The home drops its strong handle (letting the entity die
-/// when nothing else owns it) and forgets its observers.
-pub(crate) const RELEASE_METHOD: &str = "$release";
 
 /// The GPUI entity inside every [`Remote`] that incoming events land on; observe and
 /// subscribe through [`Remote::observe`] / [`Remote::subscribe`] rather than directly.

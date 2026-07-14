@@ -344,35 +344,62 @@ world plugin {
     // two roots is the entire bootstrap -- everything else is reached by calling
     // root methods that return refs.
     //
-    // An entity has exactly one home end, which owns its state and dispatches messages
+    // An entity has exactly one home end, which owns its state and dispatches calls
     // to it; the other end holds remotes that call methods on it. All dispatch is
     // dynamic on the wire -- a method name plus serialized payload -- with typed
-    // wrappers layered on in each language.
+    // wrappers layered on in each language. The method namespace belongs entirely to
+    // user schemas: the operations that are *constitutive* of objects (subscribe,
+    // release) are message variants, not method names.
     //
-    // Events are not a channel: they are messages flowing the other way. A remote that
-    // wants the home's `cx.notify` / `cx.emit` sends the reserved `$subscribe` method
-    // whose payload is a ref to an *observer object* on its own end; the home then
-    // calls that observer -- `$notify` for notifies, the schema event name for typed
-    // events -- as ordinary messages (answered first with one initial `$notify`). The
-    // reserved `$release` method tells a home its last remote dropped: it lets go of
-    // its strong handle and forgets its observers.
+    // Events are not a channel: they are calls flowing the other way. A remote that
+    // wants the home's `cx.notify` / `cx.emit` sends a `subscribe` frame carrying a
+    // ref to an *observer object* on its own end; the home then calls that observer --
+    // `$notify` for notifies (an internal convention between the two registries'
+    // observer objects, never seen by user code), the schema event name for typed
+    // events -- as ordinary calls, answered first with one initial notify. A `release`
+    // frame tells a home its last remote dropped: it lets go of its strong handle and
+    // forgets its observers.
     //
-    // Everything is single-threaded and queued, so ordering is deterministic and there
-    // are no synchronization concerns, only reentrancy rules (messages are delivered
-    // from the effects/tick machinery, never mid-render).
+    // Everything is single-threaded and queued -- all three frame kinds share one FIFO
+    // stream, so subscribe/release order with calls -- and there are no synchronization
+    // concerns, only reentrancy rules (messages are delivered from the effects/tick
+    // machinery, never mid-render).
     // ------------------------------------------------------------------
 
-    /// A dynamically dispatched message for an object's home end. Delivery is
-    /// FIFO over a single thread, so the home applies messages in send order. A message
-    /// with a `request-id` expects a `object-response` carrying the handler's return
-    /// value (or an error). FIFO is also the consistency story: any read made after a
-    /// message is itself a message, so it observes the write (read-your-writes by
-    /// ordering, no sequence numbers required).
-    record object-message {
+    /// A dynamically dispatched call to an object's home end. Delivery is FIFO over a
+    /// single thread, so the home applies calls in send order. A call with a
+    /// `request-id` expects an `object-response` carrying the handler's return value
+    /// (or an error). FIFO is also the consistency story: any read made after a call
+    /// is itself a call, so it observes the write (read-your-writes by ordering, no
+    /// sequence numbers required).
+    record object-call {
         entity-id: u64,
         request-id: option<u64>,
         method: string,
         payload: list<u8>,
+    }
+
+    /// Register an observer object with an entity's home: the home will call
+    /// `observer-id` (an object on the sender's end) with `$notify` and typed event
+    /// names, starting with one initial notify.
+    record object-subscribe {
+        entity-id: u64,
+        observer-id: u64,
+    }
+
+    /// The sender's last remote for this entity dropped: the home lets go of its
+    /// strong handle and forgets its observers.
+    record object-release {
+        entity-id: u64,
+    }
+
+    /// Everything that flows toward an object: ordinary method calls, plus the two
+    /// operations constitutive of objecthood as structural variants rather than
+    /// reserved method names.
+    variant object-message {
+        call(object-call),
+        subscribe(object-subscribe),
+        release(object-release),
     }
 
     /// The answer to a `object-message` that carried a `request-id`.

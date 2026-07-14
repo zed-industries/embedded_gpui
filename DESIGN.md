@@ -254,19 +254,24 @@ deliberately not built yet (see TODO).
 
 A home entity's reactivity crosses the boundary in the same shape gpui gives it locally:
 
-- every `cx.notify` on the home becomes a `$notify` event, firing `Remote::observe`
-  callbacks on the other side (notifies are idempotent, so bursts coalesce trivially);
+- every `cx.notify` on the home becomes a `$notify` call to observers, firing
+  `Remote::observe` callbacks on the other side (notifies are idempotent, so bursts
+  coalesce trivially);
 - `cx.emit(SomeEvent)` on the home becomes a named, typed event for `Remote::subscribe`,
   provided the schema declares it (`events = [SomeEvent]`) and the home type is an
   ordinary gpui `EventEmitter<SomeEvent>` — emitting is completely standard GPUI code.
 
 Under the hood there is no event channel at all — events are messages flowing the
 other way. The first `observe`/`subscribe` on a projection mints a hidden *observer
-object* and sends `$subscribe` with its ref; the home then calls that observer
-(`$notify`, or the typed event's name) as ordinary messages, starting with one initial
-`$notify` so observers always fire at least once. Lifetime is the ordinary release
-machinery: `$release` makes the home forget its observers, and releasing a projection
-removes its observer object. A projection nobody listens to costs the wire nothing,
+object* and sends a `subscribe` frame carrying its ref; the home then calls that
+observer (`$notify`, or the typed event's name) as ordinary calls, starting with one
+initial notify so observers always fire at least once. Lifetime is the ordinary
+release machinery: a `release` frame makes the home forget its observers, and
+releasing a projection removes its observer object. Subscribe and release are not
+method names but structural wire variants — the operations constitutive of objecthood
+get constitutive framing, and the method namespace belongs entirely to user schemas
+(`$notify` survives only as a private convention between the two registries' own
+observer objects). A projection nobody listens to costs the wire nothing,
 and homes naturally support any number of observers (the multi-plugin future). This is
 what replaced snapshots: the protocol no longer blesses one serialized state type per
 entity. State transfer is just a method call, and *when to look again* is the only
@@ -305,8 +310,8 @@ a payload that carried it, so enumerating the other end's objects is infeasible.
 treated as secrets in logs.)
 
 Lifetimes are own-only, like `Entity<T>` itself: sharing holds the entity strongly in
-the registry until the other end's last remote drops, at which point a `$release`
-control message lets it go (revocation-by-drop's principled replacement is
+the registry until the other end's last remote drops, at which point a `release`
+frame lets it go (revocation-by-drop's principled replacement is
 `Revocable`). Remotes carry a refcounted guard shared by all clones; drops queue the
 release, flushed on the next pump on either end. Connecting the same ref twice yields
 the same projection and the same guard. Sharing the same entity twice mints two

@@ -10,7 +10,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::registry::{Objects, WireMessage, WireOutgoing, WireResponse};
+use crate::registry::{Objects, WireCall, WireMessage, WireOutgoing, WireResponse};
 use crate::{Interface, Methods, Ref, Remote, Shared};
 use anyhow::{Context as _, Result};
 use futures::StreamExt as _;
@@ -439,6 +439,46 @@ impl PluginInstance {
     }
 }
 
+/// Registry frames -> bindgen wire variants, and back. Purely structural.
+fn message_to_wire(message: WireMessage) -> bindings::ObjectMessage {
+    match message {
+        WireMessage::Call(call) => bindings::ObjectMessage::Call(bindings::ObjectCall {
+            entity_id: call.entity_id,
+            request_id: call.request_id,
+            method: call.method,
+            payload: call.payload,
+        }),
+        WireMessage::Subscribe {
+            entity_id,
+            observer_id,
+        } => bindings::ObjectMessage::Subscribe(bindings::ObjectSubscribe {
+            entity_id,
+            observer_id,
+        }),
+        WireMessage::Release { entity_id } => {
+            bindings::ObjectMessage::Release(bindings::ObjectRelease { entity_id })
+        }
+    }
+}
+
+fn message_from_wire(message: bindings::ObjectMessage) -> WireMessage {
+    match message {
+        bindings::ObjectMessage::Call(call) => WireMessage::Call(WireCall {
+            entity_id: call.entity_id,
+            request_id: call.request_id,
+            method: call.method,
+            payload: call.payload,
+        }),
+        bindings::ObjectMessage::Subscribe(subscribe) => WireMessage::Subscribe {
+            entity_id: subscribe.entity_id,
+            observer_id: subscribe.observer_id,
+        },
+        bindings::ObjectMessage::Release(release) => WireMessage::Release {
+            entity_id: release.entity_id,
+        },
+    }
+}
+
 fn extent_from_size(size: Size<Pixels>) -> bindings::Extent {
     bindings::Extent {
         width: f32::from(size.width),
@@ -544,12 +584,7 @@ impl PluginHost {
         let objects = Objects::new(Box::new(move |outgoing| {
             let request = match outgoing {
                 WireOutgoing::Message(message) => {
-                    PluginRequest::DeliverMessage(bindings::ObjectMessage {
-                        entity_id: message.entity_id,
-                        request_id: message.request_id,
-                        method: message.method,
-                        payload: message.payload,
-                    })
+                    PluginRequest::DeliverMessage(message_to_wire(message))
                 }
                 WireOutgoing::Response(response) => {
                     PluginRequest::DeliverResponse(bindings::ObjectResponse {
@@ -584,15 +619,7 @@ impl PluginHost {
                     }
 
                     for message in messages {
-                        pump_objects.deliver_message(
-                            WireMessage {
-                                entity_id: message.entity_id,
-                                request_id: message.request_id,
-                                method: message.method,
-                                payload: message.payload,
-                            },
-                            cx,
-                        );
+                        pump_objects.deliver_message(message_from_wire(message), cx);
                     }
 
                     pump_objects.drain_releases();

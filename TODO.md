@@ -77,7 +77,10 @@ a later optimization.
   keeping the wire format an honest protobuf subset lets non-Rust ends speak it
   with stock tooling. Encoding moves into the schema layer (`Message` owns its
   bytes); core never mentions a codec.
-- [ ] **Ref-table packets (before views)**: the message packet becomes
+- [ ] **Ref-table packets (before views)**: test-first — start with the
+  wire-delta race test (drop a remote while the same ref is in flight; today
+  the reconnect finds "entity dropped", which is the leak/race CapTP's
+  mention-counting exists to prevent). Then: the message packet becomes
   `(method, payload, refs: list<u64>)` — a capability table, Cap'n-Proto style.
   Inside payloads a `Ref` serializes as an index into the table via a
   thread-local encode/decode context wired into `encode`/`decode` (strict:
@@ -90,7 +93,9 @@ a later optimization.
   refs *countable in transit*, enabling CapTP-style wire-delta accounting
   (`op:gc-exports`): releases that cannot race in-flight mentions, and
   collection of the currently-leaked case where a minted ref is never
-  connected by the receiver.
+  connected by the receiver. Same pass: resolver refs as the general reply
+  route on call frames (request-id stays as the answer-pos-style fast path),
+  restoring CapTP's delegation-of-reply.
 - [ ] **Object-graph inspector**: the registry already holds the whole graph —
   homes (with `std::any::type_name` labels), projections, observers, strong vs
   released, pending requests. Expose it as *another shared object* (a debug
@@ -121,8 +126,12 @@ a later optimization.
   cooperating plugins is a shared schema crate they both compiled against;
   the host never needs to know the interface exists. Routing through the
   host makes it the policy chokepoint: per-grant membranes, cross-plugin
-  audit, or powerbox-style user consent before a ref is forwarded. Depends
-  on ref-table packets (rewriting and grant tracking at the table). OCapN's
+  audit, or powerbox-style user consent before a ref is forwarded — and the
+  platform-observability surface: the host reads its own routing state to
+  report the plugin relationship graph, per-edge liveness, and backpressure
+  (queue depths), rendered by the object-graph inspector. In-process, the
+  host as trusted introducer is what makes handoff certificates unnecessary.
+  Depends on ref-table packets (rewriting and grant tracking at the table). OCapN's
   third-party handoffs are the reference design if unmediated introductions
   are ever wanted — and if semantics keep converging with CapTP, an OCapN
   netlayer bridge could someday put plugin objects on a real distributed

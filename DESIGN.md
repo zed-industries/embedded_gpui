@@ -391,7 +391,16 @@ FIFO ordering makes it race-free by construction).
 Points of reference: the [OCapN implementation guide](https://github.com/ocapn/ocapn/blob/main/implementation-guide/Implementation%20Guide.md)
 and [Spritely Goblins](https://codeberg.org/spritely/goblins). By largely convergent
 evolution, this design is a CapTP-shaped system specialized to a two-party,
-in-process boundary — the mapping, including deliberate divergences:
+in-process boundary.
+
+**Policy: converge on OCapN semantics wherever possible; diverge on encoding; record
+every divergence as either *flattened* (their design, optimized for our setting) or
+*specialized* (their mechanism solves a problem that does not exist inside one
+process).** The long-game payoff is an OCapN netlayer bridge that extends real
+distributed OCAP networks into Zed transparently: a boundary whose sink speaks
+CapTP/syrup to the network instead of wasm effects, session crypto and a powerbox
+membrane at that edge only, Goblins objects appearing inside plugins as ordinary
+`Remote`s. The mapping, including the divergences:
 
 | OCapN / CapTP                          | here                                                     |
 | -------------------------------------- | -------------------------------------------------------- |
@@ -401,7 +410,7 @@ in-process boundary — the mapping, including deliberate divergences:
 | swiss-nums (unguessable object names)   | random u64 ids (bearer refs)                              |
 | per-session import/export positions, perspective-flipped | global random ids: no flip, so opaque payloads pass through membranes unrewritten (their refs are structural descriptors; ref-table packets are our equivalent step) |
 | `op:deliver`                            | the `call` frame                                          |
-| resolver objects (`resolve-me-desc`)    | `request-id` + response record — a flattened resolver; the full unification (responses as calls to resolver objects) is available if ever needed |
+| resolver objects (`resolve-me-desc`)    | `request-id` + response record — a flattened resolver (the optimization CapTP itself evolves into via answer tables); resolver *refs* on calls, restoring delegation-of-reply, ride the ref-table pass |
 | promises + `op:listen`                  | `Receipt`s (one-shot); observer objects are our listen    |
 | pipelining via `answer-pos` (questions/answers) | the caller-allocated-ids design in TODO — same idea, reached from random ids |
 | `op:gc-exports` with wire-deltas        | release frames + drop guards; in-flight mention accounting is queued with ref-table packets |

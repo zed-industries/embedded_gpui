@@ -386,6 +386,29 @@ registers handlers by name at runtime, including the `"*"` wildcard the wrappers
 Home transfer is not implemented (if ever needed: a serialize-and-swap barrier message;
 FIFO ordering makes it race-free by construction).
 
+## Prior art: OCapN / CapTP and Spritely Goblins
+
+Points of reference: the [OCapN implementation guide](https://github.com/ocapn/ocapn/blob/main/implementation-guide/Implementation%20Guide.md)
+and [Spritely Goblins](https://codeberg.org/spritely/goblins). By largely convergent
+evolution, this design is a CapTP-shaped system specialized to a two-party,
+in-process boundary — the mapping, including deliberate divergences:
+
+| OCapN / CapTP                          | here                                                     |
+| -------------------------------------- | -------------------------------------------------------- |
+| netlayer (channel-agnostic CapTP)      | the side-blind registry over a `WireSink`; wasmtime is the netlayer |
+| session setup (fresh keys, crossed hellos) | the wasm boundary *is* the session; the host owns the guest's memory, so no cryptographic identity |
+| bootstrap object at export position 0  | the root object at address 0                              |
+| swiss-nums (unguessable object names)   | random u64 ids (bearer refs)                              |
+| per-session import/export positions, perspective-flipped | global random ids: no flip, so opaque payloads pass through membranes unrewritten (their refs are structural descriptors; ref-table packets are our equivalent step) |
+| `op:deliver`                            | the `call` frame                                          |
+| resolver objects (`resolve-me-desc`)    | `request-id` + response record — a flattened resolver; the full unification (responses as calls to resolver objects) is available if ever needed |
+| promises + `op:listen`                  | `Receipt`s (one-shot); observer objects are our listen    |
+| pipelining via `answer-pos` (questions/answers) | the caller-allocated-ids design in TODO — same idea, reached from random ids |
+| `op:gc-exports` with wire-deltas        | release frames + drop guards; in-flight mention accounting is queued with ref-table packets |
+| third-party handoffs (gifter/receiver/exporter certificates) | multi-plugin routing stays host-mediated (the host is the powerbox); handoffs are the reference for unmediated introductions |
+| syrup (canonical s-expressions)         | JSON today; a protobuf-subset codec planned — version-skew tolerance via field tags is the requirement syrup meets only by convention |
+| vats                                    | the two gpui event loops, exactly (minus transactional turns) |
+
 ## Known spike limitations (intentional)
 
 - No video `Surface` primitives; no gradient backgrounds (solid color fallback); no sprite

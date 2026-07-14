@@ -54,7 +54,8 @@ a later optimization.
   calling end mints the id for the object a method will return and sends it in
   the request — the returned `Remote` is usable immediately, sends FIFO behind
   the allocating call, and no promise tables exist. Needs home-side binding of
-  the pre-minted id.
+  the pre-minted id. (This is CapTP's `answer-pos` mechanism reached from the
+  random-ids direction; see the prior-art section in DESIGN.md.)
 - [ ] **Share dedup**: sharing the same entity twice mints two independent ids.
   Dedup wants a per-entity identity map (and interacts with release: both refs
   share one strong hold).
@@ -85,7 +86,11 @@ a later optimization.
   crossing without parsing payloads: accounting, the inspector's who-holds-what
   edges, deep membranes (a caretaker rewrites the table — wrapping each entry —
   without understanding the payload), and hop-by-hop rewriting for multi-plugin
-  routing, all from one wire-shape change, independent of codec.
+  routing, all from one wire-shape change, independent of codec. It also makes
+  refs *countable in transit*, enabling CapTP-style wire-delta accounting
+  (`op:gc-exports`): releases that cannot race in-flight mentions, and
+  collection of the currently-leaked case where a minted ref is never
+  connected by the receiver.
 - [ ] **Object-graph inspector**: the registry already holds the whole graph —
   homes (with `std::any::type_name` labels), projections, observers, strong vs
   released, pending requests. Expose it as *another shared object* (a debug
@@ -117,8 +122,11 @@ a later optimization.
   the host never needs to know the interface exists. Routing through the
   host makes it the policy chokepoint: per-grant membranes, cross-plugin
   audit, or powerbox-style user consent before a ref is forwarded. Depends
-  on tagged refs (id rewriting across plugin id-spaces, grant tracking) and
-  multi-subscriber homes.
+  on ref-table packets (rewriting and grant tracking at the table). OCapN's
+  third-party handoffs are the reference design if unmediated introductions
+  are ever wanted — and if semantics keep converging with CapTP, an OCapN
+  netlayer bridge could someday put plugin objects on a real distributed
+  OCAP network (Goblins interop).
 
 ## Advanced OCAPs
 

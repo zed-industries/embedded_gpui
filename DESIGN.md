@@ -33,6 +33,34 @@ app alive and re-enter it whenever the external run loop yields control).
 - `tests/` — the host-driven integration tests for the object protocol, with
   their guest fixture in `tests/test_plugin/`.
 
+## The object model, made correct (this pass)
+
+The spike proved the object model *works*; this pass makes it the only model. Target,
+written before the code so the diff can be reviewed against it:
+
+1. **Views are objects.** A slot is a host-homed `SurfaceApi` object; the thing drawing
+   on it is a guest-homed `ViewApi` object. The host hands a `Ref<SurfaceApi>` to the
+   plugin through an ordinary typed method; the guest opens a window on it, shares a
+   view, and calls `surface.attach(view)`. Input, resize, and cursor are method calls on
+   those two objects. There are no view ids, no view names, and no directional
+   view/input functions in the WIT.
+2. **Refs are enumerable.** Every call and response carries a `refs` table; payload
+   bytes name refs by table index. Forwarders rewrite the table without parsing the
+   payload, which is what makes transitive membranes (`Revocable` wrapping every ref
+   that crosses it, in both directions) and future in-flight GC accounting possible.
+3. **One frame type, one FIFO per direction.** `frame` is
+   `call | response | subscribe | release`. Both directions ride the `tick` export:
+   `tick(inbound: list<frame>) -> turn { frames, scenes, wake-after-ms }`. Imports
+   cannot re-enter the guest because there are none left to re-enter with (text shaping
+   stays a synchronous import because layout needs the answer mid-call). The WIT is pure
+   substrate: objects, scheduling, pixels, text.
+4. **A ref knows where it came from.** `Ref<S>` binds to the registry that delivered
+   it, so `ref.connect()` works anywhere a ref is held — in handlers, after awaits, on
+   either end. `connect` stops being a host/guest entry point.
+5. **The interface schema is a runtime value.** `Interface::schema()` describes methods,
+   argument types, and events, so a dynamic-language guest can bind against the same
+   artifact the macros consume.
+
 ## Architecture (agreed invariants)
 
 1. **The host never calls into the guest synchronously from the frame path.** The guest

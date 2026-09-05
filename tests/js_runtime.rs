@@ -64,20 +64,26 @@ fn settle(cx: &mut TestAppContext) {
     cx.executor().run_until_parked();
 }
 
-/// A host with the runtime loaded and the test script evaluated.
-fn setup(cx: &mut TestAppContext) -> (Entity<PluginHost>, Remote<JsRuntimeApi>, Entity<HostRoot>) {
+fn setup_with_options(
+    options: PluginOptions,
+    cx: &mut TestAppContext,
+) -> (Entity<PluginHost>, Remote<JsRuntimeApi>, Entity<HostRoot>) {
     let path = js_runtime_path();
-    let instance = cx.update(|_| {
-        PluginInstance::new(
-            &path,
-            PluginOptions::new(Arc::new(gpui::NoopTextSystem::new())),
-        )
-        .expect("failed to instantiate js_runtime")
-    });
+    let instance = cx
+        .update(|_| PluginInstance::new(&path, options).expect("failed to instantiate js_runtime"));
     let host = cx.new(|cx| PluginHost::new(instance, cx));
     let root = cx.new(|_| HostRoot { pings: 0 });
     cx.update(|cx| host.share_root(&root, cx));
     let runtime = cx.update(|cx| host.root::<JsRuntimeApi>(cx));
+    (host, runtime, root)
+}
+
+/// A host with the runtime loaded and the test script pushed in through `load`.
+fn setup(cx: &mut TestAppContext) -> (Entity<PluginHost>, Remote<JsRuntimeApi>, Entity<HostRoot>) {
+    let (host, runtime, root) = setup_with_options(
+        PluginOptions::new(Arc::new(gpui::NoopTextSystem::new())),
+        cx,
+    );
     let loaded = cx.update(|cx| runtime.load(PLUGIN_SOURCE.to_string(), cx));
     settle(cx);
     assert_eq!(
@@ -216,35 +222,95 @@ async fn test_script_renders_a_view_and_receives_input(cx: &mut TestAppContext) 
 }
 
 #[gpui::test]
-async fn test_reload_starts_clean(cx: &mut TestAppContext) {
-    let (host, runtime, _root) = setup(cx);
+async fn test_reload_starts_clean_and_replays_the_host(cx: &mut TestAppContext) {
+    let (host, runtime, root) = setup(cx);
     let surface = cx.new(Surface::new);
     let surface_ref = cx.update(|cx| host.share(&surface, cx));
     call_js!(runtime, cx, "mount", Mount { surface: surface_ref } => String).expect("mount");
+    call_js!(runtime, cx, "echo_ping", EchoPing { message: "before".into() } => String)
+        .expect("ping before reload");
     let first_view = surface
         .read_with(cx, |surface, _| surface.view().cloned())
         .expect("first view");
+    let click = MouseButtonEvent {
+        button: MouseButton::Left,
+        position: Point { x: 20., y: 20. },
+        modifiers: Modifiers::default(),
+        click_count: 1,
+    };
+    cx.update(|cx| {
+        first_view.resize(
+            Geometry {
+                width: 200.,
+                height: 100.,
+                scale_factor: 1.,
+            },
+            cx,
+        );
+    });
+    settle(cx);
+    cx.update(|cx| {
+        first_view.mouse(MouseEvent::Down(click.clone()), cx);
+        first_view.mouse(MouseEvent::Up(click), cx);
+    });
+    settle(cx);
+    assert_eq!(
+        call_js!(runtime, cx, "clicks", NoArgs {} => u32).expect("clicks"),
+        1
+    );
 
-    // Reloading evaluates the script in a fresh context: state resets and the old view's
-    // window is gone, so its object no longer answers.
+    // Reloading evaluates the script in a fresh context (script state resets) and
+    // replays every call the host made to the root, so the view the host mounted comes
+    // back on the same surface as a new object — without the host doing anything.
     let reloaded = cx.update(|cx| runtime.load(PLUGIN_SOURCE.to_string(), cx));
     settle(cx);
     assert_eq!(reloaded.await.expect("reload"), None);
     let clicks = call_js!(runtime, cx, "clicks", NoArgs {} => u32);
     assert_eq!(clicks.expect("clicks after reload"), 0);
-
-    // Mounting again attaches a new view to the same surface.
-    let surface_ref = cx.update(|cx| host.share(&surface, cx));
-    call_js!(runtime, cx, "mount", Mount { surface: surface_ref } => String).expect("remount");
     let second_view = surface
         .read_with(cx, |surface, _| surface.view().cloned())
-        .expect("second view");
+        .expect("the replayed mount attached a view");
     assert_ne!(
         first_view.reference().entity_id(),
         second_view.reference().entity_id()
     );
+    // The replayed ping reached the host too.
+    assert_eq!(root.read_with(cx, |root, _| root.pings), 2);
+    // Once the new view has geometry it draws: the slot is not blank after a reload.
+    cx.update(|cx| {
+        second_view.resize(
+            Geometry {
+                width: 200.,
+                height: 100.,
+                scale_factor: 1.,
+            },
+            cx,
+        );
+    });
+    settle(cx);
+    assert!(
+        surface.read_with(cx, |surface, _| surface.has_scene()),
+        "the replayed view rendered on the surface"
+    );
     let payload = decode::<String>(&encode(&"still decoding").expect("encode")).expect("decode");
     assert_eq!(payload, "still decoding");
+}
+
+#[gpui::test]
+async fn test_plugin_directory_is_the_plugin(cx: &mut TestAppContext) {
+    // A JS plugin is a directory with an index.js. The host mounts it and never says
+    // "JavaScript": no `load` call anywhere in this test.
+    let dir = std::env::temp_dir().join(format!("embedded_gpui_js_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp plugin dir");
+    std::fs::write(dir.join("index.js"), PLUGIN_SOURCE).expect("write index.js");
+    let (_host, runtime, _root) = setup_with_options(
+        PluginOptions::new(Arc::new(gpui::NoopTextSystem::new())).with_plugin_dir(&dir),
+        cx,
+    );
+    settle(cx);
+    let greeting = call_js!(runtime, cx, "greet", Greet { name: "directory".into() } => String);
+    assert_eq!(greeting.expect("greet"), "hello, directory");
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[gpui::test]

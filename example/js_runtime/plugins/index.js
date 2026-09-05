@@ -1,8 +1,10 @@
-// A plugin in JavaScript. The host loads this file into the js_runtime component and
-// then calls `show_button(surface)` on the plugin's root — the same call it makes on
-// the Rust demo plugin. Everything here is the object model: `host` is the host's
-// root, `host.counter()` returns a remote, remotes have promise-returning methods and
-// `observe`, and the UI is a tree of data handed to `view.render`.
+// A plugin in JavaScript. This directory is the plugin: the host mounts it for the
+// js_runtime component, which runs index.js (and reruns it when the file changes — edit
+// this while the demo is running). The host then calls `show_button(surface)` on the
+// plugin's root, exactly as it does on the Rust demo plugin; it never learns that the
+// answer comes from JavaScript. Everything here is the object model: `host` is the
+// host's root, `host.counter()` returns a remote, remotes have promise-returning methods
+// and `observe`, and the UI is a tree of data handed to `view.render`.
 
 plugin.root = {
   async show_button({ surface }) {

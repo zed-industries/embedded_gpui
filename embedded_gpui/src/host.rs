@@ -18,7 +18,9 @@ use futures::channel::mpsc;
 use gpui::{AppContext as _, Context, Entity, PlatformTextSystem, Task, px};
 use wasmtime::component::{Component, Linker};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
-use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime_wasi::{
+    DirPerms, FilePerms, ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView,
+};
 
 pub(crate) mod bindings {
     wasmtime::component::bindgen!({
@@ -273,6 +275,9 @@ impl Drop for PluginInstance {
 /// How often the engine's epoch advances; the granularity of the turn budget.
 const EPOCH_TICK: Duration = Duration::from_millis(10);
 
+/// Where [`PluginOptions::plugin_dir`] appears inside the guest.
+const PLUGIN_DIR_GUEST_PATH: &str = "/plugin";
+
 /// Grants extra WASI authority to a plugin's sandbox at instantiation.
 pub type ConfigureWasi = Box<dyn FnOnce(&mut WasiCtxBuilder) + Send>;
 
@@ -285,6 +290,10 @@ pub struct PluginOptions {
     /// inherited stdout/stderr; every additional authority (filesystem, network, env)
     /// is an explicit choice made here.
     pub configure_wasi: Option<ConfigureWasi>,
+    /// The plugin's own directory, mounted read-only at `/plugin` in the guest: where a
+    /// plugin keeps whatever it ships besides its component (assets, configuration,
+    /// scripts). What is in it is the plugin's business; the host only grants access.
+    pub plugin_dir: Option<std::path::PathBuf>,
     /// The most wall-clock time one guest turn (`init` or `tick`) may take. A guest
     /// that exceeds it traps and the instance stops; the host UI never waits on it
     /// either way, since turns run on a worker. Default: one second.
@@ -298,9 +307,16 @@ impl PluginOptions {
         Self {
             text_system,
             configure_wasi: None,
+            plugin_dir: None,
             turn_budget: Duration::from_secs(1),
             memory_limit: 512 << 20,
         }
+    }
+
+    /// Mount `dir` read-only at `/plugin` in the guest. See [`PluginOptions::plugin_dir`].
+    pub fn with_plugin_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.plugin_dir = Some(dir.into());
+        self
     }
 
     pub fn with_turn_budget(mut self, budget: Duration) -> Self {
@@ -357,6 +373,11 @@ impl PluginInstance {
 
         let mut wasi_builder = WasiCtxBuilder::new();
         wasi_builder.inherit_stdout().inherit_stderr();
+        if let Some(dir) = &options.plugin_dir {
+            wasi_builder
+                .preopened_dir(dir, PLUGIN_DIR_GUEST_PATH, DirPerms::READ, FilePerms::READ)
+                .with_context(|| format!("mounting plugin directory {}", dir.display()))?;
+        }
         if let Some(configure) = options.configure_wasi {
             configure(&mut wasi_builder);
         }

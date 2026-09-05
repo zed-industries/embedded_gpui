@@ -48,12 +48,15 @@ changes; nothing here is a supported API yet.
   `Attenuated` (allowlist), `Audited` (call ledger), and `Mirror` (a local,
   observable cache of remote state — snapshots as a library, not a protocol).
 - **Plugins in JavaScript** (`embedded_gpui_js`, an optional crate on top):
-  a QuickJS runtime that is itself a plugin. Scripts see the same object model — `host` is the host's
-  root, remotes are proxies with promise-returning methods and `observe`,
-  refs cross as `{"$ref": n}` so no schema is needed at runtime — and render
-  UI as a data tree that becomes GPUI elements on a host surface. Loading a
-  script is a method call, so hot reload is a second call. `typescript::
-  declarations` renders the Rust schemas as `.d.ts` for script authors.
+  a QuickJS runtime that is itself a plugin. A JS plugin is a directory with
+  an `index.js`; the host mounts the directory (a generic grant) and addresses
+  the plugin's root like any other — it never learns JavaScript is involved.
+  Scripts see the same object model — `host` is the host's root, remotes are
+  proxies with promise-returning methods and `observe`, refs cross as
+  `{"$ref": n}` so no schema is needed at runtime — and render UI as a data
+  tree that becomes GPUI elements on a host surface. Edit `index.js` and the
+  runtime reloads it, replaying the host's calls so views come back.
+  `typescript::declarations` renders the Rust schemas as `.d.ts` for authors.
 - **Resource limits**: a per-turn budget (wasmtime epoch deadline) and a memory
   cap on `PluginOptions`; a plugin that overruns stops and its in-flight calls
   fail instead of hanging.

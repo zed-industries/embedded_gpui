@@ -222,7 +222,7 @@ pub fn open_view<V: Render + 'static>(
     let view = cx.new(|cx| {
         let platform = platform.clone();
         cx.on_release(move |view: &mut GuestView, cx| {
-            platform.remove_window(surface_id);
+            platform.forget_window(surface_id, &view.window);
             view.handle
                 .update(cx, |_, window, _| window.remove_window())
                 .ok();

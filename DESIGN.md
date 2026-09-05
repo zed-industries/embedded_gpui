@@ -85,11 +85,17 @@ toolchain setup) and runs scripts against the same host objects a Rust plugin se
 The host's only knowledge of it is the tiny `JsRuntimeApi` schema — `load(source)` —
 and a host that never loads scripts never compiles a line of it.
 
-- **It is just a plugin.** The host loads it like any component and shares its root;
-  the runtime's own root answers `load(source)` and forwards every other method to the
-  script's `plugin.root`. Loading again is hot reload: the previous script's windows,
-  observers, and remotes are torn down and a fresh context starts. The sandbox is the
-  wasm boundary, not QuickJS: a bug in the engine cannot reach the host.
+- **It is just a plugin, and a plugin is a directory.** The host mounts the plugin's
+  directory read-only at `/plugin` (`PluginOptions::with_plugin_dir`, a grant any
+  plugin can use for assets) and shares its root; the runtime runs `/plugin/index.js`
+  and forwards every method on its root to the script's `plugin.root`. The host
+  addresses a JS plugin exactly as it addresses a Rust one and never learns which it
+  got. When `index.js` changes on disk the runtime tears the previous script's windows,
+  observers, and remotes down, starts a fresh context, and **replays every call the
+  host made to the root** — so the views the host mounted come back without the host
+  knowing anything happened. `load(source)` exists for tools and tests that push
+  scripts directly. The sandbox is the wasm boundary, not QuickJS: a bug in the engine
+  cannot reach the host.
 - **Remotes are proxies.** `host.counter()` returns a promise of a remote;
   `counter.increment({ by: 1 })` is `call("increment", { by: 1 })`; `observe` mirrors
   `cx.notify`. Object ids travel as strings (u64 does not fit a JS number). No schema
@@ -527,8 +533,11 @@ membrane at that edge only, Goblins objects appearing inside plugins as ordinary
 ## Known spike limitations (intentional)
 
 - The JS runtime keeps every remote a script has ever received connected until the
-  next `load`, and scripts cannot cancel observers; `load` tears the previous script's
-  views, observers, and remotes down and starts a fresh context.
+  next reload, and scripts cannot cancel observers. Reload replays the host's root
+  calls verbatim, which is right for mount-style calls and wrong for calls that were
+  meant to happen once; the runtime cannot tell them apart.
+- Reload is detected by polling the entry point's modification time twice a second;
+  WASI has no file watching.
 
 - No video `Surface` primitives; no gradient backgrounds (solid color fallback); no sprite
   transformation matrices (painted untransformed with a warning).

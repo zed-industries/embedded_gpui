@@ -44,7 +44,8 @@ Views are `SurfaceApi`/`ViewApi` objects; see `DESIGN.md`. What remains:
   before anything ships against it.
 - [x] **Bindings from the schema**: `Describe` gives `Interface::schema()` structural
   types and every named definition; `typescript::declarations` renders `.d.ts`.
-- [ ] **JS runtime, next steps** (`embedded_gpui_js`): `observe` cancellation; typed events
+- [ ] **JS runtime, next steps** (`embedded_gpui_js`): let a script opt out of replay
+  for one-shot root calls (or mark a method replayable); `observe` cancellation; typed events
   (`subscribe`) in the prelude; a `.d.ts` bundle emitted by the demo host next to
   `counter.js`; a richer element vocabulary (input, images, scroll) or, better, a
   generic `Styled` mapping; script errors surfaced to the host as `ErrorReport`s

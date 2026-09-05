@@ -638,6 +638,58 @@ async fn test_views_are_objects(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_reattaching_a_surface_replaces_its_view(cx: &mut TestAppContext) {
+    let host = setup(cx);
+    let surface = cx.new(Surface::new);
+    let root = cx.update(|cx| host.root::<TestPlugin>(cx));
+    let geometry = Geometry {
+        width: 200.,
+        height: 100.,
+        scale_factor: 1.,
+    };
+
+    let first = cx.update(|cx| root.mount(host.share(&surface, cx), cx));
+    settle(cx);
+    let first = first.await.expect("first mount");
+    let first_view = surface
+        .read_with(cx, |surface, _| surface.view().cloned())
+        .expect("first view");
+
+    // A second view attaches to the same surface: the surface drops its remote to the
+    // first, whose release must not take the second's window down with it.
+    let second = cx.update(|cx| root.mount(host.share(&surface, cx), cx));
+    settle(cx);
+    let second = second.await.expect("second mount");
+    cx.update(|cx| host.pump(cx));
+    settle(cx);
+    let second_view = surface
+        .read_with(cx, |surface, _| surface.view().cloned())
+        .expect("second view");
+    assert_ne!(
+        first_view.reference().entity_id(),
+        second_view.reference().entity_id()
+    );
+    cx.update(|cx| second_view.resize(geometry, cx));
+    settle(cx);
+    let seen = cx.update(|cx| second.last_geometry(cx));
+    settle(cx);
+    assert_eq!(seen.await.expect("geometry"), Some(geometry));
+    assert!(surface.read_with(cx, |surface, _| surface.has_scene()));
+
+    // Once nobody holds the first view (the surface let go on reattach, and so do we),
+    // it is released and its window closes.
+    drop(first_view);
+    cx.update(|cx| host.pump(cx));
+    settle(cx);
+    let first_alive = cx.update(|cx| first.view_alive(cx));
+    settle(cx);
+    assert!(
+        !first_alive.await.expect("alive"),
+        "the replaced view is gone"
+    );
+}
+
+#[gpui::test]
 async fn test_turn_budget_stops_a_runaway_plugin(cx: &mut TestAppContext) {
     let host = setup_with_options(
         PluginOptions::new(Arc::new(gpui::NoopTextSystem::new()))

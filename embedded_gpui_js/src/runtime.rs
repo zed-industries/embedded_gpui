@@ -9,6 +9,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::time::Duration;
 
 use crate::JsRuntimeApi;
 use anyhow::{Context as _, anyhow};
@@ -29,17 +30,78 @@ use serde::Deserialize;
 
 const PRELUDE: &str = include_str!("prelude.js");
 
+/// The script a JS plugin ships: the host mounts the plugin's directory at `/plugin`
+/// (`PluginOptions::with_plugin_dir`), and this is what the runtime runs from it.
+pub const ENTRY_POINT: &str = "/plugin/index.js";
+
+/// How often the runtime checks whether the entry point changed on disk.
+const WATCH_INTERVAL: Duration = Duration::from_millis(500);
+
 /// A ready-made plugin whose root is a [`JsRoot`]: the whole JavaScript runtime as one
 /// component. Register it with `embedded_gpui::register_plugin!(embedded_gpui_js::JsPlugin)`.
+///
+/// On start it runs [`ENTRY_POINT`] if the host mounted a plugin directory, and reloads
+/// it whenever the file changes — so a JS plugin is a directory with an `index.js`, and
+/// the host never learns that JavaScript is involved. Without a plugin directory the
+/// runtime waits for `load(source)` instead.
 pub struct JsPlugin {
-    _root: Entity<JsRoot>,
+    root: Entity<JsRoot>,
+    _watcher: Option<Task<()>>,
 }
 
 impl Plugin for JsPlugin {
     fn new(cx: &mut App) -> Self {
         let root = cx.new(|_| JsRoot::new());
         share_root(&root, cx);
-        Self { _root: root }
+        let watcher = match std::fs::metadata(ENTRY_POINT) {
+            Ok(_) => Some(Self::run_from_disk(root.clone(), cx)),
+            Err(_) => {
+                log::info!("embedded_gpui_js: no {ENTRY_POINT}; waiting for load()");
+                None
+            }
+        };
+        Self {
+            root,
+            _watcher: watcher,
+        }
+    }
+}
+
+impl JsPlugin {
+    /// The root, for plugins that embed the runtime and want to load scripts themselves.
+    pub fn root(&self) -> &Entity<JsRoot> {
+        &self.root
+    }
+
+    /// Run the entry point now, then poll its modification time and rerun on change.
+    fn run_from_disk(root: Entity<JsRoot>, cx: &mut App) -> Task<()> {
+        let mut last_modified = Self::load_entry_point(&root, cx);
+        cx.spawn(async move |cx| {
+            loop {
+                cx.background_executor().timer(WATCH_INTERVAL).await;
+                let modified = std::fs::metadata(ENTRY_POINT)
+                    .and_then(|metadata| metadata.modified())
+                    .ok();
+                if modified.is_some() && modified != last_modified {
+                    cx.update(|cx| last_modified = Self::load_entry_point(&root, cx));
+                }
+            }
+        })
+    }
+
+    fn load_entry_point(root: &Entity<JsRoot>, cx: &mut App) -> Option<std::time::SystemTime> {
+        let modified = std::fs::metadata(ENTRY_POINT)
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        match std::fs::read_to_string(ENTRY_POINT) {
+            Ok(source) => {
+                if let Some(error) = root.update(cx, |root, cx| root.load(source, cx)) {
+                    log::error!("embedded_gpui_js: {ENTRY_POINT} failed to load: {error}");
+                }
+            }
+            Err(error) => log::error!("embedded_gpui_js: reading {ENTRY_POINT}: {error}"),
+        }
+        modified
     }
 }
 
@@ -70,15 +132,25 @@ impl Default for JsRoot {
 impl JsRoot {
     /// Evaluate a script in a fresh context. Whatever the previous script built —
     /// views, observers, the remotes it held — is torn down first, so a reload is a
-    /// clean start rather than a second layer.
-    fn load(&mut self, source: String, cx: &mut Context<Self>) -> Option<String> {
+    /// clean start rather than a second layer. Every call the host has made to this
+    /// root is then replayed to the new script, in order, so the views the host mounted
+    /// come back without the host knowing anything changed. Returns the error message
+    /// on failure.
+    pub fn load(&mut self, source: String, cx: &mut Context<Self>) -> Option<String> {
         JsState::reset(cx);
-        run_js(cx, |ctx| {
+        let evaluated = run_js(cx, |ctx| {
             ctx.eval::<(), _>(source.as_bytes())
                 .catch(ctx)
                 .map_err(|error| error.to_string())
-        })
-        .err()
+        });
+        if let Err(error) = evaluated {
+            return Some(error);
+        }
+        let history = JsState::with(|state| state.history.clone());
+        for (method, payload) in history {
+            dispatch(&method, &payload, cx).detach();
+        }
+        None
     }
 }
 
@@ -92,8 +164,14 @@ impl Shared<JsRuntimeApi> for JsRoot {
     }
 }
 
-/// Hand a host call to `plugin.root[method]` and resolve when the script answers.
+/// Hand a host call to `plugin.root[method]` and resolve when the script answers. The
+/// call is remembered for replay on reload.
 fn dispatch_to_js(method: &str, payload: &Payload, cx: &mut App) -> Task<anyhow::Result<Payload>> {
+    JsState::with(|state| state.history.push((method.to_string(), payload.clone())));
+    dispatch(method, payload, cx)
+}
+
+fn dispatch(method: &str, payload: &Payload, cx: &mut App) -> Task<anyhow::Result<Payload>> {
     let (sender, receiver) = oneshot::channel();
     let request = JsState::with(|state| {
         state.next_request += 1;
@@ -166,6 +244,9 @@ struct JsState {
     pending: HashMap<u64, oneshot::Sender<Result<Payload, String>>>,
     next_request: u64,
     next_view: u32,
+    /// Every call the host made to the root, in order: what a reloaded script is
+    /// replayed. Survives `reset`, since it is about the host, not the script.
+    history: Vec<(String, Payload)>,
 }
 
 thread_local! {
@@ -174,6 +255,10 @@ thread_local! {
 
 impl JsState {
     fn install() {
+        Self::install_with(Vec::new());
+    }
+
+    fn install_with(history: Vec<(String, Payload)>) {
         let runtime = Runtime::new().expect("quickjs runtime");
         let context = rquickjs::Context::full(&runtime).expect("quickjs context");
         context.with(|ctx| {
@@ -193,6 +278,7 @@ impl JsState {
                 pending: HashMap::new(),
                 next_request: 0,
                 next_view: 0,
+                history,
             })
         });
     }
@@ -207,6 +293,7 @@ impl JsState {
     /// old script never answered fail.
     fn reset(cx: &mut App) {
         let previous = STATE.with(|slot| slot.borrow_mut().take());
+        let mut history = Vec::new();
         if let Some(previous) = previous {
             for (handle, _) in previous.views.into_values() {
                 handle
@@ -218,8 +305,9 @@ impl JsState {
             }
             drop(previous.subscriptions);
             drop(previous.remotes);
+            history = previous.history;
         }
-        Self::install();
+        Self::install_with(history);
     }
 
     fn push(op: Op) {

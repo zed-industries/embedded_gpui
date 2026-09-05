@@ -17,6 +17,12 @@
 //! embedded_gpui::register_plugin!(embedded_gpui_js::JsPlugin);
 //! ```
 //!
+//! A JS plugin is then a directory with an `index.js`: the host mounts it with
+//! `PluginOptions::with_plugin_dir` (a generic grant, not a JavaScript one), the runtime
+//! runs `/plugin/index.js` and reloads it when it changes, and the host addresses the
+//! plugin's root exactly as it would a Rust plugin's. `load(source)` remains for tools
+//! and tests that push scripts directly.
+//!
 //! Scripts see the object model directly: `host` is the host's root, remotes are proxies
 //! whose methods return promises (`counter.increment({ by: 1 })`) and which `observe`
 //! the home's notifies, refs cross as `{"$ref": n}` so no schema is consulted at
@@ -32,7 +38,7 @@ pub mod typescript;
 #[cfg(target_arch = "wasm32")]
 mod runtime;
 #[cfg(target_arch = "wasm32")]
-pub use runtime::{JsPlugin, JsRoot};
+pub use runtime::{ENTRY_POINT, JsPlugin, JsRoot};
 
 /// The root interface of a JS runtime component: how a host loads JavaScript into it.
 /// Every other method on that root is answered by the script itself

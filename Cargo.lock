@@ -2000,7 +2000,6 @@ name = "example_host"
 version = "0.1.0"
 dependencies = [
  "embedded_gpui",
- "embedded_gpui_js",
  "embedded_gpui_util",
  "env_logger",
  "example_schema",

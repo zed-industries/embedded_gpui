@@ -67,10 +67,17 @@ impl PluginPlatform {
         self.windows.borrow().get(&surface).cloned()
     }
 
-    /// Forget the window drawing on `surface`; the GPUI window itself is closed by the
-    /// caller.
-    pub fn remove_window(&self, surface: u64) -> Option<Rc<PluginWindowState>> {
-        self.windows.borrow_mut().remove(&surface)
+    /// Forget `window` if it is still the one drawing on `surface`; a newer window may
+    /// have taken the surface over (a reattach), in which case it is left alone. The
+    /// GPUI window itself is closed by the caller.
+    pub fn forget_window(&self, surface: u64, window: &Rc<PluginWindowState>) {
+        let mut windows = self.windows.borrow_mut();
+        if windows
+            .get(&surface)
+            .is_some_and(|current| Rc::ptr_eq(current, window))
+        {
+            windows.remove(&surface);
+        }
     }
 
     /// The live windows; states whose GPUI window has been removed are forgotten here.

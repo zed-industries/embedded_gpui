@@ -1,7 +1,5 @@
-use crate::wit;
 use gpui::{PlatformDispatcher, Priority, RunnableVariant};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -13,30 +11,17 @@ struct DispatcherState {
 
 /// A single-threaded scheduler that is pumped by the host through the `tick` export.
 ///
-/// The guest never blocks; instead it queues work locally and asks the host for a wakeup via
-/// the `request-tick` import. `run_until_idle` drains the queues and is driven from `tick`.
+/// The guest never blocks: all work is queued locally, every guest turn drains the queues
+/// (`run_until_idle`), and the turn reports the earliest remaining timer as the wakeup the
+/// host should schedule. Nothing runs outside a turn, so no other wakeup path is needed.
 pub struct PluginDispatcher {
     state: Mutex<DispatcherState>,
-    wakeups_suppressed: AtomicBool,
 }
 
 impl PluginDispatcher {
     pub fn new() -> Self {
         Self {
             state: Mutex::new(DispatcherState::default()),
-            wakeups_suppressed: AtomicBool::new(false),
-        }
-    }
-
-    /// While suppressed, dispatches don't ask the host for a wakeup. `pump` drains everything
-    /// queued during the current host call anyway, so a wakeup would only cause a no-op tick.
-    pub fn set_wakeups_suppressed(&self, suppressed: bool) {
-        self.wakeups_suppressed.store(suppressed, Ordering::Relaxed);
-    }
-
-    fn request_wakeup(&self, delay_ms: u32) {
-        if !self.wakeups_suppressed.load(Ordering::Relaxed) {
-            wit::request_tick(delay_ms);
         }
     }
 
@@ -101,19 +86,15 @@ impl PlatformDispatcher for PluginDispatcher {
 
     fn dispatch(&self, runnable: RunnableVariant, _priority: Priority) {
         self.lock().runnables.push_back(runnable);
-        self.request_wakeup(0);
     }
 
     fn dispatch_on_main_thread(&self, runnable: RunnableVariant, _priority: Priority) {
         self.lock().runnables.push_back(runnable);
-        self.request_wakeup(0);
     }
 
     fn dispatch_after(&self, duration: Duration, runnable: RunnableVariant) {
         let deadline = Instant::now() + duration;
         self.lock().timers.push((deadline, runnable));
-        let millis = duration.as_millis().min(u32::MAX as u128) as u32;
-        self.request_wakeup(millis);
     }
 
     fn spawn_realtime(&self, function: Box<dyn FnOnce() + Send>) {

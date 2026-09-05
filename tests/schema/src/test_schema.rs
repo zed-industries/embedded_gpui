@@ -4,6 +4,7 @@
 //! id 0, and every other capability below is reached by calling root methods that
 //! return refs.
 
+use embedded_gpui::surface::{Geometry, SurfaceApi};
 use embedded_gpui::{Ref, data, interface};
 
 /// The plugin's root object: the host's entire view of the plugin. The methods create
@@ -18,6 +19,26 @@ pub trait TestPlugin {
     /// Calls `ping` on the host's root and relays the reply: the bootstrap exercised
     /// in the other direction, from inside a handler.
     async fn ping_host(&mut self, message: String, cx: &mut gpui::Context<Self>) -> String;
+
+    /// Open a view on a host surface and return a probe into it: views are objects, so
+    /// the whole UI path is exercised as ordinary method calls.
+    fn mount(
+        &mut self,
+        surface: Ref<SurfaceApi>,
+        cx: &mut gpui::Context<Self>,
+    ) -> Ref<ViewProbeApi>;
+}
+
+/// What the plugin observed of a mounted view.
+#[interface]
+pub trait ViewProbeApi {
+    /// The geometry the host last pushed, if any.
+    fn last_geometry(&mut self, cx: &mut gpui::Context<Self>) -> Option<Geometry>;
+    /// Mouse-down events the view's root element received.
+    fn clicks(&mut self, cx: &mut gpui::Context<Self>) -> u32;
+    /// Whether the window's root view still exists (it dies when the host drops the
+    /// surface and the view is released).
+    fn view_alive(&mut self, cx: &mut gpui::Context<Self>) -> bool;
 }
 
 /// The host's root object: everything this suite's plugin can reach on the host.
@@ -62,6 +83,15 @@ pub trait FactoryApi {
 #[interface]
 pub trait VaultApi {
     async fn read(&mut self, cx: &mut gpui::Context<Self>) -> String;
+
+    /// A capability the vault hands out: through a membrane, the returned ref is itself
+    /// wrapped, so revoking the membrane revokes the key too.
+    fn key(&mut self, cx: &mut gpui::Context<Self>) -> Ref<KeyApi>;
+}
+
+#[interface]
+pub trait KeyApi {
+    fn unlock(&mut self, cx: &mut gpui::Context<Self>) -> String;
 }
 
 #[interface]

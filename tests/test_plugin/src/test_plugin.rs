@@ -3,15 +3,19 @@
 //! attenuation, and fully dynamic dispatch.
 
 use anyhow::anyhow;
+use embedded_gpui::surface::{Geometry, SurfaceApi};
 use embedded_gpui::{
-    Plugin, Ref, Remote, connect, decode, encode, register_plugin, root, share, share_root,
-    share_with, shared,
+    Payload, Plugin, Ref, Remote, decode, encode, open_view, register_plugin, root, share,
+    share_root, share_with, shared,
 };
 use embedded_gpui_util::Revocable;
-use gpui::{AnyView, App, Context, Entity, EventEmitter, Task, Window, div, prelude::*};
+use gpui::{
+    App, Context, Entity, EventEmitter, MouseDownEvent, Task, WeakEntity, Window, div, prelude::*,
+    rgb,
+};
 use test_schema::{
     ChameleonApi, ChameleonState, CounterMilestone, FactoryApi, GatekeeperApi, ItemApi, ItemInfo,
-    TestCounterApi, TestHost, TestHostCaller as _, TestPlugin, VaultApi,
+    TestCounterApi, TestHost, TestHostCaller as _, TestPlugin, VaultApi, ViewProbeApi,
 };
 
 /// The plugin's whole bootstrap: construct the root object and install it at this end's
@@ -29,13 +33,10 @@ impl Plugin for TestGuest {
             factory: None,
             gatekeeper: None,
             chameleon: None,
+            probes: Vec::new(),
         });
         share_root(&root, cx);
         TestGuest { _root: root }
-    }
-
-    fn create_view(&mut self, _name: &str, _window: &mut Window, cx: &mut App) -> AnyView {
-        cx.new(|_| EmptyView).into()
     }
 }
 
@@ -50,43 +51,45 @@ struct Root {
     factory: Option<(Entity<Factory>, Ref<FactoryApi>)>,
     gatekeeper: Option<(Entity<Gatekeeper>, Ref<GatekeeperApi>)>,
     chameleon: Option<(Entity<Chameleon>, Ref<ChameleonApi>)>,
+    /// Probes for every view mounted so far; the root owns them so their refs stay valid.
+    probes: Vec<Entity<ViewProbe>>,
 }
 
 #[shared]
 impl TestPlugin for Root {
     fn counter(&mut self, cx: &mut Context<Self>) -> Ref<TestCounterApi> {
         if let Some((_, reference)) = &self.counter {
-            return *reference;
+            return reference.clone();
         }
         let counter = cx.new(|_| Counter { count: 0 });
         let reference = share(&counter, cx);
-        self.counter = Some((counter, reference));
+        self.counter = Some((counter, reference.clone()));
         reference
     }
 
     fn factory(&mut self, cx: &mut Context<Self>) -> Ref<FactoryApi> {
         if let Some((_, reference)) = &self.factory {
-            return *reference;
+            return reference.clone();
         }
         let factory = cx.new(|_| Factory { created: 0 });
         let reference = share(&factory, cx);
-        self.factory = Some((factory, reference));
+        self.factory = Some((factory, reference.clone()));
         reference
     }
 
     fn gatekeeper(&mut self, cx: &mut Context<Self>) -> Ref<GatekeeperApi> {
         if let Some((_, reference)) = &self.gatekeeper {
-            return *reference;
+            return reference.clone();
         }
         let gatekeeper = cx.new(|_| Gatekeeper { guarded: 0 });
         let reference = share(&gatekeeper, cx);
-        self.gatekeeper = Some((gatekeeper, reference));
+        self.gatekeeper = Some((gatekeeper, reference.clone()));
         reference
     }
 
     fn chameleon(&mut self, cx: &mut Context<Self>) -> Ref<ChameleonApi> {
         if let Some((_, reference)) = &self.chameleon {
-            return *reference;
+            return reference.clone();
         }
         let chameleon = cx.new(|_| Chameleon {
             mode: "echo".to_string(),
@@ -126,7 +129,7 @@ impl TestPlugin for Root {
             },
             cx,
         );
-        self.chameleon = Some((chameleon, reference));
+        self.chameleon = Some((chameleon, reference.clone()));
         reference
     }
 
@@ -140,13 +143,77 @@ impl TestPlugin for Root {
         let receipt = self.host.ping(message, cx);
         cx.spawn(async move |_, _| receipt.await)
     }
+
+    fn mount(&mut self, surface: Ref<SurfaceApi>, cx: &mut Context<Self>) -> Ref<ViewProbeApi> {
+        let probe = cx.new(|_| ViewProbe { view: None });
+        let weak_probe = probe.downgrade();
+        let opened = open_view(surface, cx, |_, cx| {
+            let view = cx.new(|_| ProbeView {
+                geometry: None,
+                clicks: 0,
+            });
+            weak_probe
+                .update(cx, |probe, _| probe.view = Some(view.downgrade()))
+                .ok();
+            view
+        });
+        if let Err(error) = opened {
+            embedded_gpui::log::error!("test_plugin: open_view failed: {error:#}");
+        }
+        let reference = share(&probe, cx);
+        self.probes.push(probe);
+        reference
+    }
 }
 
-struct EmptyView;
+/// The root view of a mounted window: records what the host drives it with.
+struct ProbeView {
+    geometry: Option<Geometry>,
+    clicks: u32,
+}
 
-impl Render for EmptyView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+impl Render for ProbeView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let size = window.viewport_size();
+        self.geometry = Some(Geometry {
+            width: f32::from(size.width),
+            height: f32::from(size.height),
+            scale_factor: window.scale_factor(),
+        });
+        div().size_full().bg(rgb(0x336699)).on_mouse_down(
+            gpui::MouseButton::Left,
+            cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                this.clicks += 1;
+                cx.notify();
+            }),
+        )
+    }
+}
+
+/// Plugin-homed and root-owned, so it outlives the window it reports on.
+struct ViewProbe {
+    view: Option<WeakEntity<ProbeView>>,
+}
+
+#[shared]
+impl ViewProbeApi for ViewProbe {
+    fn last_geometry(&mut self, cx: &mut Context<Self>) -> Option<Geometry> {
+        let view = self.view.as_ref()?.upgrade()?;
+        view.read(cx).geometry
+    }
+
+    fn clicks(&mut self, cx: &mut Context<Self>) -> u32 {
+        self.view
+            .as_ref()
+            .and_then(|view| view.upgrade())
+            .map(|view| view.read(cx).clicks)
+            .unwrap_or(0)
+    }
+
+    fn view_alive(&mut self, _cx: &mut Context<Self>) -> bool {
+        self.view
+            .as_ref()
+            .is_some_and(|view| view.upgrade().is_some())
     }
 }
 
@@ -220,7 +287,7 @@ impl GatekeeperApi for Gatekeeper {
         // The membrane is the stock caretaker from embedded_gpui_util: every method
         // forwards to the wrapped vault capability, and revoking drops the inner remote
         // (auto-release cascades to the vault's home).
-        let vault = connect(vault);
+        let vault = vault.connect();
         let revocable = Revocable::new(vault, cx);
         share_with(
             &revocable,
@@ -244,12 +311,12 @@ impl GatekeeperApi for Gatekeeper {
         payload: Vec<u8>,
         cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<Vec<u8>>> {
-        let remote = connect(target);
-        let receipt = remote.call_raw(&method, payload, cx);
+        let remote = target.connect();
+        let receipt = remote.call_raw(&method, Payload::from_parts(payload, Vec::new()), cx);
         cx.spawn(async move |_, _| {
             let outcome = receipt.await;
             drop(remote);
-            outcome
+            outcome.map(|payload| payload.bytes)
         })
     }
 }

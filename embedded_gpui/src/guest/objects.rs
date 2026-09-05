@@ -1,62 +1,73 @@
 //! Guest-side boundary for the object registry: a thread-local [`Objects`] whose sink is
-//! the WIT imports, plus free-function wrappers. The object model itself lives in
-//! `registry` and is identical on both ends; this file only moves bytes.
+//! the outbound frame queue of the current turn, plus free-function wrappers. The object
+//! model itself lives in `registry` and is identical on both ends; this file only moves
+//! frames.
 
-use crate::registry::{Objects, WireCall, WireMessage, WireOutgoing, WireResponse};
+use std::cell::RefCell;
+
+use crate::registry::{Call, Frame, Objects, Response};
 use crate::wit;
-use embedded_gpui::{Interface, Methods, Ref, Remote, Shared};
-use gpui::{App, AsyncApp, Entity};
+use embedded_gpui::{Interface, Methods, Payload, Ref, Registry, Remote, Shared};
+use gpui::{App, Entity};
 
 thread_local! {
-    static OBJECTS: Objects = Objects::new(Box::new(deliver_outgoing));
+    static OBJECTS: Objects = Objects::new(Box::new(|frame| {
+        OUTBOUND.with(|outbound| outbound.borrow_mut().push(frame_to_wire(frame)))
+    }));
+    /// Frames toward the host, collected until the turn returns.
+    static OUTBOUND: RefCell<Vec<wit::Frame>> = const { RefCell::new(Vec::new()) };
+    /// Display lists toward the host, collected until the turn returns.
+    static SCENES: RefCell<Vec<wit::Scene>> = const { RefCell::new(Vec::new()) };
 }
 
-fn deliver_outgoing(outgoing: WireOutgoing) {
-    match outgoing {
-        WireOutgoing::Message(message) => wit::send_object_message(&message_to_wire(message)),
-        WireOutgoing::Response(response) => wit::send_object_response(&wit::ObjectResponse {
-            request_id: response.request_id,
-            outcome: response.outcome,
-        }),
-    }
-}
-
-/// Registry frames -> wit-bindgen wire variants, and back. Purely structural.
-fn message_to_wire(message: WireMessage) -> wit::ObjectMessage {
-    match message {
-        WireMessage::Call(call) => wit::ObjectMessage::Call(wit::ObjectCall {
-            entity_id: call.entity_id,
-            request_id: call.request_id,
+/// Registry frames -> wit-bindgen wire records, and back. Purely structural.
+fn frame_to_wire(frame: Frame) -> wit::Frame {
+    match frame {
+        Frame::Call(call) => wit::Frame::Call(wit::Call {
+            target: call.target,
+            request: call.request,
             method: call.method,
-            payload: call.payload,
+            payload: call.payload.bytes,
+            refs: call.payload.refs,
         }),
-        WireMessage::Subscribe {
-            entity_id,
-            observer_id,
-        } => wit::ObjectMessage::Subscribe(wit::ObjectSubscribe {
-            entity_id,
-            observer_id,
-        }),
-        WireMessage::Release { entity_id } => {
-            wit::ObjectMessage::Release(wit::ObjectRelease { entity_id })
+        Frame::Response(response) => {
+            let (outcome, refs) = match response.outcome {
+                Ok(payload) => (Ok(payload.bytes), payload.refs),
+                Err(error) => (Err(error), Vec::new()),
+            };
+            wit::Frame::Response(wit::Response {
+                request: response.request,
+                outcome,
+                refs,
+            })
         }
+        Frame::Subscribe { target, observer } => {
+            wit::Frame::Subscribe(wit::Subscribe { target, observer })
+        }
+        Frame::Release { target } => wit::Frame::Release(wit::Release { target }),
     }
 }
 
-fn message_from_wire(message: wit::ObjectMessage) -> WireMessage {
-    match message {
-        wit::ObjectMessage::Call(call) => WireMessage::Call(WireCall {
-            entity_id: call.entity_id,
-            request_id: call.request_id,
+fn frame_from_wire(frame: wit::Frame) -> Frame {
+    match frame {
+        wit::Frame::Call(call) => Frame::Call(Call {
+            target: call.target,
+            request: call.request,
             method: call.method,
-            payload: call.payload,
+            payload: Payload::from_parts(call.payload, call.refs),
         }),
-        wit::ObjectMessage::Subscribe(subscribe) => WireMessage::Subscribe {
-            entity_id: subscribe.entity_id,
-            observer_id: subscribe.observer_id,
+        wit::Frame::Response(response) => Frame::Response(Response {
+            request: response.request,
+            outcome: response
+                .outcome
+                .map(|bytes| Payload::from_parts(bytes, response.refs)),
+        }),
+        wit::Frame::Subscribe(subscribe) => Frame::Subscribe {
+            target: subscribe.target,
+            observer: subscribe.observer,
         },
-        wit::ObjectMessage::Release(release) => WireMessage::Release {
-            entity_id: release.entity_id,
+        wit::Frame::Release(release) => Frame::Release {
+            target: release.target,
         },
     }
 }
@@ -65,7 +76,12 @@ fn objects() -> Objects {
     OBJECTS.with(|objects| objects.clone())
 }
 
-/// Install `entity` as this end's root object (its id 0): the single capability the
+/// This end's registry, for sharing and connecting from anywhere.
+pub fn registry() -> Registry {
+    Registry::new(objects().downgrade())
+}
+
+/// Install `entity` as this end's root object (address 0): the single capability the
 /// other end starts from, whose typed methods return everything else. Call it from
 /// [`Plugin::new`](crate::Plugin::new). Root traffic that arrived first is queued and
 /// delivered in order once the root exists.
@@ -110,27 +126,30 @@ pub fn root<S: Interface>() -> Remote<S> {
     objects().root()
 }
 
-/// Attach to an entity through a capability reference received in a payload. Connecting
-/// the same ref twice returns a handle to the same projection; when the last clone
-/// drops, the home end is told to release the entity.
-pub fn connect<S: Interface>(reference: Ref<S>) -> Remote<S> {
-    objects().connect(reference)
-}
-
 /// Flush queued capability releases; called from the guest's pump so drops become
 /// observable to the other end promptly.
 pub(crate) fn drain_releases() {
     objects().drain_releases();
 }
 
-pub(crate) fn message_delivered(message: wit::ObjectMessage, cx: &mut AsyncApp) {
+/// Apply one turn's inbound frames, in order.
+pub(crate) fn deliver(inbound: Vec<wit::Frame>, cx: &mut App) {
     let objects = objects();
-    cx.update(|cx| objects.deliver_message(message_from_wire(message), cx));
+    for frame in inbound {
+        objects.deliver(frame_from_wire(frame), cx);
+    }
 }
 
-pub(crate) fn response_delivered(response: wit::ObjectResponse) {
-    objects().deliver_response(WireResponse {
-        request_id: response.request_id,
-        outcome: response.outcome,
-    });
+/// Queue a rendered display list for the host.
+pub(crate) fn push_scene(surface: u64, list: wit::DisplayList) {
+    SCENES.with(|scenes| scenes.borrow_mut().push(wit::Scene { surface, list }));
+}
+
+/// Everything queued since the last turn, as the `tick` export returns it.
+pub(crate) fn take_turn(wake_after_ms: Option<u32>) -> wit::Turn {
+    wit::Turn {
+        frames: OUTBOUND.with(|outbound| std::mem::take(&mut *outbound.borrow_mut())),
+        scenes: SCENES.with(|scenes| std::mem::take(&mut *scenes.borrow_mut())),
+        wake_after_ms,
+    }
 }

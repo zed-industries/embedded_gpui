@@ -1,7 +1,6 @@
-//! Host side of the "GPUI embedded in GPUI" spike. See `DESIGN.md` for the architecture and
-//! `wit/plugin.wit` for the wire protocol. This crate compiles a `wasm32-wasip2` guest
-//! component that renders a GPUI UI, and replays its retained display lists inside a native
-//! GPUI application.
+//! Host side: wasmtime glue, the request/turn transport, and the [`Surface`] entity that
+//! replays guest display lists. See `DESIGN.md` for the architecture and
+//! `wit/plugin.wit` for the wire protocol.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -10,12 +9,12 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::registry::{Objects, WireCall, WireMessage, WireOutgoing, WireResponse};
-use crate::{Interface, Methods, Ref, Remote, Shared};
+use crate::registry::{Call, Frame, Objects, Response};
+use crate::{Interface, Methods, Payload, Ref, Registry, Remote, Shared};
 use anyhow::{Context as _, Result};
 use futures::StreamExt as _;
 use futures::channel::mpsc;
-use gpui::{AppContext as _, Context, Entity, Pixels, PlatformTextSystem, Size, Task, px};
+use gpui::{AppContext as _, Context, Entity, PlatformTextSystem, Task, px};
 use wasmtime::component::{Component, Linker};
 use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
@@ -29,33 +28,16 @@ pub(crate) mod bindings {
 
 use bindings::{Plugin, PluginImports};
 
-mod plugin_element;
+mod surface;
 
-pub use plugin_element::PluginViewState;
+pub use surface::Surface;
 
-/// Effects drained from the guest after each call into it. The host acts on these once the
-/// guest call has returned, never re-entering wasm from within a host import (see DESIGN.md
-/// invariant 3).
-#[derive(Default)]
-pub struct PendingEffects {
-    pub scene_updates: Vec<(u32, bindings::DisplayList)>,
-    pub tick_delay_ms: Option<u32>,
-    pub cursor_style: Option<gpui::CursorStyle>,
-    pub messages: Vec<bindings::ObjectMessage>,
-    pub responses: Vec<bindings::ObjectResponse>,
-}
-
-/// Alias used for the value returned from the `PluginInstance` methods after they drain the
-/// pending effects.
-pub type Effects = PendingEffects;
-
-/// The data carried on the wasmtime `Store`. Host imports only mutate `pending`; the host
-/// drains it after each guest call returns.
+/// The data carried on the wasmtime `Store`: the WASI sandbox and the text system the
+/// synchronous shaping imports answer from.
 struct HostState {
     wasi: WasiCtx,
     table: ResourceTable,
     text_system: Arc<dyn PlatformTextSystem>,
-    pending: PendingEffects,
 }
 
 impl WasiView for HostState {
@@ -223,29 +205,6 @@ impl PluginImports for HostState {
             }
         }
     }
-
-    fn request_tick(&mut self, delay_ms: u32) {
-        self.pending.tick_delay_ms = Some(match self.pending.tick_delay_ms {
-            Some(existing) => existing.min(delay_ms),
-            None => delay_ms,
-        });
-    }
-
-    fn update_scene(&mut self, view_id: u32, list: bindings::DisplayList) {
-        self.pending.scene_updates.push((view_id, list));
-    }
-
-    fn send_object_message(&mut self, message: bindings::ObjectMessage) {
-        self.pending.messages.push(message);
-    }
-
-    fn send_object_response(&mut self, response: bindings::ObjectResponse) {
-        self.pending.responses.push(response);
-    }
-
-    fn set_cursor_style(&mut self, style: bindings::CursorStyle) {
-        self.pending.cursor_style = Some(cursor_style_from_wire(style));
-    }
 }
 
 fn bounds_from_f32(bounds: gpui::Bounds<f32>) -> bindings::Bounds {
@@ -291,22 +250,8 @@ fn convert_line_layout(layout: &gpui::LineLayout) -> bindings::LineLayout {
     }
 }
 
-fn cursor_style_from_wire(style: bindings::CursorStyle) -> gpui::CursorStyle {
-    match style {
-        bindings::CursorStyle::Arrow => gpui::CursorStyle::Arrow,
-        bindings::CursorStyle::Ibeam => gpui::CursorStyle::IBeam,
-        bindings::CursorStyle::Crosshair => gpui::CursorStyle::Crosshair,
-        bindings::CursorStyle::ClosedHand => gpui::CursorStyle::ClosedHand,
-        bindings::CursorStyle::OpenHand => gpui::CursorStyle::OpenHand,
-        bindings::CursorStyle::PointingHand => gpui::CursorStyle::PointingHand,
-        bindings::CursorStyle::ResizeLeftRight => gpui::CursorStyle::ResizeLeftRight,
-        bindings::CursorStyle::ResizeUpDown => gpui::CursorStyle::ResizeUpDown,
-        bindings::CursorStyle::OperationNotAllowed => gpui::CursorStyle::OperationNotAllowed,
-    }
-}
-
-/// A synchronous wasmtime store plus its instantiated bindings. Each method calls a guest
-/// export and then drains and returns the effects the guest queued during that call.
+/// A synchronous wasmtime store plus its instantiated bindings: the two exports, `init`
+/// and `tick`, are the whole runtime surface.
 pub struct PluginInstance {
     store: Store<HostState>,
     bindings: Plugin,
@@ -368,7 +313,6 @@ impl PluginInstance {
             wasi,
             table: ResourceTable::new(),
             text_system: options.text_system,
-            pending: PendingEffects::default(),
         };
         let mut store = Store::new(&engine, state);
         let bindings = Plugin::instantiate(&mut store, &component, &linker)
@@ -377,181 +321,91 @@ impl PluginInstance {
         Ok(Self { store, bindings })
     }
 
-    fn take_effects(&mut self) -> Effects {
-        std::mem::take(&mut self.store.data_mut().pending)
+    /// Run `Plugin::new` in the guest, then collect what it queued with an empty tick.
+    pub fn init(&mut self) -> Result<bindings::Turn> {
+        self.bindings.call_init(&mut self.store)?;
+        self.tick(Vec::new())
     }
 
-    pub fn init(&mut self) -> Result<Effects> {
-        self.bindings.call_init_plugin(&mut self.store)?;
-        Ok(self.take_effects())
-    }
-
-    pub fn create_view(
-        &mut self,
-        view_id: u32,
-        name: &str,
-        size: Size<Pixels>,
-        scale: f32,
-    ) -> Result<Effects> {
-        let extent = extent_from_size(size);
-        self.bindings
-            .call_create_view(&mut self.store, view_id, name, extent, scale)?;
-        Ok(self.take_effects())
-    }
-
-    pub fn resize_view(&mut self, view_id: u32, size: Size<Pixels>, scale: f32) -> Result<Effects> {
-        let extent = extent_from_size(size);
-        self.bindings
-            .call_resize_view(&mut self.store, view_id, extent, scale)?;
-        Ok(self.take_effects())
-    }
-
-    pub fn handle_mouse(&mut self, view_id: u32, event: bindings::MouseEvent) -> Result<Effects> {
-        self.bindings
-            .call_handle_mouse(&mut self.store, view_id, event)?;
-        Ok(self.take_effects())
-    }
-
-    pub fn handle_key(&mut self, view_id: u32, event: bindings::KeyEvent) -> Result<Effects> {
-        self.bindings
-            .call_handle_key(&mut self.store, view_id, &event)?;
-        Ok(self.take_effects())
-    }
-
-    pub fn tick(&mut self) -> Result<Effects> {
-        self.bindings.call_tick(&mut self.store)?;
-        Ok(self.take_effects())
-    }
-
-    pub fn deliver_object_message(&mut self, message: &bindings::ObjectMessage) -> Result<Effects> {
-        self.bindings
-            .call_deliver_object_message(&mut self.store, message)?;
-        Ok(self.take_effects())
-    }
-
-    pub fn deliver_object_response(
-        &mut self,
-        response: &bindings::ObjectResponse,
-    ) -> Result<Effects> {
-        self.bindings
-            .call_deliver_object_response(&mut self.store, response)?;
-        Ok(self.take_effects())
+    /// One guest turn: deliver `inbound`, run the guest's scheduler, collect its output.
+    pub fn tick(&mut self, inbound: Vec<bindings::Frame>) -> Result<bindings::Turn> {
+        Ok(self.bindings.call_tick(&mut self.store, &inbound)?)
     }
 }
 
-/// Registry frames -> bindgen wire variants, and back. Purely structural.
-fn message_to_wire(message: WireMessage) -> bindings::ObjectMessage {
-    match message {
-        WireMessage::Call(call) => bindings::ObjectMessage::Call(bindings::ObjectCall {
-            entity_id: call.entity_id,
-            request_id: call.request_id,
+/// Registry frames -> bindgen wire records, and back. Purely structural.
+fn frame_to_wire(frame: Frame) -> bindings::Frame {
+    match frame {
+        Frame::Call(call) => bindings::Frame::Call(bindings::Call {
+            target: call.target,
+            request: call.request,
             method: call.method,
-            payload: call.payload,
+            payload: call.payload.bytes,
+            refs: call.payload.refs,
         }),
-        WireMessage::Subscribe {
-            entity_id,
-            observer_id,
-        } => bindings::ObjectMessage::Subscribe(bindings::ObjectSubscribe {
-            entity_id,
-            observer_id,
-        }),
-        WireMessage::Release { entity_id } => {
-            bindings::ObjectMessage::Release(bindings::ObjectRelease { entity_id })
+        Frame::Response(response) => {
+            let (outcome, refs) = match response.outcome {
+                Ok(payload) => (Ok(payload.bytes), payload.refs),
+                Err(error) => (Err(error), Vec::new()),
+            };
+            bindings::Frame::Response(bindings::Response {
+                request: response.request,
+                outcome,
+                refs,
+            })
         }
+        Frame::Subscribe { target, observer } => {
+            bindings::Frame::Subscribe(bindings::Subscribe { target, observer })
+        }
+        Frame::Release { target } => bindings::Frame::Release(bindings::Release { target }),
     }
 }
 
-fn message_from_wire(message: bindings::ObjectMessage) -> WireMessage {
-    match message {
-        bindings::ObjectMessage::Call(call) => WireMessage::Call(WireCall {
-            entity_id: call.entity_id,
-            request_id: call.request_id,
+fn frame_from_wire(frame: bindings::Frame) -> Frame {
+    match frame {
+        bindings::Frame::Call(call) => Frame::Call(Call {
+            target: call.target,
+            request: call.request,
             method: call.method,
-            payload: call.payload,
+            payload: Payload::from_parts(call.payload, call.refs),
         }),
-        bindings::ObjectMessage::Subscribe(subscribe) => WireMessage::Subscribe {
-            entity_id: subscribe.entity_id,
-            observer_id: subscribe.observer_id,
+        bindings::Frame::Response(response) => Frame::Response(Response {
+            request: response.request,
+            outcome: response
+                .outcome
+                .map(|bytes| Payload::from_parts(bytes, response.refs)),
+        }),
+        bindings::Frame::Subscribe(subscribe) => Frame::Subscribe {
+            target: subscribe.target,
+            observer: subscribe.observer,
         },
-        bindings::ObjectMessage::Release(release) => WireMessage::Release {
-            entity_id: release.entity_id,
+        bindings::Frame::Release(release) => Frame::Release {
+            target: release.target,
         },
     }
 }
 
-fn extent_from_size(size: Size<Pixels>) -> bindings::Extent {
-    bindings::Extent {
-        width: f32::from(size.width),
-        height: f32::from(size.height),
-    }
-}
-
-/// A GPUI entity that owns the wasmtime store and mediates between the host application and
-/// the guest. All calls into the guest happen from here, on the foreground thread.
-/// Images shipped by the guest, cached per instance and shared by all of its views.
+/// Images shipped by the guest, cached per instance and shared by every surface it
+/// draws on. Image ids are minted by the guest, so the cache is per instance.
 pub type PluginImages = Rc<RefCell<HashMap<u64, Arc<gpui::RenderImage>>>>;
 
-/// One call into the guest, queued for the background worker that owns the store.
+/// One call into the guest, queued for the background worker that owns the store. The
+/// worker coalesces consecutive `Tick`s into one guest turn.
 enum PluginRequest {
     Init,
-    CreateView {
-        view_id: u32,
-        name: String,
-        size: Size<Pixels>,
-        scale: f32,
-    },
-    ResizeView {
-        view_id: u32,
-        size: Size<Pixels>,
-        scale: f32,
-    },
-    HandleMouse {
-        view_id: u32,
-        event: bindings::MouseEvent,
-    },
-    HandleKey {
-        view_id: u32,
-        event: bindings::KeyEvent,
-    },
-    Tick,
-    DeliverMessage(bindings::ObjectMessage),
-    DeliverResponse(bindings::ObjectResponse),
+    Tick(Vec<bindings::Frame>),
 }
 
-impl PluginInstance {
-    fn handle(&mut self, request: PluginRequest) -> Result<Effects> {
-        match request {
-            PluginRequest::Init => self.init(),
-            PluginRequest::CreateView {
-                view_id,
-                name,
-                size,
-                scale,
-            } => self.create_view(view_id, &name, size, scale),
-            PluginRequest::ResizeView {
-                view_id,
-                size,
-                scale,
-            } => self.resize_view(view_id, size, scale),
-            PluginRequest::HandleMouse { view_id, event } => self.handle_mouse(view_id, event),
-            PluginRequest::HandleKey { view_id, event } => self.handle_key(view_id, event),
-            PluginRequest::Tick => self.tick(),
-            PluginRequest::DeliverMessage(message) => self.deliver_object_message(&message),
-            PluginRequest::DeliverResponse(response) => self.deliver_object_response(&response),
-        }
-    }
-}
-
+/// A GPUI entity that owns a plugin's wasmtime store (on a worker) and mediates between
+/// the host application and the guest: its registry's transport, and the surfaces the
+/// guest draws on.
 pub struct PluginHost {
     /// Requests to the background worker that owns the wasmtime store. FIFO: the worker
-    /// processes one call at a time, and each call's effects come back in order.
+    /// processes one turn at a time, and each turn's output comes back in order.
     requests: mpsc::UnboundedSender<PluginRequest>,
-    views: HashMap<u32, Entity<PluginViewState>>,
-    views_by_name: HashMap<String, Entity<PluginViewState>>,
-    next_view_id: u32,
     images: PluginImages,
     /// This end's object registry: the object model lives there, side-blind; this
-    /// entity supplies only its transport (the request queue) and the wasm surface.
+    /// entity supplies only its transport (the request queue) and the pixel path.
     objects: Objects,
     scheduled_tick: Option<Task<()>>,
     _worker: Task<()>,
@@ -559,19 +413,32 @@ pub struct PluginHost {
 }
 
 impl PluginHost {
-    /// Move `instance` onto a background worker and wire the effect pump. A slow or
-    /// misbehaving guest can no longer stall the UI thread: calls into wasm happen on
-    /// the worker, strictly one at a time, and their effects are applied back on the
+    /// Move `instance` onto a background worker and wire the turn pump. A slow or
+    /// misbehaving guest can never stall the UI thread: calls into wasm happen on the
+    /// worker, strictly one at a time, and their output is applied back on the
     /// foreground in the same order.
     pub fn new(mut instance: PluginInstance, cx: &mut Context<Self>) -> Self {
         let (requests, mut request_rx) = mpsc::unbounded::<PluginRequest>();
-        let (effects_tx, mut effects_rx) = mpsc::unbounded::<Effects>();
+        let (turns_tx, mut turns_rx) = mpsc::unbounded::<bindings::Turn>();
 
         let worker = cx.background_spawn(async move {
             while let Some(request) = request_rx.next().await {
-                match instance.handle(request) {
-                    Ok(effects) => {
-                        if effects_tx.unbounded_send(effects).is_err() {
+                let turn = match request {
+                    PluginRequest::Init => instance.init(),
+                    PluginRequest::Tick(mut inbound) => {
+                        // Everything already queued rides the same turn: one boundary
+                        // crossing per burst, and the FIFO is preserved by construction.
+                        // `Init` is always the first request, so nothing else can be
+                        // queued behind a tick.
+                        while let Ok(PluginRequest::Tick(more)) = request_rx.try_recv() {
+                            inbound.extend(more);
+                        }
+                        instance.tick(inbound)
+                    }
+                };
+                match turn {
+                    Ok(turn) => {
+                        if turns_tx.unbounded_send(turn).is_err() {
                             break;
                         }
                     }
@@ -581,49 +448,30 @@ impl PluginHost {
         });
 
         let sink = requests.clone();
-        let objects = Objects::new(Box::new(move |outgoing| {
-            let request = match outgoing {
-                WireOutgoing::Message(message) => {
-                    PluginRequest::DeliverMessage(message_to_wire(message))
-                }
-                WireOutgoing::Response(response) => {
-                    PluginRequest::DeliverResponse(bindings::ObjectResponse {
-                        request_id: response.request_id,
-                        outcome: response.outcome,
-                    })
-                }
-            };
+        let objects = Objects::new(Box::new(move |frame| {
+            let request = PluginRequest::Tick(vec![frame_to_wire(frame)]);
             if sink.unbounded_send(request).is_err() {
-                log::error!("embedded_gpui: plugin worker is gone; dropping message");
+                log::error!("embedded_gpui: plugin worker is gone; dropping frame");
             }
         }));
 
         // Object traffic is applied straight to the registry, *outside* any update of
         // this entity: handlers run with the host entity un-borrowed, so user code in a
         // handler may freely use `PluginHostHandle` (e.g. a root method sharing a new
-        // entity). Only the wasm surface (scenes, cursor, ticks) goes through the
-        // entity.
+        // entity). Only the pixel path (scenes, wakeups) goes through the entity.
         let pump_objects = objects.clone();
         let pump = cx.spawn(async move |host, cx| {
-            while let Some(mut effects) = effects_rx.next().await {
-                let responses = std::mem::take(&mut effects.responses);
-                let messages = std::mem::take(&mut effects.messages);
+            while let Some(turn) = turns_rx.next().await {
                 let applied = cx.update(|cx| {
                     pump_objects.drain_releases();
-
-                    for response in responses {
-                        pump_objects.deliver_response(WireResponse {
-                            request_id: response.request_id,
-                            outcome: response.outcome,
-                        });
+                    for frame in turn.frames {
+                        pump_objects.deliver(frame_from_wire(frame), cx);
                     }
-
-                    for message in messages {
-                        pump_objects.deliver_message(message_from_wire(message), cx);
-                    }
-
                     pump_objects.drain_releases();
-                    host.update(cx, |host, cx| host.apply_effects(effects, cx))
+                    host.update(cx, |host, cx| {
+                        host.apply_scenes(turn.scenes, cx);
+                        host.schedule_wake(turn.wake_after_ms, cx);
+                    })
                 });
                 if applied.is_err() {
                     break;
@@ -633,9 +481,6 @@ impl PluginHost {
 
         let this = Self {
             requests,
-            views: HashMap::new(),
-            views_by_name: HashMap::new(),
-            next_view_id: 0,
             images: PluginImages::default(),
             objects,
             scheduled_tick: None,
@@ -647,8 +492,8 @@ impl PluginHost {
     }
 
     /// The whole embedding story in one call: compile and instantiate the component on
-    /// a background thread, then hand back a ready [`PluginHost`]. Pair with
-    /// [`PluginHost::view`] to place the plugin's surfaces in your UI.
+    /// a background thread, then hand back a ready [`PluginHost`]. Share your root,
+    /// take theirs, and hand the plugin [`Surface`]s to draw on.
     pub fn load(
         path: std::path::PathBuf,
         options: PluginOptions,
@@ -665,6 +510,11 @@ impl PluginHost {
         if self.requests.unbounded_send(request).is_err() {
             log::error!("embedded_gpui: plugin worker is gone; dropping request");
         }
+    }
+
+    /// This end's registry, for sharing and connecting from anywhere.
+    pub fn registry(&self) -> Registry {
+        Registry::new(self.objects.downgrade())
     }
 
     /// Install `entity` as this end's root object: the single capability the other
@@ -713,124 +563,37 @@ impl PluginHost {
         self.objects.root()
     }
 
-    /// Attach to an entity through a capability reference received in a payload.
-    pub fn connect<S: Interface>(
-        &mut self,
-        reference: Ref<S>,
-        _cx: &mut Context<Self>,
-    ) -> Remote<S> {
-        self.objects.connect(reference)
-    }
-
     /// Flush deferred work (queued capability releases) and give the guest a turn.
     /// Hosts with quiescent plugins (no pending tick) can call this to make drops
     /// observable.
-    pub fn pump(&mut self, cx: &mut Context<Self>) {
+    pub fn pump(&mut self, _cx: &mut Context<Self>) {
         self.objects.drain_releases();
-        self.tick(cx);
+        self.enqueue(PluginRequest::Tick(Vec::new()));
     }
 
-    /// The view named `name` from the plugin, as a GPUI view: place it anywhere in
-    /// your element tree and it fills its slot. Creation is lazy — the guest's
-    /// `create-view` runs on first layout, with the measured slot size and the
-    /// window's actual scale factor — and repeated calls return the same view.
-    pub fn view(
-        &mut self,
-        name: impl Into<String>,
-        cx: &mut Context<Self>,
-    ) -> Entity<PluginViewState> {
-        let name = name.into();
-        if let Some(view) = self.views_by_name.get(&name) {
-            return view.clone();
-        }
-        let view_id = self.next_view_id;
-        self.next_view_id += 1;
-        let host = cx.weak_entity();
-        let images = self.images.clone();
-        let view = cx.new(|cx| PluginViewState::new(view_id, name.clone(), host, images, cx));
-        self.views.insert(view_id, view.clone());
-        self.views_by_name.insert(name, view.clone());
-        view
-    }
-
-    pub(crate) fn create_view_now(
-        &mut self,
-        view_id: u32,
-        name: String,
-        size: Size<Pixels>,
-        scale: f32,
-        _cx: &mut Context<Self>,
-    ) {
-        self.enqueue(PluginRequest::CreateView {
-            view_id,
-            name,
-            size,
-            scale,
-        });
-    }
-
-    pub fn resize_view(
-        &mut self,
-        view_id: u32,
-        size: Size<Pixels>,
-        scale: f32,
-        _cx: &mut Context<Self>,
-    ) {
-        self.enqueue(PluginRequest::ResizeView {
-            view_id,
-            size,
-            scale,
-        });
-    }
-
-    pub fn handle_mouse(
-        &mut self,
-        view_id: u32,
-        event: bindings::MouseEvent,
-        _cx: &mut Context<Self>,
-    ) {
-        self.enqueue(PluginRequest::HandleMouse { view_id, event });
-    }
-
-    pub fn handle_key(&mut self, view_id: u32, event: bindings::KeyEvent, _cx: &mut Context<Self>) {
-        self.enqueue(PluginRequest::HandleKey { view_id, event });
-    }
-
-    fn tick(&mut self, _cx: &mut Context<Self>) {
-        self.enqueue(PluginRequest::Tick);
-    }
-
-    /// Apply the wasm-surface effects of one guest turn: scenes, cursor, and the next
-    /// tick. Object traffic was already applied to the registry by the pump, outside
-    /// this entity's update.
-    fn apply_effects(&mut self, effects: Effects, cx: &mut Context<Self>) {
-        for (view_id, list) in effects.scene_updates {
-            self.ingest_images(&list);
-            if let Some(view) = self.views.get(&view_id) {
-                view.update(cx, |view, cx| {
-                    view.set_display_list(list);
-                    cx.notify();
-                });
-            } else {
-                log::warn!("embedded_gpui: update-scene for unknown view {view_id}");
+    /// Route freshly rendered display lists to the surfaces they address. A scene names
+    /// its surface by object id; the surface must be one this host shared, so a guest
+    /// can only draw where it was handed a ref.
+    fn apply_scenes(&mut self, scenes: Vec<bindings::Scene>, cx: &mut Context<Self>) {
+        for scene in scenes {
+            self.ingest_images(&scene.list);
+            match self.objects.local_entity::<Surface>(scene.surface) {
+                Some(surface) => surface.update(cx, |surface, cx| {
+                    surface.set_scene(scene.list, self.images.clone(), cx);
+                }),
+                None => log::warn!("embedded_gpui: scene for unknown surface {}", scene.surface),
             }
         }
+    }
 
-        if let Some(cursor) = effects.cursor_style {
-            for view in self.views.values() {
-                view.update(cx, |view, cx| {
-                    view.set_cursor(cursor);
-                    cx.notify();
-                });
-            }
-        }
-
-        if let Some(delay) = effects.tick_delay_ms {
+    fn schedule_wake(&mut self, wake_after_ms: Option<u32>, cx: &mut Context<Self>) {
+        if let Some(delay) = wake_after_ms {
             self.scheduled_tick = Some(cx.spawn(async move |this, cx| {
                 cx.background_executor()
                     .timer(Duration::from_millis(delay as u64))
                     .await;
-                this.update(cx, |this, cx| this.tick(cx)).ok();
+                this.update(cx, |this, _| this.enqueue(PluginRequest::Tick(Vec::new())))
+                    .ok();
             }));
         }
     }
@@ -868,6 +631,9 @@ impl PluginHost {
 /// the host entity (the registry is shared), so they are safe to call from anywhere,
 /// including inside method handlers.
 pub trait PluginHostHandle {
+    /// See [`PluginHost::registry`].
+    fn registry(&self, cx: &gpui::App) -> Registry;
+
     /// See [`PluginHost::share_root`].
     fn share_root<S: Interface, T: Shared<S>>(&self, entity: &Entity<T>, cx: &mut gpui::App);
 
@@ -885,17 +651,15 @@ pub trait PluginHostHandle {
     /// See [`PluginHost::root`].
     fn root<S: Interface>(&self, cx: &mut gpui::App) -> Remote<S>;
 
-    /// See [`PluginHost::connect`].
-    fn connect<S: Interface>(&self, reference: Ref<S>, cx: &mut gpui::App) -> Remote<S>;
-
-    /// See [`PluginHost::view`].
-    fn view(&self, name: impl Into<String>, cx: &mut gpui::App) -> Entity<PluginViewState>;
-
     /// See [`PluginHost::pump`].
     fn pump(&self, cx: &mut gpui::App);
 }
 
 impl PluginHostHandle for Entity<PluginHost> {
+    fn registry(&self, cx: &gpui::App) -> Registry {
+        self.read(cx).registry()
+    }
+
     fn share_root<S: Interface, T: Shared<S>>(&self, entity: &Entity<T>, cx: &mut gpui::App) {
         self.read(cx).objects.clone().share_root(entity, cx);
     }
@@ -918,14 +682,6 @@ impl PluginHostHandle for Entity<PluginHost> {
 
     fn root<S: Interface>(&self, cx: &mut gpui::App) -> Remote<S> {
         self.read(cx).objects.clone().root()
-    }
-
-    fn connect<S: Interface>(&self, reference: Ref<S>, cx: &mut gpui::App) -> Remote<S> {
-        self.read(cx).objects.clone().connect(reference)
-    }
-
-    fn view(&self, name: impl Into<String>, cx: &mut gpui::App) -> Entity<PluginViewState> {
-        self.update(cx, |host, cx| host.view(name, cx))
     }
 
     fn pump(&self, cx: &mut gpui::App) {

@@ -1,14 +1,15 @@
 use crate::dispatcher::PluginDispatcher;
+use crate::surface::{Cursor, SurfaceApi};
 use crate::text_system::PluginTextSystem;
 use crate::window::{PluginWindow, PluginWindowState};
-use crate::wit;
 use anyhow::{Result, anyhow};
+use embedded_gpui::Remote;
 use futures::channel::oneshot;
 use gpui::{
     Action, AnyWindowHandle, BackgroundExecutor, Bounds, ClipboardItem, CursorStyle,
     DummyKeyboardMapper, ForegroundExecutor, Keymap, Menu, MenuItem, PathPromptOptions, Pixels,
     Platform, PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
-    PlatformWindow, Point, Size, Task, ThermalState, WindowAppearance, WindowParams, px, size,
+    PlatformWindow, Point, Task, ThermalState, WindowAppearance, WindowParams, px, size,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -16,23 +17,23 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
-pub(crate) struct PendingView {
-    pub view_id: u32,
-    pub size: Size<Pixels>,
-    pub scale_factor: f32,
-}
-
 /// The GPUI [`Platform`] implementation for Wasm plugin guests. There is no real display or
-/// window here: each "window" is a view slot in the host application, and all rendering,
-/// text shaping, and scheduling is delegated across the WIT boundary.
+/// window here: each "window" draws on a host surface object, and all rendering, text
+/// shaping, and scheduling is delegated across the boundary.
 pub struct PluginPlatform {
     dispatcher: Arc<PluginDispatcher>,
     background_executor: BackgroundExecutor,
     foreground_executor: ForegroundExecutor,
     text_system: Arc<PluginTextSystem>,
     display: Rc<PluginDisplay>,
-    windows: RefCell<HashMap<u32, Rc<PluginWindowState>>>,
-    pending_view: Cell<Option<PendingView>>,
+    /// Open windows, keyed by the object id of the surface each draws on.
+    windows: RefCell<HashMap<u64, Rc<PluginWindowState>>>,
+    /// The surface the next `open_window` binds to; set by `open_view` right before.
+    pending_surface: RefCell<Option<Remote<SurfaceApi>>>,
+    /// The surface that most recently received input: where cursor changes apply.
+    last_input_surface: Rc<Cell<Option<u64>>>,
+    /// A cursor style GPUI set since the last pump; flushed to `last_input_surface`.
+    pending_cursor: Cell<Option<Cursor>>,
 }
 
 impl PluginPlatform {
@@ -47,7 +48,9 @@ impl PluginPlatform {
             text_system: Arc::new(PluginTextSystem::new()),
             display: Rc::new(PluginDisplay::new()),
             windows: RefCell::new(HashMap::new()),
-            pending_view: Cell::new(None),
+            pending_surface: RefCell::new(None),
+            last_input_surface: Rc::default(),
+            pending_cursor: Cell::new(None),
         }
     }
 
@@ -55,21 +58,31 @@ impl PluginPlatform {
         &self.dispatcher
     }
 
-    /// Bind the next `open_window` call to the given host view. See the `create-view` export.
-    pub fn set_pending_view(&self, view_id: u32, size: Size<Pixels>, scale_factor: f32) {
-        self.pending_view.set(Some(PendingView {
-            view_id,
-            size,
-            scale_factor,
-        }));
+    /// Bind the next `open_window` call to `surface`. See [`open_view`](crate::open_view).
+    pub fn set_pending_surface(&self, surface: Remote<SurfaceApi>) {
+        *self.pending_surface.borrow_mut() = Some(surface);
     }
 
-    pub fn window(&self, view_id: u32) -> Option<Rc<PluginWindowState>> {
-        self.windows.borrow().get(&view_id).cloned()
+    pub fn window(&self, surface: u64) -> Option<Rc<PluginWindowState>> {
+        self.windows.borrow().get(&surface).cloned()
+    }
+
+    /// Forget the window drawing on `surface`; the GPUI window itself is closed by the
+    /// caller.
+    pub fn remove_window(&self, surface: u64) -> Option<Rc<PluginWindowState>> {
+        self.windows.borrow_mut().remove(&surface)
     }
 
     pub fn window_states(&self) -> Vec<Rc<PluginWindowState>> {
         self.windows.borrow().values().cloned().collect()
+    }
+
+    /// The cursor change GPUI requested since the last pump, and the surface it is for.
+    pub fn take_pending_cursor(&self) -> Option<(Remote<SurfaceApi>, Cursor)> {
+        let cursor = self.pending_cursor.take()?;
+        let surface = self.last_input_surface.get()?;
+        let window = self.window(surface)?;
+        Some((window.surface().clone(), cursor))
     }
 }
 
@@ -121,18 +134,17 @@ impl Platform for PluginPlatform {
         _handle: AnyWindowHandle,
         _params: WindowParams,
     ) -> Result<Box<dyn PlatformWindow>> {
-        let pending = self.pending_view.take().ok_or_else(|| {
-            anyhow!("plugin windows can only be opened for a host-created view (create-view)")
-        })?;
+        let surface =
+            self.pending_surface.borrow_mut().take().ok_or_else(|| {
+                anyhow!("plugin windows are opened with embedded_gpui::open_view")
+            })?;
+        let surface_id = surface.reference().entity_id();
         let state = Rc::new(PluginWindowState::new(
-            pending.view_id,
-            pending.size,
-            pending.scale_factor,
+            surface,
             self.text_system.clone(),
+            self.last_input_surface.clone(),
         ));
-        self.windows
-            .borrow_mut()
-            .insert(pending.view_id, state.clone());
+        self.windows.borrow_mut().insert(surface_id, state.clone());
         Ok(Box::new(PluginWindow::new(state, self.display.clone())))
     }
 
@@ -220,7 +232,7 @@ impl Platform for PluginPlatform {
     }
 
     fn set_cursor_style(&self, style: CursorStyle) {
-        wit::set_cursor_style(cursor_style_to_wire(style));
+        self.pending_cursor.set(Some(Cursor::from_gpui(style)));
     }
 
     fn hide_cursor_until_mouse_moves(&self) {}
@@ -256,30 +268,6 @@ impl Platform for PluginPlatform {
     }
 
     fn on_keyboard_layout_change(&self, _callback: Box<dyn FnMut()>) {}
-}
-
-fn cursor_style_to_wire(style: CursorStyle) -> wit::CursorStyle {
-    match style {
-        CursorStyle::Arrow | CursorStyle::ContextualMenu => wit::CursorStyle::Arrow,
-        CursorStyle::IBeam | CursorStyle::IBeamCursorForVerticalLayout => wit::CursorStyle::Ibeam,
-        CursorStyle::Crosshair => wit::CursorStyle::Crosshair,
-        CursorStyle::ClosedHand => wit::CursorStyle::ClosedHand,
-        CursorStyle::OpenHand => wit::CursorStyle::OpenHand,
-        CursorStyle::PointingHand | CursorStyle::DragLink | CursorStyle::DragCopy => {
-            wit::CursorStyle::PointingHand
-        }
-        CursorStyle::ResizeLeft
-        | CursorStyle::ResizeRight
-        | CursorStyle::ResizeLeftRight
-        | CursorStyle::ResizeColumn => wit::CursorStyle::ResizeLeftRight,
-        CursorStyle::ResizeUp
-        | CursorStyle::ResizeDown
-        | CursorStyle::ResizeUpDown
-        | CursorStyle::ResizeRow
-        | CursorStyle::ResizeUpLeftDownRight
-        | CursorStyle::ResizeUpRightDownLeft => wit::CursorStyle::ResizeUpDown,
-        CursorStyle::OperationNotAllowed => wit::CursorStyle::OperationNotAllowed,
-    }
 }
 
 struct PluginKeyboardLayout;

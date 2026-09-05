@@ -1,7 +1,10 @@
+use crate::guest::objects;
 use crate::platform::PluginDisplay;
+use crate::surface::SurfaceApi;
 use crate::text_system::{PluginAtlas, PluginTextSystem, TileContent};
 use crate::wit;
 use anyhow::Result;
+use embedded_gpui::Remote;
 use futures::channel::oneshot;
 use gpui::{
     Bounds, Capslock, DispatchEventResult, GpuSpecs, Modifiers, Pixels, PlatformAtlas,
@@ -25,33 +28,73 @@ struct Callbacks {
     resize: Option<ResizeCallback>,
 }
 
-/// Shared state for one plugin "window" (a view slot in the host application).
+/// Shared state for one plugin "window": the guest end of a host surface.
 pub struct PluginWindowState {
-    view_id: u32,
+    /// The host surface this window draws on; scenes are addressed to its object id.
+    surface: Remote<SurfaceApi>,
     size: Cell<Size<Pixels>>,
     scale_factor: Cell<f32>,
     mouse_position: Cell<Point<Pixels>>,
     atlas: Arc<PluginAtlas>,
     callbacks: RefCell<Callbacks>,
     input_handler: RefCell<Option<PlatformInputHandler>>,
+    /// Shared with the platform: the surface that most recently received input.
+    last_input_surface: Rc<Cell<Option<u64>>>,
+    /// Geometry and input the host delivered this turn. `ViewApi` handlers run inside
+    /// the registry's `App` borrow, and GPUI's window callbacks re-enter the app, so the
+    /// pump applies these once the borrow is released.
+    pending: RefCell<Vec<WindowEvent>>,
+}
+
+/// One host-driven window event, applied by the pump.
+pub enum WindowEvent {
+    Resize(Size<Pixels>, f32),
+    Input(PlatformInput),
 }
 
 impl PluginWindowState {
+    /// A window opens at a nominal size; the host drives the real geometry through the
+    /// view's `resize` as soon as the surface is attached.
     pub fn new(
-        view_id: u32,
-        size: Size<Pixels>,
-        scale_factor: f32,
+        surface: Remote<SurfaceApi>,
         text_system: Arc<PluginTextSystem>,
+        last_input_surface: Rc<Cell<Option<u64>>>,
     ) -> Self {
         Self {
-            view_id,
-            size: Cell::new(size),
-            scale_factor: Cell::new(scale_factor),
+            surface,
+            size: Cell::new(gpui::size(gpui::px(1.), gpui::px(1.))),
+            scale_factor: Cell::new(1.),
             mouse_position: Cell::new(Point::default()),
             atlas: Arc::new(PluginAtlas::new(text_system)),
             callbacks: RefCell::new(Callbacks::default()),
             input_handler: RefCell::new(None),
+            last_input_surface,
+            pending: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Queue a host-driven event for the next pump.
+    pub fn push_event(&self, event: WindowEvent) {
+        self.pending.borrow_mut().push(event);
+    }
+
+    /// Apply the queued events, in order. Called outside any `App` borrow.
+    pub fn flush_events(&self) {
+        let events = std::mem::take(&mut *self.pending.borrow_mut());
+        for event in events {
+            match event {
+                WindowEvent::Resize(size, scale_factor) => self.resized(size, scale_factor),
+                WindowEvent::Input(input) => self.dispatch_input(input),
+            }
+        }
+    }
+
+    pub fn surface(&self) -> &Remote<SurfaceApi> {
+        &self.surface
+    }
+
+    fn surface_id(&self) -> u64 {
+        self.surface.reference().entity_id()
     }
 
     /// Give GPUI a chance to redraw this window. GPUI's registered frame callback checks the
@@ -76,6 +119,7 @@ impl PluginWindowState {
     /// GPUI's Linux backends synthesize text input from key events (there is no OS IME on
     /// this side of the wasm boundary).
     pub fn dispatch_input(&self, input: PlatformInput) {
+        self.last_input_surface.set(Some(self.surface_id()));
         match &input {
             PlatformInput::MouseDown(event) => self.mouse_position.set(event.position),
             PlatformInput::MouseUp(event) => self.mouse_position.set(event.position),
@@ -137,7 +181,7 @@ impl PluginWindow {
 impl rwh::HasWindowHandle for PluginWindow {
     fn window_handle(&self) -> Result<rwh::WindowHandle<'_>, rwh::HandleError> {
         // A synthetic handle: nothing consumes it, but the trait requires one.
-        let raw = rwh::WebWindowHandle::new(self.state.view_id);
+        let raw = rwh::WebWindowHandle::new(self.state.surface_id() as u32);
         Ok(unsafe { rwh::WindowHandle::borrow_raw(rwh::RawWindowHandle::Web(raw)) })
     }
 }
@@ -269,7 +313,7 @@ impl PlatformWindow for PluginWindow {
 
     fn draw(&self, scene: &Scene) {
         let list = serialize_scene(scene, self.state.scale_factor.get(), &self.state.atlas);
-        wit::update_scene(self.state.view_id, &list);
+        objects::push_scene(self.state.surface_id(), list);
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

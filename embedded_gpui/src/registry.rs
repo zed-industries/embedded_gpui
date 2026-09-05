@@ -2,19 +2,19 @@
 //! the boundary.
 //!
 //! A registry knows exactly two things: *local* objects (homes -- entities whose state
-//! lives here, keyed by ids this end allocates, with this end's root at its id 0) and
-//! *remote* objects (projections of the other end's homes). There is no notion of host
-//! or guest anywhere in this module: the two ends differ only in the configuration they
-//! construct the registry with -- a transport sink that moves outgoing wire records, and
-//! which half of the id namespace is theirs. Boundary creation assigns those; the object
-//! model never mentions them again.
+//! lives here, with this end's root at address 0) and *remote* objects (projections of
+//! the other end's homes). There is no notion of host or guest anywhere in this module:
+//! the two ends differ only in the transport they construct the registry with -- a sink
+//! that carries outgoing [`Frame`]s. Boundary creation supplies it; the object model
+//! never mentions it again.
 //!
 //! Ids are random u64s, globally unique for practical purposes, so a ref is universally
-//! applicable: payloads stay opaque (a caretaker can forward bytes verbatim and any refs
-//! inside keep meaning the same objects), nothing is namespaced per end, and an id can
-//! only be *known*, never guessed or enumerated — holding a ref is the authority. The
-//! single reserved value is 0, "your root": a connection-local address (never an
-//! identity in a payload) that each end answers with its own root object.
+//! applicable: nothing is namespaced per end, and an id can only be *known*, never
+//! guessed or enumerated — holding a ref is the authority. Refs travel in each frame's
+//! ref table, so payloads stay opaque here while every capability in transit is
+//! enumerable to whoever forwards it. The single reserved value is 0, "your root": a
+//! connection-local address (never an identity in a payload) that each end answers with
+//! its own root object.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -23,49 +23,43 @@ use std::rc::{Rc, Weak};
 use gpui::{AnyEntity, App, AppContext as _, Entity, Subscription};
 
 use crate::{
-    HandlerResponse, Interface, MethodHandler, Methods, NOTIFY_EVENT, RawEvent, Ref, Remote,
-    RemoteSignal, ResponseSender, Shared,
+    HandlerResponse, Interface, MethodHandler, Methods, NOTIFY_EVENT, Payload, RawEvent, Ref,
+    Remote, RemoteSignal, ResponseSender, Shared,
 };
 
 /// The reserved connection-local address meaning "the root object of whichever end you
 /// send it to". Never minted as an object id and never meaningful inside a payload.
 const ROOT_ADDRESS: u64 = 0;
 
-/// A method call toward a home on the other end, in wire-neutral form. The boundary
-/// layer converts to its concrete wire types (wit-bindgen or wasmtime bindgen records).
-pub(crate) struct WireCall {
-    pub entity_id: u64,
-    pub request_id: Option<u64>,
+/// A method call toward a home on the other end.
+pub(crate) struct Call {
+    pub target: u64,
+    pub request: Option<u64>,
     pub method: String,
-    pub payload: Vec<u8>,
+    pub payload: Payload,
 }
 
-/// Everything that flows toward an object: calls, plus the two operations that are
-/// *constitutive* of objecthood — structural frames, not reserved method names, so the
-/// method namespace belongs entirely to user schemas. All variants share one FIFO
-/// stream: subscribe and release order with calls.
-pub(crate) enum WireMessage {
-    Call(WireCall),
-    Subscribe { entity_id: u64, observer_id: u64 },
-    Release { entity_id: u64 },
+/// The answer to a [`Call`] that carried a `request` id.
+pub(crate) struct Response {
+    pub request: u64,
+    pub outcome: Result<Payload, String>,
 }
 
-/// The answer to a [`WireMessage`] that carried a `request_id`.
-pub(crate) struct WireResponse {
-    pub request_id: u64,
-    pub outcome: Result<Vec<u8>, String>,
+/// Everything that crosses the boundary about objects, in wire-neutral form (the
+/// boundary layer converts to its bindgen records). Calls and responses carry payloads
+/// with ref tables; subscribe and release are the two operations *constitutive* of
+/// objecthood — structural frames, not reserved method names, so the method namespace
+/// belongs entirely to user schemas. Both directions are one FIFO of these.
+pub(crate) enum Frame {
+    Call(Call),
+    Response(Response),
+    Subscribe { target: u64, observer: u64 },
+    Release { target: u64 },
 }
 
-/// Everything the registry ever emits toward the other end. Events are not a case:
-/// they are messages to observer objects.
-pub(crate) enum WireOutgoing {
-    Message(WireMessage),
-    Response(WireResponse),
-}
-
-/// How outgoing wire records leave this end: the single point of side-specific behavior,
+/// How outgoing frames leave this end: the single point of side-specific behavior,
 /// supplied at boundary creation.
-pub(crate) type WireSink = Box<dyn Fn(WireOutgoing)>;
+pub(crate) type WireSink = Box<dyn Fn(Frame)>;
 
 /// A local object: an entity homed on this end, with its dispatch closure. The
 /// registry stores exactly one handler per object — how it interprets method names is
@@ -76,14 +70,41 @@ struct HomeEntry {
     #[allow(dead_code)]
     type_name: &'static str,
     handler: MethodHandler,
-    /// Observer objects on the other end (registered via `$subscribe`); the home's
-    /// `cx.notify` and typed events are sent to each as ordinary messages. Cleared on
-    /// `$release`.
+    /// Observer objects on the other end (registered via `subscribe`); the home's
+    /// `cx.notify` and typed events are sent to each as ordinary calls. Cleared on
+    /// `release`.
     observers: Vec<u64>,
-    /// The registry keeps the entity alive until the other end releases it.
-    strong: Option<AnyEntity>,
+    /// The entity itself, so scenes and other side traffic addressed by object id can
+    /// find it. Strong while the other end holds a remote (unless the type opted out of
+    /// [`Shared::keep_alive`]); observer objects have none.
+    entity: HomeEntity,
     /// The notify observation plus any typed-event forwarders wired at share time.
     _subscriptions: Vec<Subscription>,
+}
+
+enum HomeEntity {
+    None,
+    Strong(AnyEntity),
+    Weak(gpui::AnyWeakEntity),
+}
+
+impl HomeEntity {
+    // Only the host routes by object id today (scenes to surfaces).
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    fn upgrade(&self) -> Option<AnyEntity> {
+        match self {
+            Self::None => None,
+            Self::Strong(entity) => Some(entity.clone()),
+            Self::Weak(entity) => entity.upgrade(),
+        }
+    }
+
+    /// The other end released the object: stop keeping it alive.
+    fn release(&mut self) {
+        if let Self::Strong(entity) = self {
+            *self = Self::Weak(entity.downgrade());
+        }
+    }
 }
 
 /// A remote object: this end's projection of an entity homed on the other end.
@@ -92,7 +113,7 @@ struct Projection {
     type_name: &'static str,
     /// Where the home's notifies and events land locally, plus the id of the hidden
     /// observer object that receives them. Created lazily by the first
-    /// `observe`/`subscribe`, which is also when `$subscribe` is sent — a projection
+    /// `observe`/`subscribe`, which is also when `subscribe` is sent — a projection
     /// nobody listens to costs the wire nothing.
     signal: Option<(Entity<RemoteSignal>, u64)>,
     /// Live while some `Remote` still holds the projection; used to hand the same guard
@@ -121,15 +142,15 @@ struct State {
     projections: HashMap<u64, Projection>,
     next_request_id: u64,
     pending_responses: HashMap<u64, ResponseSender>,
-    /// Messages addressed to this end's root before `share_root` ran. The other end's
-    /// bootstrap may lawfully race ours (its `root()` remote subscribes immediately), so
-    /// root traffic queues instead of failing; `share_root` drains it in order.
-    pending_root_messages: Vec<WireMessage>,
+    /// Frames addressed to this end's root before `share_root` ran. The other end's
+    /// bootstrap may lawfully race ours, so root traffic queues instead of failing;
+    /// `share_root` drains it in order.
+    pending_root_frames: Vec<Frame>,
 }
 
 struct Inner {
     sink: WireSink,
-    /// Projections whose last `Remote` dropped; drained into `$release` sends.
+    /// Projections whose last `Remote` dropped; drained into `release` frames.
     releases: Rc<RefCell<Vec<u64>>>,
     state: RefCell<State>,
 }
@@ -142,8 +163,8 @@ pub(crate) struct Objects {
 }
 
 /// A non-owning handle for everything the registry itself stores (subscriptions, event
-/// sinks) or that user entities may hold indefinitely (every `Remote`): a strong
-/// capture there would cycle through `Inner` and keep every shared object alive
+/// sinks) or that user entities may hold indefinitely (every `Remote` and `Ref`): a
+/// strong capture there would cycle through `Inner` and keep every shared object alive
 /// forever. Remotes outliving their boundary resolve receipts with errors.
 #[derive(Clone)]
 pub(crate) struct WeakObjects {
@@ -155,6 +176,11 @@ impl WeakObjects {
         Some(Objects {
             inner: self.inner.upgrade()?,
         })
+    }
+
+    /// A handle to no registry at all.
+    pub(crate) fn detached() -> Self {
+        Self { inner: Weak::new() }
     }
 }
 
@@ -175,7 +201,7 @@ impl Objects {
         }
     }
 
-    /// Install `entity` as this end's root object (its id 0). The other end reaches it
+    /// Install `entity` as this end's root object (address 0). The other end reaches it
     /// with `root()`; everything else it can reach is a method of this object
     /// returning refs. Root traffic that arrived first was queued and is delivered
     /// now, in order, so the two bootstraps may race freely.
@@ -191,16 +217,16 @@ impl Objects {
         let mut methods = Methods::new(entity.downgrade());
         T::methods(&mut methods);
         let events = T::events(entity, self.event_sink(entity_id), cx);
-        self.install::<S, T>(entity, methods, events, entity_id, cx);
-        let queued = std::mem::take(&mut self.inner.state.borrow_mut().pending_root_messages);
-        for message in queued {
-            self.deliver_message(message, cx);
+        self.install::<S, T>(entity, methods, events, entity_id, T::keep_alive(), cx);
+        let queued = std::mem::take(&mut self.inner.state.borrow_mut().pending_root_frames);
+        for frame in queued {
+            self.deliver(frame, cx);
         }
     }
 
     /// Share a local entity, returning a capability reference to embed in message or
     /// event payloads. The registry holds the entity alive until the other end's last
-    /// remote drops.
+    /// remote drops, unless `T` opts out via [`Shared::keep_alive`].
     pub fn share<S, T>(&self, entity: &Entity<T>, cx: &mut App) -> Ref<S>
     where
         S: Interface,
@@ -210,8 +236,8 @@ impl Objects {
         T::methods(&mut methods);
         let entity_id = self.reserve_local_id();
         let events = T::events(entity, self.event_sink(entity_id), cx);
-        self.install::<S, T>(entity, methods, events, entity_id, cx);
-        Ref::from_raw(entity_id)
+        self.install::<S, T>(entity, methods, events, entity_id, T::keep_alive(), cx);
+        Ref::new(entity_id, self.downgrade())
     }
 
     /// [`Objects::share`] with a closure-registered dispatch table instead of a schema
@@ -230,8 +256,8 @@ impl Objects {
         let mut methods = Methods::new(entity.downgrade());
         register(&mut methods);
         let entity_id = self.reserve_local_id();
-        self.install::<S, T>(entity, methods, Vec::new(), entity_id, cx);
-        Ref::from_raw(entity_id)
+        self.install::<S, T>(entity, methods, Vec::new(), entity_id, true, cx);
+        Ref::new(entity_id, self.downgrade())
     }
 
     /// Attach to the other end's root object (the reserved address 0 means "your root"
@@ -241,21 +267,28 @@ impl Objects {
         self.connect_id(ROOT_ADDRESS)
     }
 
-    /// Attach to an entity through a capability reference received in a payload.
-    /// Connecting the same ref twice returns a handle to the same projection; when the
-    /// last clone drops, the home end is told to release the entity. Context-free:
-    /// connecting allocates nothing but a map entry.
-    pub fn connect<S: Interface>(&self, reference: Ref<S>) -> Remote<S> {
-        let entity_id = reference.entity_id();
-        if self.inner.state.borrow().homes.contains_key(&entity_id) {
+    /// Whether `id` is an object homed on this end.
+    pub fn is_local(&self, id: u64) -> bool {
+        self.inner.state.borrow().homes.contains_key(&id)
+    }
+
+    /// The entity behind a local object id, if it is a `T` and still alive: how side
+    /// traffic addressed by object id (a scene for a surface) finds its target.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub fn local_entity<T: 'static>(&self, id: u64) -> Option<Entity<T>> {
+        let entity = self.inner.state.borrow().homes.get(&id)?.entity.upgrade()?;
+        entity.downcast::<T>().ok()
+    }
+
+    /// Attach to an entity by id. Connecting the same id twice returns a handle to the
+    /// same projection; when the last clone drops, the home end is told to release the
+    /// entity. Context-free: connecting allocates nothing but a map entry.
+    pub(crate) fn connect_id<S: Interface>(&self, entity_id: u64) -> Remote<S> {
+        if entity_id != ROOT_ADDRESS && self.is_local(entity_id) {
             log::warn!(
                 "embedded_gpui: connecting a ref homed on this end (loopback) is not supported"
             );
         }
-        self.connect_id(entity_id)
-    }
-
-    fn connect_id<S: Interface>(&self, entity_id: u64) -> Remote<S> {
         let existing = {
             let state = self.inner.state.borrow();
             state
@@ -264,11 +297,12 @@ impl Objects {
                 .and_then(|projection| Some((projection.guard.upgrade()?, projection.type_name)))
         };
         if let Some((guard, type_name)) = existing {
-            if type_name != crate::interface_name::<S>() {
+            let requested = crate::interface_name::<S>();
+            let opaque = crate::interface_name::<crate::Opaque>();
+            if type_name != requested && type_name != opaque && requested != opaque {
                 log::error!(
-                    "embedded_gpui: object {entity_id} connected as {} but already live as \
-                     {type_name}",
-                    crate::interface_name::<S>()
+                    "embedded_gpui: object {entity_id} connected as {requested} but already \
+                     live as {type_name}"
                 );
             }
             return Remote::from_parts(self.downgrade(), entity_id, Some(guard));
@@ -305,9 +339,9 @@ impl Objects {
 
     /// The signal a projection's notifies and events land on, created on first demand
     /// (from `observe`/`subscribe`, which have a context). Creation mints the hidden
-    /// observer object that receives them as ordinary messages, and sends
-    /// `$subscribe(observer_ref)` — subscription is lazy, so a projection nobody
-    /// listens to costs the wire nothing. `None` if the projection is gone.
+    /// observer object that receives them as ordinary calls, and sends
+    /// `subscribe(observer)` — subscription is lazy, so a projection nobody listens to
+    /// costs the wire nothing. `None` if the projection is gone.
     pub(crate) fn signal_for(&self, entity_id: u64, cx: &mut App) -> Option<Entity<RemoteSignal>> {
         let existing = self
             .inner
@@ -328,15 +362,15 @@ impl Objects {
             .projections
             .get_mut(&entity_id)?
             .signal = Some((signal.clone(), observer_id));
-        (self.inner.sink)(WireOutgoing::Message(WireMessage::Subscribe {
-            entity_id,
-            observer_id,
-        }));
+        (self.inner.sink)(Frame::Subscribe {
+            target: entity_id,
+            observer: observer_id,
+        });
         Some(signal)
     }
 
     /// Install the hidden observer object behind a projection's signal: a home whose
-    /// handler turns incoming messages back into gpui reactivity — `$notify` becomes
+    /// handler turns incoming calls back into gpui reactivity — `$notify` becomes
     /// `cx.notify`, any other method name is a typed event for `cx.emit`.
     fn install_observer(&self, signal: Entity<RemoteSignal>) -> u64 {
         let entity_id = self.reserve_local_id();
@@ -347,11 +381,11 @@ impl Objects {
                 signal.update(cx, |_, cx| {
                     cx.emit(RawEvent {
                         name: method.to_string(),
-                        payload: payload.to_vec(),
+                        payload: payload.clone(),
                     })
                 });
             }
-            HandlerResponse::Ready(Ok(Vec::new()))
+            HandlerResponse::Ready(Ok(Payload::empty()))
         });
         self.inner.state.borrow_mut().homes.insert(
             entity_id,
@@ -359,7 +393,7 @@ impl Objects {
                 type_name: "observer",
                 handler,
                 observers: Vec::new(),
-                strong: None,
+                entity: HomeEntity::None,
                 _subscriptions: Vec::new(),
             },
         );
@@ -370,30 +404,30 @@ impl Objects {
         &self,
         entity_id: u64,
         method: &str,
-        payload: Vec<u8>,
+        payload: Payload,
         response: Option<ResponseSender>,
     ) {
-        let message = {
+        let call = {
             let mut state = self.inner.state.borrow_mut();
             if !state.projections.contains_key(&entity_id) {
                 // Dropping `response` here resolves the caller's receipt with an error.
-                log::warn!("embedded_gpui: send to released object {entity_id}");
+                log::warn!("embedded_gpui: call to released object {entity_id}");
                 return;
             }
-            let request_id = response.map(|sender| {
+            let request = response.map(|sender| {
                 state.next_request_id += 1;
-                let request_id = state.next_request_id;
-                state.pending_responses.insert(request_id, sender);
-                request_id
+                let request = state.next_request_id;
+                state.pending_responses.insert(request, sender);
+                request
             });
-            WireCall {
-                entity_id,
-                request_id,
+            Call {
+                target: entity_id,
+                request,
                 method: method.to_string(),
                 payload,
             }
         };
-        (self.inner.sink)(WireOutgoing::Message(WireMessage::Call(message)));
+        (self.inner.sink)(Frame::Call(call));
     }
 
     /// Mint a fresh object id: random, nonzero, and unused here. Randomness is what
@@ -401,7 +435,7 @@ impl Objects {
     /// any number of hands unrewritten) and unguessable (an id can only be learned
     /// from a payload that carried it; enumeration is infeasible). Collisions with ids
     /// minted by the other end are birthday-bounded at ~2^-64 per pair; the loopback
-    /// check in `connect` doubles as the tripwire.
+    /// check in `connect_id` doubles as the tripwire.
     fn reserve_local_id(&self) -> u64 {
         let state = self.inner.state.borrow();
         loop {
@@ -422,7 +456,7 @@ impl Objects {
     /// onto the wire. Weak because the registry stores the resulting subscriptions.
     fn event_sink(&self, entity_id: u64) -> crate::EventSink {
         let objects = self.downgrade();
-        Rc::new(move |event: &str, payload: Vec<u8>, _cx: &mut App| {
+        Rc::new(move |event: &str, payload: Payload, _cx: &mut App| {
             if let Some(objects) = objects.upgrade() {
                 objects.notify_observers(entity_id, event, payload);
             }
@@ -435,6 +469,7 @@ impl Objects {
         methods: Methods<S, T>,
         event_forwarders: Vec<Subscription>,
         entity_id: u64,
+        keep_alive: bool,
         cx: &mut App,
     ) where
         S: Interface,
@@ -443,25 +478,30 @@ impl Objects {
         let objects = self.downgrade();
         let mut subscriptions = vec![cx.observe(entity, move |_, _| {
             if let Some(objects) = objects.upgrade() {
-                objects.notify_observers(entity_id, NOTIFY_EVENT, Vec::new());
+                objects.notify_observers(entity_id, NOTIFY_EVENT, Payload::empty());
             }
         })];
         subscriptions.extend(event_forwarders);
+        let entity = if keep_alive {
+            HomeEntity::Strong(entity.clone().into_any())
+        } else {
+            HomeEntity::Weak(entity.downgrade().into())
+        };
         self.inner.state.borrow_mut().homes.insert(
             entity_id,
             HomeEntry {
                 type_name: crate::interface_name::<S>(),
                 handler: methods.into_handler(),
                 observers: Vec::new(),
-                strong: Some(entity.clone().into_any()),
+                entity,
                 _subscriptions: subscriptions,
             },
         );
     }
 
     /// Send one notify or typed event from a local home to every observer object the
-    /// other end registered: plain messages, fire-and-forget.
-    fn notify_observers(&self, entity_id: u64, method: &str, payload: Vec<u8>) {
+    /// other end registered: plain calls, fire-and-forget.
+    fn notify_observers(&self, entity_id: u64, method: &str, payload: Payload) {
         let observers = self
             .inner
             .state
@@ -471,43 +511,42 @@ impl Objects {
             .map(|home| home.observers.clone())
             .unwrap_or_default();
         for observer in observers {
-            (self.inner.sink)(WireOutgoing::Message(WireMessage::Call(WireCall {
-                entity_id: observer,
-                request_id: None,
+            (self.inner.sink)(Frame::Call(Call {
+                target: observer,
+                request: None,
                 method: method.to_string(),
                 payload: payload.clone(),
-            })));
+            }));
         }
     }
 
-    /// Handle one incoming message to a local home: control methods inline, everything
-    /// else through the dispatch table. Responses (for messages carrying a request id)
-    /// flow back through the sink, after any sends the handler itself made.
-    pub fn deliver_message(&self, message: WireMessage, cx: &mut App) {
-        // The constitutive frames first: they never touch a handler and never respond.
-        let call = match message {
-            WireMessage::Subscribe {
-                entity_id,
-                observer_id,
-            } => {
+    /// Apply one inbound frame: resolve a response, register or drop an observer, or
+    /// dispatch a call to its home. Responses to calls (for frames carrying a request
+    /// id) flow back through the sink, after any sends the handler itself made.
+    pub fn deliver(&self, frame: Frame, cx: &mut App) {
+        let call = match frame {
+            Frame::Response(response) => {
+                self.deliver_response(response);
+                return;
+            }
+            Frame::Subscribe { target, observer } => {
                 let known = {
                     let mut state = self.inner.state.borrow_mut();
-                    match state.homes.get_mut(&entity_id) {
+                    match state.homes.get_mut(&target) {
                         Some(home) => {
-                            home.observers.push(observer_id);
+                            home.observers.push(observer);
                             true
                         }
-                        None if entity_id == ROOT_ADDRESS => {
+                        None if target == ROOT_ADDRESS => {
                             // The other end's bootstrap outran ours; deliver once our
                             // root arrives.
-                            state.pending_root_messages.push(WireMessage::Subscribe {
-                                entity_id,
-                                observer_id,
-                            });
+                            state
+                                .pending_root_frames
+                                .push(Frame::Subscribe { target, observer });
                             return;
                         }
                         None => {
-                            log::warn!("embedded_gpui: subscribe to unknown object {entity_id}");
+                            log::warn!("embedded_gpui: subscribe to unknown object {target}");
                             false
                         }
                     }
@@ -515,37 +554,37 @@ impl Objects {
                 if known {
                     // A subscription is answered with an initial notify, so a new
                     // observer always fires at least once.
-                    (self.inner.sink)(WireOutgoing::Message(WireMessage::Call(WireCall {
-                        entity_id: observer_id,
-                        request_id: None,
+                    (self.inner.sink)(Frame::Call(Call {
+                        target: observer,
+                        request: None,
                         method: NOTIFY_EVENT.to_string(),
-                        payload: Vec::new(),
-                    })));
+                        payload: Payload::empty(),
+                    }));
                 }
                 return;
             }
-            WireMessage::Release { entity_id } => {
-                if let Some(home) = self.inner.state.borrow_mut().homes.get_mut(&entity_id) {
-                    home.strong = None;
+            Frame::Release { target } => {
+                if let Some(home) = self.inner.state.borrow_mut().homes.get_mut(&target) {
+                    home.entity.release();
                     home.observers.clear();
                 }
                 return;
             }
-            WireMessage::Call(call) => call,
+            Frame::Call(call) => call,
         };
 
         let handler = {
             let mut state = self.inner.state.borrow_mut();
-            let Some(home) = state.homes.get_mut(&call.entity_id) else {
-                if call.entity_id == ROOT_ADDRESS {
+            let Some(home) = state.homes.get_mut(&call.target) else {
+                if call.target == ROOT_ADDRESS {
                     // The other end's bootstrap outran ours; deliver once our root
                     // arrives.
-                    state.pending_root_messages.push(WireMessage::Call(call));
+                    state.pending_root_frames.push(Frame::Call(call));
                     return;
                 }
-                let id = call.entity_id;
+                let id = call.target;
                 drop(state);
-                self.respond(call.request_id, Err(format!("call to unknown object {id}")));
+                self.respond(call.request, Err(format!("call to unknown object {id}")));
                 return;
             };
             // Straight to the object's one handler; how it interprets the name (a
@@ -553,19 +592,21 @@ impl Objects {
             // registry's.
             home.handler.clone()
         };
-        let outcome = match handler(&call.method, &call.payload, cx) {
+        // Refs in the payload resolve against this registry.
+        let payload = call.payload.bound(self.downgrade());
+        let outcome = match handler(&call.method, &payload, cx) {
             HandlerResponse::Ready(result) => result.map_err(|error| format!("{error:#}")),
             HandlerResponse::Pending(task) => {
                 // The handler's work outlives this delivery; the response flows when
                 // its task resolves.
                 let objects = self.clone();
-                let request_id = call.request_id;
+                let request = call.request;
                 cx.spawn(async move |_| {
                     let outcome = task.await.map_err(|error| format!("{error:#}"));
                     if let Err(error) = &outcome {
                         log::error!("embedded_gpui: method call failed: {error}");
                     }
-                    objects.respond(request_id, outcome);
+                    objects.respond(request, outcome);
                 })
                 .detach();
                 return;
@@ -574,39 +615,38 @@ impl Objects {
         if let Err(error) = &outcome {
             log::error!("embedded_gpui: method call failed: {error}");
         }
-        self.respond(call.request_id, outcome);
+        self.respond(call.request, outcome);
     }
 
-    fn respond(&self, request_id: Option<u64>, outcome: Result<Vec<u8>, String>) {
-        if let Some(request_id) = request_id {
-            (self.inner.sink)(WireOutgoing::Response(WireResponse {
-                request_id,
-                outcome,
-            }));
+    fn respond(&self, request: Option<u64>, outcome: Result<Payload, String>) {
+        if let Some(request) = request {
+            (self.inner.sink)(Frame::Response(Response { request, outcome }));
         }
     }
 
-    /// Deliver an incoming event from the other end to this end's remotes.
     /// Resolve the receipt waiting on an incoming response.
-    pub fn deliver_response(&self, response: WireResponse) {
+    fn deliver_response(&self, response: Response) {
         let sender = self
             .inner
             .state
             .borrow_mut()
             .pending_responses
-            .remove(&response.request_id);
+            .remove(&response.request);
         let Some(sender) = sender else {
             log::warn!(
                 "embedded_gpui: response for unknown request {}",
-                response.request_id
+                response.request
             );
             return;
         };
-        sender.send(response.outcome).ok();
+        let outcome = response
+            .outcome
+            .map(|payload| payload.bound(self.downgrade()));
+        sender.send(outcome).ok();
     }
 
     /// Flush queued capability releases (projections whose last `Remote` dropped) into
-    /// `$release` sends. Called from the boundary's pump, and before applying incoming
+    /// `release` frames. Called from the boundary's pump, and before applying incoming
     /// work, so drops become observable promptly.
     pub fn drain_releases(&self) {
         loop {
@@ -620,7 +660,7 @@ impl Objects {
         }
     }
 
-    /// Send `$release` for a projection and forget it locally. The home end drops its
+    /// Send `release` for a projection and forget it locally. The home end drops its
     /// strong handle; events stop flowing.
     fn release_id(&self, entity_id: u64) {
         let removed = self.inner.state.borrow_mut().projections.remove(&entity_id);
@@ -628,10 +668,10 @@ impl Objects {
             return;
         };
         // The projection's hidden observer object goes with it; the home end forgets
-        // its side on `$release`.
+        // its side on `release`.
         if let Some((_, observer_id)) = projection.signal {
             self.inner.state.borrow_mut().homes.remove(&observer_id);
         }
-        (self.inner.sink)(WireOutgoing::Message(WireMessage::Release { entity_id }));
+        (self.inner.sink)(Frame::Release { target: entity_id });
     }
 }

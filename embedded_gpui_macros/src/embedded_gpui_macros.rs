@@ -68,10 +68,14 @@ pub fn interface(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// A method the block omits stays callable-but-unhandled: callers get a "no method"
 /// error at runtime, not a compile error, so keep the block complete.
+///
+/// `#[shared(keep_alive = false)]` makes shares of the type weak: the registry does not
+/// keep the entity alive for the other end (see `Shared::keep_alive`).
 #[proc_macro_attribute]
-pub fn shared(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn shared(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let args = syn::parse_macro_input!(attr as SharedArgs);
     let item_impl = syn::parse_macro_input!(item as ItemImpl);
-    match expand_home(item_impl) {
+    match expand_home(args, item_impl) {
         Ok(tokens) => tokens.into(),
         Err(error) => error.to_compile_error().into(),
     }
@@ -95,6 +99,31 @@ pub fn data(_attr: TokenStream, item: TokenStream) -> TokenStream {
         #item
     }
     .into()
+}
+
+struct SharedArgs {
+    keep_alive: bool,
+}
+
+impl Parse for SharedArgs {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let mut keep_alive = true;
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            if key != "keep_alive" {
+                return Err(syn::Error::new(
+                    key.span(),
+                    "expected `keep_alive = <bool>`",
+                ));
+            }
+            input.parse::<Token![=]>()?;
+            keep_alive = input.parse::<syn::LitBool>()?.value;
+            if input.peek(Token![,]) {
+                input.parse::<Token![,]>()?;
+            }
+        }
+        Ok(Self { keep_alive })
+    }
 }
 
 struct InterfaceArgs {
@@ -430,6 +459,53 @@ fn expand_interface(
         }
     });
 
+    let schema_methods = methods.iter().map(|method| {
+        let Method {
+            method_name,
+            field_names,
+            field_types,
+            response,
+            ref_response,
+            is_async,
+            ..
+        } = method;
+        let argument_names = field_names.iter().map(|name| name.to_string());
+        let returns_ref = match ref_response {
+            Some(inner) => quote!(Some(::std::any::type_name::<#inner>())),
+            None => quote!(None),
+        };
+        quote! {
+            embedded_gpui::MethodSchema {
+                name: #method_name,
+                arguments: vec![
+                    #(embedded_gpui::ArgumentSchema {
+                        name: #argument_names,
+                        ty: ::std::any::type_name::<#field_types>(),
+                    },)*
+                ],
+                response: ::std::any::type_name::<#response>(),
+                returns_ref: #returns_ref,
+                is_async: #is_async,
+            }
+        }
+    });
+    let schema_events = events.iter().map(|event| {
+        let event_name = snake_case(
+            &event
+                .segments
+                .last()
+                .map(|segment| segment.ident.to_string())
+                .unwrap_or_default(),
+        );
+        quote! {
+            embedded_gpui::EventSchema {
+                name: #event_name,
+                ty: ::std::any::type_name::<#event>(),
+            }
+        }
+    });
+    let spec_name = spec_ident.to_string();
+
     let spec_doc = format!(
         "\n\nThe `{spec_ident}` interface: hold one as `Remote<{spec_ident}>`, \
          reference one as `Ref<{spec_ident}>`, implement one with \
@@ -447,7 +523,15 @@ fn expand_interface(
         #[doc = #spec_doc]
         #vis struct #spec_ident;
 
-        impl embedded_gpui::Interface for #spec_ident {}
+        impl embedded_gpui::Interface for #spec_ident {
+            fn schema() -> embedded_gpui::Schema {
+                embedded_gpui::Schema {
+                    name: #spec_name,
+                    methods: vec![#(#schema_methods,)*],
+                    events: vec![#(#schema_events,)*],
+                }
+            }
+        }
 
         impl #spec_ident {
             #(#register_fns)*
@@ -484,7 +568,8 @@ fn expand_interface(
     })
 }
 
-fn expand_home(mut item_impl: ItemImpl) -> syn::Result<proc_macro2::TokenStream> {
+fn expand_home(args: SharedArgs, mut item_impl: ItemImpl) -> syn::Result<proc_macro2::TokenStream> {
+    let keep_alive = args.keep_alive;
     let Some((None, spec_path, _for_token)) = item_impl.trait_.clone() else {
         return Err(syn::Error::new(
             item_impl.span(),
@@ -524,6 +609,10 @@ fn expand_home(mut item_impl: ItemImpl) -> syn::Result<proc_macro2::TokenStream>
                 cx: &mut embedded_gpui::gpui::App,
             ) -> Vec<embedded_gpui::gpui::Subscription> {
                 #spec_path::wire_events::<Self>(entity, sink, cx)
+            }
+
+            fn keep_alive() -> bool {
+                #keep_alive
             }
         }
     })

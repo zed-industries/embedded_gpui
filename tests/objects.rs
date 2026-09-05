@@ -12,18 +12,21 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+use embedded_gpui::surface::{
+    Geometry, Modifiers, MouseButton, MouseButtonEvent, MouseEvent, Point, ViewApiCaller as _,
+};
 use embedded_gpui::{
-    PluginHost, PluginHostHandle as _, PluginInstance, PluginOptions, Remote, decode, encode,
-    shared,
+    Interface, Payload, PluginHost, PluginHostHandle as _, PluginInstance, PluginOptions, Ref,
+    Remote, Surface, decode, encode, shared,
 };
 use embedded_gpui_util::{Attenuated, Audited, Mirror};
 use gpui::{AppContext as _, Context, Entity, Task, TestAppContext};
 use rand::prelude::*;
 use test_schema::{
     Bump, ChameleonApi, ChameleonState, Count, CounterMilestone, FactoryApi, FactoryApiCaller as _,
-    GatekeeperApi, GatekeeperApiCaller as _, Increment, ItemApiCaller as _, TestCounterApi,
-    TestCounterApiCaller as _, TestHost, TestPlugin, TestPluginCaller as _, VaultApi,
-    VaultApiCaller as _,
+    GatekeeperApi, GatekeeperApiCaller as _, Increment, ItemApiCaller as _, KeyApi,
+    KeyApiCaller as _, TestCounterApi, TestCounterApiCaller as _, TestHost, TestPlugin,
+    TestPluginCaller as _, VaultApi, VaultApiCaller as _, ViewProbeApiCaller as _,
 };
 
 /// Builds the test plugin once per process and returns the component path.
@@ -262,9 +265,13 @@ async fn test_shared_refs_build_object_graphs(cx: &mut TestAppContext) {
 }
 
 /// The host half of the membrane test: an entity whose secret is only reachable via a
-/// capability, with a deliberately asynchronous read handler.
+/// capability, with a deliberately asynchronous read handler, and which hands out a
+/// further capability (the key) so the membrane has a ref to wrap.
 struct Vault {
     secret: String,
+    key: Entity<Key>,
+    key_ref: Option<Ref<KeyApi>>,
+    host: Entity<PluginHost>,
 }
 
 #[shared]
@@ -278,6 +285,33 @@ impl VaultApi for Vault {
             Ok(secret)
         })
     }
+
+    fn key(&mut self, cx: &mut Context<Self>) -> Ref<KeyApi> {
+        if let Some(reference) = &self.key_ref {
+            return reference.clone();
+        }
+        let reference = self.host.share(&self.key, cx);
+        self.key_ref = Some(reference.clone());
+        reference
+    }
+}
+
+struct Key;
+
+#[shared]
+impl KeyApi for Key {
+    fn unlock(&mut self, _cx: &mut Context<Self>) -> String {
+        "opened".to_string()
+    }
+}
+
+fn new_vault(host: &Entity<PluginHost>, cx: &mut TestAppContext) -> Entity<Vault> {
+    cx.new(|cx| Vault {
+        secret: "swordfish".to_string(),
+        key: cx.new(|_| Key),
+        key_ref: None,
+        host: host.clone(),
+    })
 }
 
 #[gpui::test]
@@ -286,15 +320,13 @@ async fn test_caretaker_membrane_forwards_and_revokes(cx: &mut TestAppContext) {
 
     // A host-homed vault, shared anonymously: the ref is the only way in, and reads go
     // through an async handler.
-    let vault = cx.new(|_| Vault {
-        secret: "swordfish".to_string(),
-    });
+    let vault = new_vault(&host, cx);
     let vault_ref = cx.update(|cx| host.share(&vault, cx));
 
     // Hand the vault capability to the plugin's gatekeeper; it wraps it in a caretaker
     // and returns a ref to *that*. The caller can't tell the difference.
     let gatekeeper = gatekeeper(&host, cx).await;
-    let guarded = cx.update(|cx| gatekeeper.guard(vault_ref, cx));
+    let guarded = cx.update(|cx| gatekeeper.guard(vault_ref.clone(), cx));
     settle(cx);
     let guarded = guarded.await.expect("guard should respond with a remote");
     assert_ne!(guarded.reference().entity_id(), vault_ref.entity_id());
@@ -365,7 +397,7 @@ async fn test_dropping_last_remote_releases_the_capability(cx: &mut TestAppConte
     settle(cx);
 
     // Re-connecting the same ref finds nobody home.
-    let item = cx.update(|cx| host.connect(item_ref, cx));
+    let item = item_ref.connect();
     let bumped = cx.update(|cx| item.bump(cx));
     settle(cx);
     let error = bumped.await.expect_err("bump after release must fail");
@@ -397,9 +429,9 @@ async fn test_attenuation_is_a_library_pattern(cx: &mut TestAppContext) {
     let gatekeeper = gatekeeper(&host, cx).await;
     let denied = cx.update(|cx| {
         gatekeeper.probe(
-            readonly_ref,
+            readonly_ref.clone(),
             "bump".to_string(),
-            encode(&Bump {}).expect("encode bump"),
+            encode(&Bump {}).expect("encode bump").bytes,
             cx,
         )
     });
@@ -422,13 +454,14 @@ async fn test_attenuation_is_a_library_pattern(cx: &mut TestAppContext) {
         gatekeeper.probe(
             writable_ref,
             "bump".to_string(),
-            encode(&Bump {}).expect("encode bump"),
+            encode(&Bump {}).expect("encode bump").bytes,
             cx,
         )
     });
     settle(cx);
     let response = allowed.await.expect("bump through allowlisted wrapper");
-    let bumps: u32 = decode(&response).expect("decode bump response");
+    let bumps: u32 =
+        decode(&Payload::from_parts(response, Vec::new())).expect("decode bump response");
     assert_eq!(bumps, 2);
 }
 
@@ -450,9 +483,9 @@ async fn test_audited_wrapper_keeps_a_ledger(cx: &mut TestAppContext) {
     for _ in 0..2 {
         let bumped = cx.update(|cx| {
             gatekeeper.probe(
-                audited_ref,
+                audited_ref.clone(),
                 "bump".to_string(),
-                encode(&Bump {}).expect("encode bump"),
+                encode(&Bump {}).expect("encode bump").bytes,
                 cx,
             )
         });
@@ -473,6 +506,164 @@ async fn test_audited_wrapper_keeps_a_ledger(cx: &mut TestAppContext) {
     let info = cx.update(|cx| item.describe(cx));
     settle(cx);
     assert_eq!(info.await.expect("describe").bumps, 2);
+}
+
+#[gpui::test]
+async fn test_membrane_wraps_refs_transitively(cx: &mut TestAppContext) {
+    let host = setup(cx);
+    let vault = new_vault(&host, cx);
+    let vault_ref = cx.update(|cx| host.share(&vault, cx));
+    let gatekeeper = gatekeeper(&host, cx).await;
+    let guarded = cx.update(|cx| gatekeeper.guard(vault_ref.clone(), cx));
+    settle(cx);
+    let guarded = guarded.await.expect("guard");
+
+    // A ref returned *through* the membrane is not the vault's key but a wrapper minted
+    // by the membrane: the ref table let the caretaker substitute it without parsing
+    // the response.
+    let key = cx.update(|cx| guarded.key(cx));
+    settle(cx);
+    let key = key.await.expect("key through membrane");
+    let real_key_id = vault.read_with(cx, |vault, _| {
+        vault.key_ref.as_ref().expect("key shared").entity_id()
+    });
+    assert_ne!(key.reference().entity_id(), real_key_id);
+
+    // The wrapped key works like the real one...
+    let unlocked = cx.update(|cx| key.unlock(cx));
+    settle(cx);
+    assert_eq!(unlocked.await.expect("unlock"), "opened");
+
+    // ...until the membrane is revoked, which severs everything reached through it.
+    let revoked = cx.update(|cx| {
+        guarded
+            .call_raw("revoke", encode(&()).expect("encode unit"), cx)
+            .acknowledged()
+    });
+    settle(cx);
+    revoked.await.expect("revoke");
+    let unlocked = cx.update(|cx| key.unlock(cx));
+    settle(cx);
+    let error = unlocked
+        .await
+        .expect_err("keys obtained through a revoked membrane fail");
+    assert!(
+        error.to_string().contains("capability revoked"),
+        "unexpected error: {error:#}"
+    );
+
+    // The real key is untouched: a fresh membrane around the same vault reaches it
+    // again. The old membrane wrapped, it did not own.
+    let guarded_again = cx.update(|cx| gatekeeper.guard(vault_ref, cx));
+    settle(cx);
+    let guarded_again = guarded_again.await.expect("guard again");
+    let key_again = cx.update(|cx| guarded_again.key(cx));
+    settle(cx);
+    let key_again = key_again.await.expect("key through the new membrane");
+    let unlocked = cx.update(|cx| key_again.unlock(cx));
+    settle(cx);
+    assert_eq!(
+        unlocked.await.expect("unlock through the new membrane"),
+        "opened"
+    );
+}
+
+#[gpui::test]
+async fn test_views_are_objects(cx: &mut TestAppContext) {
+    let host = setup(cx);
+
+    // A surface is an ordinary host entity, shared like any other object. The plugin
+    // receives its ref through a typed method and opens a view on it.
+    let surface = cx.new(Surface::new);
+    let surface_ref = cx.update(|cx| host.share(&surface, cx));
+    let root = cx.update(|cx| host.root::<TestPlugin>(cx));
+    let probe = cx.update(|cx| root.mount(surface_ref, cx));
+    settle(cx);
+    let probe = probe.await.expect("mount");
+
+    // The guest attached its view object to the surface.
+    let view = surface
+        .read_with(cx, |surface, _| surface.view().cloned())
+        .expect("the guest attached a view");
+
+    // Geometry is a method call on the view (layout would make this call; tests drive
+    // it directly), and the guest renders at that size: a display list comes back.
+    let geometry = Geometry {
+        width: 200.,
+        height: 100.,
+        scale_factor: 2.,
+    };
+    cx.update(|cx| view.resize(geometry, cx));
+    settle(cx);
+    let seen = cx.update(|cx| probe.last_geometry(cx));
+    settle(cx);
+    assert_eq!(seen.await.expect("geometry"), Some(geometry));
+    assert!(
+        surface.read_with(cx, |surface, _| surface.has_scene()),
+        "the surface received a display list"
+    );
+
+    // Input is a method call too; the guest's own dispatch hit-tests and runs listeners.
+    let click = MouseButtonEvent {
+        button: MouseButton::Left,
+        position: Point { x: 10., y: 10. },
+        modifiers: Modifiers::default(),
+        click_count: 1,
+    };
+    cx.update(|cx| {
+        view.mouse(MouseEvent::Down(click.clone()), cx);
+        view.mouse(MouseEvent::Up(click), cx);
+    });
+    settle(cx);
+    let clicks = cx.update(|cx| probe.clicks(cx));
+    settle(cx);
+    assert_eq!(clicks.await.expect("clicks"), 1);
+
+    // The surface belongs to its owner: dropping it releases the view, and the guest
+    // closes the window behind it.
+    let alive = cx.update(|cx| probe.view_alive(cx));
+    settle(cx);
+    assert!(alive.await.expect("alive"));
+    drop(view);
+    drop(surface);
+    cx.update(|cx| host.pump(cx));
+    settle(cx);
+    let alive = cx.update(|cx| probe.view_alive(cx));
+    settle(cx);
+    assert!(!alive.await.expect("alive"), "the view should be gone");
+}
+
+#[gpui::test]
+async fn test_interfaces_describe_themselves(_cx: &mut TestAppContext) {
+    let schema = TestPlugin::schema();
+    assert_eq!(schema.name, "TestPlugin");
+    let names: Vec<_> = schema.methods.iter().map(|method| method.name).collect();
+    assert_eq!(
+        names,
+        [
+            "counter",
+            "factory",
+            "gatekeeper",
+            "chameleon",
+            "ping_host",
+            "mount"
+        ]
+    );
+    let ping = &schema.methods[4];
+    assert!(ping.is_async);
+    assert_eq!(ping.arguments.len(), 1);
+    assert_eq!(ping.arguments[0].name, "message");
+    assert!(ping.arguments[0].ty.ends_with("String"));
+    let mount = &schema.methods[5];
+    assert!(
+        mount
+            .returns_ref
+            .is_some_and(|ty| ty.ends_with("ViewProbeApi"))
+    );
+
+    let counter = TestCounterApi::schema();
+    assert_eq!(counter.events.len(), 1);
+    assert_eq!(counter.events[0].name, "counter_milestone");
 }
 
 #[gpui::test]

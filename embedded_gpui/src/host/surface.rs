@@ -1,243 +1,171 @@
-//! The GPUI view that caches and replays a guest's retained display list, and forwards mouse
-//! input back to the guest. See DESIGN.md invariants 1, 5, 6, and 7.
+//! The host-side [`Surface`]: the entity behind a `SurfaceApi` object. It caches the
+//! guest's most recent display list and replays it every frame without calling into
+//! the guest (DESIGN.md invariant 1), and drives the attached `ViewApi` with resize and
+//! input as ordinary method calls.
 
 use gpui::{
     App, Bounds, BoxShadow, ContentMask, Context, Corners, Edges, FocusHandle, IntoElement,
-    KeyDownEvent, KeyUpEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PaintQuad, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, Size, UnderlineStyle,
-    WeakEntity, Window, canvas, div, point, prelude::*, px,
+    KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
+    Pixels, PlatformInput, Point, Render, ScrollWheelEvent, Size, UnderlineStyle, Window, canvas,
+    div, point, prelude::*, px,
 };
 
-use crate::bindings;
-use crate::{PluginHost, PluginImages};
+use crate::surface::{
+    Cursor, Geometry, KeyEvent, MouseEvent, SurfaceApi, ViewApi, ViewApiCaller as _,
+};
+use crate::{PluginImages, Ref, Remote, bindings};
 
-/// Host-side state for a single plugin view. The display list is a retained copy of the
-/// guest's most recent scene; the host replays it cheaply every frame without calling into
-/// the guest (DESIGN.md invariant 1).
-pub struct PluginViewState {
-    view_id: u32,
-    display_list: Option<bindings::DisplayList>,
+/// A place pixels go: one slot in the host's element tree, as a GPUI entity.
+///
+/// Create one, share it with a plugin host (`host.share(&surface, cx)` gives the
+/// `Ref<SurfaceApi>` to pass through any plugin method), and place the entity in your
+/// element tree like any view; it fills its slot. The guest attaches a view, which then
+/// receives the slot's geometry and input.
+///
+/// A surface's lifetime belongs to its owner: sharing it does not keep it alive (see
+/// [`Shared::keep_alive`](crate::Shared::keep_alive)). Drop the entity and the guest's
+/// remote dangles, its view is released, and the window behind it closes.
+pub struct Surface {
+    view: Option<Remote<ViewApi>>,
+    display_list: Option<(bindings::DisplayList, PluginImages)>,
     cursor: Option<gpui::CursorStyle>,
-    /// Set until the first layout; the guest's `create-view` is deferred so the
-    /// measured slot size and real scale factor shape the initial window.
-    pending_create: Option<String>,
-    last_size: Size<Pixels>,
+    geometry: Option<Geometry>,
     last_origin: Point<Pixels>,
-    host: WeakEntity<PluginHost>,
-    images: PluginImages,
     focus_handle: FocusHandle,
 }
 
-impl PluginViewState {
-    pub fn new(
-        view_id: u32,
-        name: String,
-        host: WeakEntity<PluginHost>,
-        images: PluginImages,
-        cx: &mut Context<Self>,
-    ) -> Self {
+impl Surface {
+    pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
-            view_id,
+            view: None,
             display_list: None,
             cursor: None,
-            pending_create: Some(name),
-            last_size: Size::default(),
+            geometry: None,
             last_origin: Point::default(),
-            host,
-            images,
             focus_handle: cx.focus_handle(),
         }
     }
 
-    pub fn set_display_list(&mut self, list: bindings::DisplayList) {
-        self.display_list = Some(list);
+    /// The view currently drawing here, if a guest has attached one.
+    pub fn view(&self) -> Option<&Remote<ViewApi>> {
+        self.view.as_ref()
     }
 
-    pub fn set_cursor(&mut self, cursor: gpui::CursorStyle) {
-        self.cursor = Some(cursor);
+    /// Whether a display list has arrived since the last attach.
+    pub fn has_scene(&self) -> bool {
+        self.display_list.is_some()
     }
 
-    /// Translate and forward a mouse button press or release to the guest.
-    fn emit_button(
-        &self,
-        pressed: bool,
-        button: MouseButton,
-        position: Point<Pixels>,
-        modifiers: gpui::Modifiers,
-        click_count: usize,
+    pub(crate) fn set_scene(
+        &mut self,
+        list: bindings::DisplayList,
+        images: PluginImages,
         cx: &mut Context<Self>,
     ) {
-        let Some(button) = wire_button(button) else {
+        self.display_list = Some((list, images));
+        cx.notify();
+    }
+
+    /// Forward input to the attached view. Fire-and-forget: the guest's own dispatch
+    /// does hit-testing and runs listeners (DESIGN.md invariant 7).
+    fn forward_mouse(&self, input: PlatformInput, cx: &mut Context<Self>) {
+        let Some(view) = &self.view else {
             return;
         };
-        let button_event = bindings::MouseButtonEvent {
-            button,
-            position: wire_point(position - self.last_origin),
-            modifiers: wire_modifiers(modifiers),
-            click_count: click_count as u32,
+        if let Some(event) = MouseEvent::from_gpui(&input, self.last_origin) {
+            view.mouse(event, cx);
+        }
+    }
+
+    fn forward_key(&self, input: PlatformInput, cx: &mut Context<Self>) {
+        let Some(view) = &self.view else {
+            return;
         };
-        let event = if pressed {
-            bindings::MouseEvent::Down(button_event)
-        } else {
-            bindings::MouseEvent::Up(button_event)
+        if let Some(event) = KeyEvent::from_gpui(&input) {
+            view.key(event, cx);
+        }
+    }
+
+    /// Record the slot's measured geometry and push it to the view if it changed.
+    fn measured(&mut self, size: Size<Pixels>, scale_factor: f32, cx: &mut Context<Self>) {
+        let geometry = Geometry {
+            width: f32::from(size.width),
+            height: f32::from(size.height),
+            scale_factor,
         };
-        self.forward_mouse(event, cx);
-    }
-
-    /// Forward a mouse event to the guest. Deferred so it never re-enters wasm while this
-    /// view is mid-update (the event listener runs inside the view's own lease), and so the
-    /// resulting scene update can safely update this view (DESIGN.md invariants 3 and 7).
-    fn forward_mouse(&self, event: bindings::MouseEvent, cx: &mut Context<Self>) {
-        let view_id = self.view_id;
-        let host = self.host.clone();
-        cx.defer(move |cx| {
-            if let Some(host) = host.upgrade() {
-                host.update(cx, |host, cx| host.handle_mouse(view_id, event, cx));
-            }
-        });
-    }
-
-    /// Forward a keyboard event to the guest; same deferral rules as `forward_mouse`.
-    fn forward_key(&self, event: bindings::KeyEvent, cx: &mut Context<Self>) {
-        let view_id = self.view_id;
-        let host = self.host.clone();
-        cx.defer(move |cx| {
-            if let Some(host) = host.upgrade() {
-                host.update(cx, |host, cx| host.handle_key(view_id, event, cx));
-            }
-        });
-    }
-
-    /// Ask the guest to open this view, now that its slot has been measured. Deferred
-    /// so it does not call into the host from inside layout.
-    fn request_create(&self, name: String, size: Size<Pixels>, scale: f32, cx: &mut Context<Self>) {
-        let host = self.host.clone();
-        let view_id = self.view_id;
-        cx.defer(move |cx| {
-            host.update(cx, |host, cx| {
-                host.create_view_now(view_id, name, size, scale, cx);
-            })
-            .ok();
-        });
-    }
-
-    /// Notify the guest that this view's slot changed size. Deferred so it does not call into
-    /// wasm during the host's draw (DESIGN.md invariant 1).
-    fn request_resize(&self, size: Size<Pixels>, scale: f32, cx: &mut Context<Self>) {
-        let view_id = self.view_id;
-        let host = self.host.clone();
-        cx.defer(move |cx| {
-            if let Some(host) = host.upgrade() {
-                host.update(cx, |host, cx| host.resize_view(view_id, size, scale, cx));
-            }
-        });
+        if self.geometry == Some(geometry) {
+            return;
+        }
+        self.geometry = Some(geometry);
+        if let Some(view) = &self.view {
+            view.resize(geometry, cx);
+        }
     }
 }
 
-impl Render for PluginViewState {
+#[crate::shared(keep_alive = false)]
+impl SurfaceApi for Surface {
+    fn attach(&mut self, view: Ref<ViewApi>, cx: &mut Context<Self>) {
+        let view = view.connect();
+        // The view renders at the slot's real size from its first frame: the geometry
+        // the slot was last measured at goes out before any input can.
+        if let Some(geometry) = self.geometry {
+            view.resize(geometry, cx);
+        }
+        self.view = Some(view);
+        self.display_list = None;
+        cx.notify();
+    }
+
+    fn set_cursor(&mut self, cursor: Cursor, cx: &mut Context<Self>) {
+        self.cursor = Some(cursor.to_gpui());
+        cx.notify();
+    }
+}
+
+impl Render for Surface {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let prepaint_entity = cx.entity();
         let paint_entity = cx.entity();
 
         div()
             .size_full()
-            .id(("plugin-view", self.view_id))
+            .id(("embedded-surface", cx.entity_id()))
             .track_focus(&self.focus_handle)
             .when_some(self.cursor, |this, cursor| this.cursor(cursor))
             .on_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, window, cx| {
                 window.focus(&this.focus_handle, cx);
-                this.emit_button(
-                    true,
-                    event.button,
-                    event.position,
-                    event.modifiers,
-                    event.click_count,
-                    cx,
-                );
+                this.forward_mouse(PlatformInput::MouseDown(event.clone()), cx);
             }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
-                this.forward_key(
-                    bindings::KeyEvent::Down(bindings::KeyDownEvent {
-                        keystroke: wire_keystroke(&event.keystroke),
-                        is_held: event.is_held,
-                    }),
-                    cx,
-                );
+                this.forward_key(PlatformInput::KeyDown(event.clone()), cx);
             }))
             .on_key_up(cx.listener(|this, event: &KeyUpEvent, _window, cx| {
-                this.forward_key(
-                    bindings::KeyEvent::Up(bindings::KeyUpEvent {
-                        keystroke: wire_keystroke(&event.keystroke),
-                    }),
-                    cx,
-                );
+                this.forward_key(PlatformInput::KeyUp(event.clone()), cx);
             }))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseUpEvent, _window, cx| {
-                    this.emit_button(
-                        false,
-                        event.button,
-                        event.position,
-                        event.modifiers,
-                        event.click_count,
-                        cx,
-                    );
+                    this.forward_mouse(PlatformInput::MouseUp(event.clone()), cx);
                 }),
             )
             .on_mouse_up(
                 MouseButton::Right,
                 cx.listener(|this, event: &MouseUpEvent, _window, cx| {
-                    this.emit_button(
-                        false,
-                        event.button,
-                        event.position,
-                        event.modifiers,
-                        event.click_count,
-                        cx,
-                    );
+                    this.forward_mouse(PlatformInput::MouseUp(event.clone()), cx);
                 }),
             )
             .on_mouse_up(
                 MouseButton::Middle,
                 cx.listener(|this, event: &MouseUpEvent, _window, cx| {
-                    this.emit_button(
-                        false,
-                        event.button,
-                        event.position,
-                        event.modifiers,
-                        event.click_count,
-                        cx,
-                    );
+                    this.forward_mouse(PlatformInput::MouseUp(event.clone()), cx);
                 }),
             )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
-                let position = wire_point(event.position - this.last_origin);
-                this.forward_mouse(
-                    bindings::MouseEvent::Move(bindings::MouseMoveEvent {
-                        position,
-                        pressed_button: event.pressed_button.and_then(wire_button),
-                        modifiers: wire_modifiers(event.modifiers),
-                    }),
-                    cx,
-                );
+                this.forward_mouse(PlatformInput::MouseMove(event.clone()), cx);
             }))
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
-                let position = wire_point(event.position - this.last_origin);
-                let (delta_x, delta_y, precise) = match event.delta {
-                    ScrollDelta::Pixels(delta) => (f32::from(delta.x), f32::from(delta.y), true),
-                    ScrollDelta::Lines(delta) => (delta.x, delta.y, false),
-                };
-                this.forward_mouse(
-                    bindings::MouseEvent::Scroll(bindings::ScrollWheelEvent {
-                        position,
-                        delta_x,
-                        delta_y,
-                        precise,
-                        modifiers: wire_modifiers(event.modifiers),
-                    }),
-                    cx,
-                );
+                this.forward_mouse(PlatformInput::ScrollWheel(event.clone()), cx);
             }))
             .child(
                 canvas(
@@ -245,13 +173,7 @@ impl Render for PluginViewState {
                         let scale = window.scale_factor();
                         prepaint_entity.update(cx, |this, cx| {
                             this.last_origin = bounds.origin;
-                            if let Some(name) = this.pending_create.take() {
-                                this.last_size = bounds.size;
-                                this.request_create(name, bounds.size, scale, cx);
-                            } else if bounds.size != this.last_size {
-                                this.last_size = bounds.size;
-                                this.request_resize(bounds.size, scale, cx);
-                            }
+                            this.measured(bounds.size, scale, cx);
                         });
                         bounds
                     },
@@ -259,9 +181,9 @@ impl Render for PluginViewState {
                           _: Bounds<Pixels>,
                           window: &mut Window,
                           cx: &mut App| {
-                        let view = paint_entity.read(cx);
-                        if let Some(list) = view.display_list.as_ref() {
-                            let images = view.images.borrow();
+                        let surface = paint_entity.read(cx);
+                        if let Some((list, images)) = surface.display_list.as_ref() {
+                            let images = images.borrow();
                             replay(list, bounds, &images, window);
                         }
                     },
@@ -433,14 +355,6 @@ fn paint_primitive(
     }
 }
 
-fn wire_keystroke(keystroke: &Keystroke) -> bindings::Keystroke {
-    bindings::Keystroke {
-        modifiers: wire_modifiers(keystroke.modifiers),
-        key: keystroke.key.clone(),
-        key_char: keystroke.key_char.clone(),
-    }
-}
-
 fn to_point(point: &bindings::Point, offset: Point<Pixels>) -> Point<Pixels> {
     gpui::point(px(point.x) + offset.x, px(point.y) + offset.y)
 }
@@ -478,30 +392,5 @@ fn to_border_style(style: bindings::BorderStyle) -> gpui::BorderStyle {
     match style {
         bindings::BorderStyle::Solid => gpui::BorderStyle::Solid,
         bindings::BorderStyle::Dashed => gpui::BorderStyle::Dashed,
-    }
-}
-
-fn wire_button(button: MouseButton) -> Option<bindings::MouseButton> {
-    match button {
-        MouseButton::Left => Some(bindings::MouseButton::Left),
-        MouseButton::Right => Some(bindings::MouseButton::Right),
-        MouseButton::Middle => Some(bindings::MouseButton::Middle),
-        _ => None,
-    }
-}
-
-fn wire_modifiers(modifiers: gpui::Modifiers) -> bindings::Modifiers {
-    bindings::Modifiers {
-        control: modifiers.control,
-        alt: modifiers.alt,
-        shift: modifiers.shift,
-        platform: modifiers.platform,
-    }
-}
-
-fn wire_point(position: Point<Pixels>) -> bindings::Point {
-    bindings::Point {
-        x: f32::from(position.x),
-        y: f32::from(position.y),
     }
 }

@@ -1,15 +1,15 @@
 //! Guest-side GPUI platform for the "GPUI embedded in GPUI" spike.
 //!
-//! A plugin runs a real GPUI [`App`] inside a `wasm32-wasip2` component. Each host view slot
-//! becomes a GPUI window backed by [`window::PluginWindow`], whose painted scenes are
-//! serialized over the `gpui:embedded` WIT protocol instead of being sent to a GPU. See
+//! A plugin runs a real GPUI [`App`] inside a `wasm32-wasip2` component. Each host
+//! surface the plugin draws on becomes a GPUI window backed by [`window::PluginWindow`],
+//! whose painted scenes are serialized into the turn instead of being sent to a GPU. See
 //! `DESIGN.md`.
 
 pub(crate) mod dispatcher;
 mod objects;
 pub(crate) mod platform;
 
-pub use objects::{connect, root, share, share_root, share_with};
+pub use objects::{registry, root, share, share_root, share_with};
 pub(crate) mod text_system;
 pub(crate) mod window;
 
@@ -19,32 +19,32 @@ pub(crate) mod wit {
     wit_bindgen::generate!({
         path: "wit",
         world: "plugin",
-        skip: ["init-plugin"],
+        skip: ["init"],
     });
 }
 
+use crate::surface::{Geometry, KeyEvent, MouseEvent, SurfaceApi, SurfaceApiCaller as _, ViewApi};
+use crate::{Ref, Remote};
 use gpui::{
-    AnyView, App, Application, ApplicationHandle, AssetSource, AsyncApp, Bounds, KeyDownEvent,
-    KeyUpEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PlatformInput, Point, Render, ScrollDelta, ScrollWheelEvent, SharedString, Window,
-    WindowBounds, WindowOptions, div, point, prelude::*, px, size,
+    AnyWindowHandle, App, Application, ApplicationHandle, AssetSource, AsyncApp, Bounds, Context,
+    Entity, Point, Render, SharedString, Window, WindowBounds, WindowHandle, WindowOptions,
+    prelude::*, px, size,
 };
 use platform::PluginPlatform;
 use std::cell::RefCell;
 use std::rc::Rc;
+use window::WindowEvent;
 
 /// A GPUI plugin. Implement this and call [`register_plugin!`] to make your crate a loadable
 /// plugin component.
 pub trait Plugin: 'static {
     /// Build the plugin's shared state. Runs once, when the host initializes the
     /// component. Construct your root object here and install it with [`share_root`]
-    /// before returning; reach the host's root with [`root`].
+    /// before returning; reach the host's root with [`root`]. Views are opened later,
+    /// with [`open_view`], whenever the host hands you a surface.
     fn new(cx: &mut App) -> Self
     where
         Self: Sized;
-
-    /// Called when the host creates a view slot. Return the root view to render in it.
-    fn create_view(&mut self, name: &str, window: &mut Window, cx: &mut App) -> AnyView;
 
     /// Assets (e.g. SVGs) bundled with the plugin, loadable by path from GPUI elements.
     fn assets() -> Option<Box<dyn AssetSource>>
@@ -59,7 +59,7 @@ pub trait Plugin: 'static {
 #[macro_export]
 macro_rules! register_plugin {
     ($plugin_type:ty) => {
-        #[unsafe(export_name = "init-plugin")]
+        #[unsafe(export_name = "init")]
         pub extern "C" fn __init_plugin() {
             $crate::initialize(<$plugin_type as $crate::Plugin>::assets(), |cx| {
                 Box::new(<$plugin_type as $crate::Plugin>::new(cx))
@@ -74,7 +74,7 @@ struct Runtime {
     _app: ApplicationHandle,
     async_app: AsyncApp,
     platform: Rc<PluginPlatform>,
-    plugin: SharedPlugin,
+    _plugin: Box<dyn Plugin>,
 }
 
 thread_local! {
@@ -107,12 +107,11 @@ pub fn initialize(
         application = application.with_assets(PluginAssets(assets));
     }
     let platform_for_runtime = platform.clone();
-    let plugin_slot: Rc<RefCell<Option<SharedPlugin>>> = Rc::default();
+    let plugin_slot: Rc<RefCell<Option<Box<dyn Plugin>>>> = Rc::default();
     let handle = application.run_embedded({
         let plugin_slot = plugin_slot.clone();
         move |cx| {
-            let plugin = build_plugin(cx);
-            *plugin_slot.borrow_mut() = Some(Rc::new(RefCell::new(plugin)));
+            *plugin_slot.borrow_mut() = Some(build_plugin(cx));
         }
     });
     let async_app = handle.to_async();
@@ -125,221 +124,135 @@ pub fn initialize(
             _app: handle,
             async_app,
             platform: platform_for_runtime,
-            plugin,
+            _plugin: plugin,
         });
     });
 }
 
-type SharedPlugin = Rc<RefCell<Box<dyn Plugin>>>;
-
-fn runtime_handles() -> Option<(AsyncApp, Rc<PluginPlatform>, SharedPlugin)> {
+fn runtime_handles() -> Option<(AsyncApp, Rc<PluginPlatform>)> {
     RUNTIME.with(|slot| {
-        slot.borrow().as_ref().map(|runtime| {
-            (
-                runtime.async_app.clone(),
-                runtime.platform.clone(),
-                runtime.plugin.clone(),
-            )
-        })
+        slot.borrow()
+            .as_ref()
+            .map(|runtime| (runtime.async_app.clone(), runtime.platform.clone()))
     })
 }
 
-/// Drain the guest scheduler and let dirty windows redraw, then arrange the next wakeup.
-///
-/// Wakeup requests are suppressed for the duration: everything queued during the pump is
-/// drained before it returns, so only the earliest remaining timer needs a host tick.
-fn pump(platform: &PluginPlatform) {
+/// Drain the guest scheduler and let dirty windows redraw, then report the next wakeup:
+/// everything queued is drained before this returns, so only the earliest remaining timer
+/// needs a host tick.
+fn pump(platform: &PluginPlatform, async_app: &mut AsyncApp) -> Option<u32> {
     objects::drain_releases();
     let dispatcher = platform.dispatcher();
-    dispatcher.set_wakeups_suppressed(true);
+    for window in platform.window_states() {
+        window.flush_events();
+    }
     dispatcher.run_until_idle();
     for window in platform.window_states() {
         window.pump_frame();
     }
     dispatcher.run_until_idle();
-    dispatcher.set_wakeups_suppressed(false);
+    if let Some((surface, cursor)) = platform.take_pending_cursor() {
+        async_app.update(|cx| {
+            surface.set_cursor(cursor, cx);
+        });
+    }
     objects::drain_releases();
-    if let Some(delay) = dispatcher.next_timer_delay() {
-        wit::request_tick(delay.as_millis().min(u32::MAX as u128) as u32);
+    dispatcher
+        .next_timer_delay()
+        .map(|delay| delay.as_millis().min(u32::MAX as u128) as u32)
+}
+
+/// The guest end of a host surface: the object the host drives with geometry and input.
+/// One exists per window opened with [`open_view`]; it lives exactly as long as the host
+/// holds it, and closes its window when released.
+struct GuestView {
+    window: Rc<window::PluginWindowState>,
+    handle: AnyWindowHandle,
+}
+
+#[crate::shared]
+impl ViewApi for GuestView {
+    fn resize(&mut self, geometry: Geometry, _cx: &mut Context<Self>) {
+        self.window.push_event(WindowEvent::Resize(
+            size(px(geometry.width), px(geometry.height)),
+            geometry.scale_factor,
+        ));
+    }
+
+    fn mouse(&mut self, event: MouseEvent, _cx: &mut Context<Self>) {
+        self.window
+            .push_event(WindowEvent::Input(event.to_platform_input()));
+    }
+
+    fn key(&mut self, event: KeyEvent, _cx: &mut Context<Self>) {
+        self.window
+            .push_event(WindowEvent::Input(event.to_platform_input()));
     }
 }
 
-/// Wraps a plugin-provided root view so `open_window` has a concrete `Render` type.
-struct PluginRoot {
-    view: AnyView,
-}
-
-impl Render for PluginRoot {
-    fn render(&mut self, _window: &mut Window, _cx: &mut gpui::Context<Self>) -> impl IntoElement {
-        div().size_full().child(self.view.clone())
-    }
+/// Open a GPUI window that draws on a host surface. `build` constructs the window's root
+/// view exactly as with `cx.open_window`; the resulting view object is shared and
+/// attached to the surface, after which the host drives its geometry and input.
+///
+/// The window lives as long as the host keeps the surface: when the host drops it, the
+/// view is released and the window closes.
+pub fn open_view<V: Render + 'static>(
+    surface: Ref<SurfaceApi>,
+    cx: &mut App,
+    build: impl FnOnce(&mut Window, &mut App) -> Entity<V>,
+) -> anyhow::Result<WindowHandle<V>> {
+    let (_, platform) =
+        runtime_handles().ok_or_else(|| anyhow::anyhow!("open_view before init"))?;
+    let surface: Remote<SurfaceApi> = surface.connect();
+    let surface_id = surface.reference().entity_id();
+    platform.set_pending_surface(surface.clone());
+    let handle = cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds {
+                origin: Point::default(),
+                size: size(px(1.), px(1.)),
+            })),
+            ..Default::default()
+        },
+        build,
+    )?;
+    let window = platform
+        .window(surface_id)
+        .ok_or_else(|| anyhow::anyhow!("open_window did not bind the pending surface"))?;
+    let view = cx.new(|cx| {
+        let platform = platform.clone();
+        cx.on_release(move |view: &mut GuestView, cx| {
+            platform.remove_window(surface_id);
+            view.handle
+                .update(cx, |_, window, _| window.remove_window())
+                .ok();
+        })
+        .detach();
+        GuestView {
+            window,
+            handle: handle.into(),
+        }
+    });
+    let view_ref = share(&view, cx);
+    surface.attach(view_ref, cx);
+    Ok(handle)
 }
 
 struct Component;
 
 impl wit::Guest for Component {
-    fn create_view(view_id: u32, name: String, extent: wit::Extent, scale_factor: f32) {
-        let Some((async_app, platform, plugin)) = runtime_handles() else {
-            log::error!("embedded_gpui: create-view before init-plugin");
-            return;
+    fn tick(inbound: Vec<wit::Frame>) -> wit::Turn {
+        let Some((mut async_app, platform)) = runtime_handles() else {
+            log::error!("embedded_gpui: tick before init");
+            return objects::take_turn(None);
         };
-        let view_size = size(px(extent.width), px(extent.height));
-        platform.set_pending_view(view_id, view_size, scale_factor);
-        let opened = async_app.update(|cx| {
-            cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(Bounds {
-                        origin: Point::default(),
-                        size: view_size,
-                    })),
-                    ..Default::default()
-                },
-                |window, cx| {
-                    let view = plugin.borrow_mut().create_view(&name, window, cx);
-                    cx.new(|_| PluginRoot { view })
-                },
-            )
-        });
-        if let Err(error) = opened {
-            log::error!("embedded_gpui: opening view {view_id} failed: {error:#}");
-        }
-        pump(&platform);
-    }
-
-    fn resize_view(view_id: u32, extent: wit::Extent, scale_factor: f32) {
-        let Some((_, platform, _)) = runtime_handles() else {
-            return;
-        };
-        if let Some(window) = platform.window(view_id) {
-            window.resized(size(px(extent.width), px(extent.height)), scale_factor);
-        } else {
-            log::warn!("embedded_gpui: resize-view for unknown view {view_id}");
-        }
-        pump(&platform);
-    }
-
-    fn handle_mouse(view_id: u32, event: wit::MouseEvent) {
-        let Some((_, platform, _)) = runtime_handles() else {
-            return;
-        };
-        if let Some(window) = platform.window(view_id) {
-            window.dispatch_input(platform_input_from_wire(event));
-        } else {
-            log::warn!("embedded_gpui: handle-mouse for unknown view {view_id}");
-        }
-        pump(&platform);
-    }
-
-    fn handle_key(view_id: u32, event: wit::KeyEvent) {
-        let Some((_, platform, _)) = runtime_handles() else {
-            return;
-        };
-        if let Some(window) = platform.window(view_id) {
-            let input = match event {
-                wit::KeyEvent::Down(event) => PlatformInput::KeyDown(KeyDownEvent {
-                    keystroke: keystroke_from_wire(event.keystroke),
-                    is_held: event.is_held,
-                    prefer_character_input: false,
-                }),
-                wit::KeyEvent::Up(event) => PlatformInput::KeyUp(KeyUpEvent {
-                    keystroke: keystroke_from_wire(event.keystroke),
-                }),
-            };
-            window.dispatch_input(input);
-        } else {
-            log::warn!("embedded_gpui: handle-key for unknown view {view_id}");
-        }
-        pump(&platform);
-    }
-
-    fn tick() {
-        let Some((_, platform, _)) = runtime_handles() else {
-            return;
-        };
-        pump(&platform);
-    }
-
-    fn deliver_object_message(message: wit::ObjectMessage) {
-        let Some((mut async_app, platform, _)) = runtime_handles() else {
-            return;
-        };
-        objects::message_delivered(message, &mut async_app);
-        pump(&platform);
-    }
-
-    fn deliver_object_response(response: wit::ObjectResponse) {
-        let Some((_, platform, _)) = runtime_handles() else {
-            return;
-        };
-        objects::response_delivered(response);
-        pump(&platform);
+        async_app.update(|cx| objects::deliver(inbound, cx));
+        let wake_after_ms = pump(&platform, &mut async_app);
+        objects::take_turn(wake_after_ms)
     }
 }
 
 wit::export!(Component with_types_in wit);
-
-fn platform_input_from_wire(event: wit::MouseEvent) -> PlatformInput {
-    match event {
-        wit::MouseEvent::Down(event) => PlatformInput::MouseDown(MouseDownEvent {
-            button: button_from_wire(event.button),
-            position: point_from_wire(event.position),
-            modifiers: modifiers_from_wire(event.modifiers),
-            click_count: event.click_count as usize,
-            first_mouse: false,
-        }),
-        wit::MouseEvent::Up(event) => PlatformInput::MouseUp(MouseUpEvent {
-            button: button_from_wire(event.button),
-            position: point_from_wire(event.position),
-            modifiers: modifiers_from_wire(event.modifiers),
-            click_count: event.click_count as usize,
-        }),
-        wit::MouseEvent::Move(event) => PlatformInput::MouseMove(MouseMoveEvent {
-            position: point_from_wire(event.position),
-            pressed_button: event.pressed_button.map(button_from_wire),
-            modifiers: modifiers_from_wire(event.modifiers),
-        }),
-        wit::MouseEvent::Scroll(event) => PlatformInput::ScrollWheel(ScrollWheelEvent {
-            position: point_from_wire(event.position),
-            delta: if event.precise {
-                ScrollDelta::Pixels(point(px(event.delta_x), px(event.delta_y)))
-            } else {
-                ScrollDelta::Lines(point(event.delta_x, event.delta_y))
-            },
-            modifiers: modifiers_from_wire(event.modifiers),
-            touch_phase: Default::default(),
-        }),
-    }
-}
-
-fn button_from_wire(button: wit::MouseButton) -> MouseButton {
-    match button {
-        wit::MouseButton::Left => MouseButton::Left,
-        wit::MouseButton::Right => MouseButton::Right,
-        wit::MouseButton::Middle => MouseButton::Middle,
-    }
-}
-
-fn point_from_wire(value: wit::Point) -> Point<gpui::Pixels> {
-    point(px(value.x), px(value.y))
-}
-
-fn modifiers_from_wire(modifiers: wit::Modifiers) -> gpui::Modifiers {
-    gpui::Modifiers {
-        control: modifiers.control,
-        alt: modifiers.alt,
-        shift: modifiers.shift,
-        platform: modifiers.platform,
-        function: false,
-    }
-}
-
-fn keystroke_from_wire(keystroke: wit::Keystroke) -> Keystroke {
-    Keystroke {
-        modifiers: modifiers_from_wire(keystroke.modifiers),
-        key: keystroke.key,
-        key_char: keystroke.key_char,
-    }
-}
 
 fn init_logger() {
     struct StderrLogger;

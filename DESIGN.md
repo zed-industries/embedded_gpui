@@ -32,9 +32,11 @@ app alive and re-enter it whenever the external run loop yields control).
   proc macros.
 - `embedded_gpui_util/` — side-agnostic OCAP patterns (`Revocable`, `Attenuated`,
   `Audited`, `Mirror`) built on `Remote`.
-- `example/` — the demo pair: `host/` (native window, `cargo run -p example_host`;
-  builds the plugin automatically) and `plugin/` (the wasm component, its own workspace
-  since it only compiles to `wasm32-wasip2`).
+- `example/` — the demo: `host/` (native window, `cargo run -p example_host`; builds
+  the components automatically), `plugin/` (a Rust plugin component), and
+  `js_runtime/` (a plugin component embedding QuickJS; see "Plugins in other
+  languages"). Component crates are their own workspaces since they only compile to
+  `wasm32-wasip2`.
 - `tests/` — the host-driven integration tests for the object protocol, with
   their guest fixture in `tests/test_plugin/`.
 
@@ -65,8 +67,41 @@ The spike proved the object model *works*; this pass made it the only one. Five 
    it, so `ref.connect()` works anywhere a ref is held — in handlers, after awaits, on
    either end. `connect` stops being a host/guest entry point.
 5. **The interface schema is a runtime value.** `Interface::schema()` describes methods,
-   argument types, and events, so a dynamic-language guest can bind against the same
-   artifact the macros consume.
+   argument types (structurally, via `Describe`, which `#[data]` implements), events,
+   and every named payload type, so a bindings generator (`typescript::declarations`)
+   or an inspector consumes the same artifact the macros compile against. Refs encode
+   as `{"$ref": index}`, so a guest with no schema at all can still find them.
+
+## Plugins in other languages
+
+The object model is language-neutral by construction — JSON payloads, a ref table, a
+root object — and `example/js_runtime` is the proof: a plugin component that embeds
+QuickJS (via `rquickjs`; the wasi-sdk is fetched by its build script, no toolchain
+setup) and runs scripts against the same host objects a Rust plugin sees.
+
+- **It is just a plugin.** The host loads it like any component and shares its root;
+  the runtime's own root answers `load(source)` and forwards every other method to the
+  script's `plugin.root`. Loading again is hot reload. The sandbox is the wasm
+  boundary, not QuickJS: a bug in the engine cannot reach the host.
+- **Remotes are proxies.** `host.counter()` returns a promise of a remote;
+  `counter.increment({ by: 1 })` is `call("increment", { by: 1 })`; `observe` mirrors
+  `cx.notify`. Object ids travel as strings (u64 does not fit a JS number). No schema
+  is consulted at runtime: refs are recognized by their `$ref` shape.
+- **JS never holds a GPUI context.** While a script runs, every request it makes is
+  queued as an operation; when the run returns, Rust drains the queue with the real
+  `App` — issues the calls, opens views, applies rendered trees — and later resolves
+  the script's promises from the receipts. QuickJS's job queue is pumped after every
+  entry into JS.
+- **UI is data.** `plugin.openView(surface)` opens a GPUI window on a host surface;
+  `view.render(tree)` sets a tree of `div`/`text` nodes with a small flat style
+  vocabulary; functions in the tree become handler ids the runtime invokes on input.
+  Nothing JS-specific reaches the host: it sees a `ViewApi` object like any other.
+- **Types are optional and free.** `typescript::declarations` renders the Rust
+  schemas as `.d.ts`, so a script author (or an agent) type-checks against the same
+  schema the Rust side compiled, while the runtime stays schema-free.
+
+The release component is ~4.9 MB (GPUI + QuickJS). QuickJS is a bytecode interpreter;
+the rule for it is the same as for every plugin: events and notifies, not animation.
 
 ## Architecture (agreed invariants)
 
@@ -483,6 +518,10 @@ membrane at that edge only, Goblins objects appearing inside plugins as ordinary
 | vats                                    | the two gpui event loops, exactly (minus transactional turns) |
 
 ## Known spike limitations (intentional)
+
+- The JS runtime keeps every remote a script has ever received connected, and never
+  cancels observers; reloading a script layers new views and observers on the old
+  ones. Teardown on reload is the obvious next step.
 
 - No video `Surface` primitives; no gradient backgrounds (solid color fallback); no sprite
   transformation matrices (painted untransformed with a warning).

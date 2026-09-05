@@ -647,6 +647,7 @@ impl Objects {
 
     /// The other end is gone for good (the plugin trapped or was unloaded): fail every
     /// call still waiting on it so callers see an error instead of a hang.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn fail_pending(&self, reason: &str) {
         let pending = std::mem::take(&mut self.inner.state.borrow_mut().pending_responses);
         for (_, sender) in pending {

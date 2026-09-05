@@ -42,10 +42,16 @@ Views are `SurfaceApi`/`ViewApi` objects; see `DESIGN.md`. What remains:
   `Interface::schema()` makes probing possible, but it wants an explicit
   convention — a `version()` method, or a `describe()` returning the schema —
   before anything ships against it.
-- [ ] **Bindings from the schema**: `Interface::schema()` is the artifact a
-  dynamic-language guest (a QuickJS runtime component) binds against and a `.d.ts`
-  generator consumes. Argument types are Rust `type_name`s today; a portable type
-  description is the missing piece.
+- [x] **Bindings from the schema**: `Describe` gives `Interface::schema()` structural
+  types and every named definition; `typescript::declarations` renders `.d.ts`.
+- [ ] **JS runtime, next steps** (`example/js_runtime`): tear down a script's views,
+  observers, and remotes on reload; `observe` cancellation; typed events
+  (`subscribe`) in the prelude; a `.d.ts` bundle emitted by the demo host next to
+  `counter.js`; a richer element vocabulary (input, images, scroll) or, better, a
+  generic `Styled` mapping; script errors surfaced to the host as `ErrorReport`s
+  with JS stacks; a QuickJS interrupt handler as a second, finer budget inside the
+  wasm turn budget; TypeScript source via a type-stripper if JS + `.d.ts` proves
+  insufficient.
 - [x] **A public symmetric handle**: `Registry` — reachable from any `Remote`, `Ref`,
   or inbound `Payload` — shares, connects, and reaches the root on either end. The
   host's `PluginHostHandle` and the guest's free functions are thin wrappers over it.
@@ -73,8 +79,9 @@ Views are `SurfaceApi`/`ViewApi` objects; see `DESIGN.md`. What remains:
 
 ## Platform completeness
 
-- [ ] **Resource limits**: wasmtime epoch interruption for runaway plugins, store
-  memory caps, per-plugin fuel budgets. Cheap to add, essential for trust.
+- [x] **Resource limits**: per-turn epoch deadline and memory cap (`PluginOptions`);
+  a trapped plugin stops and in-flight calls fail. Still open: a display-list size
+  cap at scene submission, and a UI for the host to show a stopped plugin.
 - [ ] **IME / marked text**: guests currently synthesize printable keys through
   `replace_text_in_range` (Linux-backend style). Dead keys and CJK composition
   need the host to proxy its `PlatformInputHandler` into the guest.

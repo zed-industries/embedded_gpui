@@ -1992,6 +1992,7 @@ dependencies = [
  "example_schema",
  "gpui",
  "gpui_platform",
+ "js_runtime_schema",
  "log",
 ]
 
@@ -3355,6 +3356,14 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "js_runtime_schema"
+version = "0.1.0"
+dependencies = [
+ "embedded_gpui",
+ "gpui",
 ]
 
 [[package]]

@@ -5,6 +5,7 @@ members = [
     "embedded_gpui_util",
     "example/host",
     "example/schema",
+    "example/js_runtime_schema",
     "tests",
     "tests/schema",
 ]

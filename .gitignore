@@ -4,3 +4,5 @@ example/plugin/Cargo.lock
 tests/test_plugin/target
 tests/test_plugin/Cargo.lock
 .agent/
+example/js_runtime/target
+example/js_runtime/Cargo.lock

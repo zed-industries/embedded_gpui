@@ -10,17 +10,18 @@
 use std::path::{Path, PathBuf};
 
 use embedded_gpui::{
-    PluginHost, PluginHostHandle as _, PluginOptions, Ref, Remote, Surface, shared,
+    PluginHost, PluginHostHandle as _, PluginOptions, Ref, Remote, Surface, encode, shared,
 };
 use embedded_gpui_util::Mirror;
 use example_schema::{
     CommandApi, CommandApiCaller as _, Commands, CounterApi, DemoHost, DemoPlugin,
-    DemoPluginCaller as _, Milestone, PaletteEntry, Text, WorkspaceApi,
+    DemoPluginCaller as _, Milestone, PaletteEntry, ShowButton, Text, WorkspaceApi,
 };
 use gpui::{
     App, Application, Bounds, Context, Entity, EventEmitter, MouseButton, Pixels, Task,
     WindowBounds, WindowOptions, div, prelude::*, px, rgb, size,
 };
+use js_runtime_schema::{JsRuntimeApi, JsRuntimeApiCaller as _};
 use std::collections::HashMap;
 
 /// The home of the shared click counter: a plain host entity. The guest's views hold
@@ -108,8 +109,12 @@ impl WorkspaceApi for Workspace {
 fn main() {
     env_logger::init();
 
-    let Some(wasm_path) = resolve_wasm_path() else {
+    let Some(wasm_path) = resolve_wasm_path("plugin", "example_plugin") else {
         eprintln!("could not find or build example_plugin.wasm");
+        std::process::exit(1);
+    };
+    let Some(js_runtime_path) = resolve_wasm_path("js_runtime", "js_runtime") else {
+        eprintln!("could not find or build js_runtime.wasm");
         std::process::exit(1);
     };
 
@@ -117,24 +122,64 @@ fn main() {
     let text_system = platform.text_system();
 
     Application::with_platform(platform).run(move |cx: &mut App| {
-        // The whole embedding story: compile on the background, get a ready host.
-        let plugin = PluginHost::load(wasm_path, PluginOptions::new(text_system), cx);
+        // The whole embedding story: compile on the background, get a ready host. Two
+        // plugins here — one written in Rust, one a JavaScript runtime — loaded the
+        // same way and talking to the same host objects.
+        let plugin = PluginHost::load(wasm_path, PluginOptions::new(text_system.clone()), cx);
+        let js_runtime = PluginHost::load(js_runtime_path, PluginOptions::new(text_system), cx);
         cx.spawn(async move |cx| {
-            let host = match plugin.await {
-                Ok(host) => host,
-                Err(error) => {
+            let (host, js_host) = match (plugin.await, js_runtime.await) {
+                (Ok(host), Ok(js_host)) => (host, js_host),
+                (Err(error), _) | (_, Err(error)) => {
                     log::error!("embedded_gpui: failed to load plugin: {error:#}");
                     cx.update(|cx| cx.quit());
                     return;
                 }
             };
-            cx.update(move |cx| open_demo_window(host, cx));
+            cx.update(move |cx| open_demo_window(host, js_host, cx));
         })
         .detach();
     });
 }
 
-fn open_demo_window(host: gpui::Entity<PluginHost>, cx: &mut App) {
+/// The JavaScript plugin's source, read fresh each time so edits show up on reload.
+fn js_plugin_source() -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../js_runtime/plugins/counter.js");
+    std::fs::read_to_string(&path).unwrap_or_else(|error| {
+        log::error!("embedded_gpui: reading {}: {error}", path.display());
+        String::new()
+    })
+}
+
+/// Load (or reload) the script and ask it to draw on the surface: the same
+/// `show_button` the Rust plugin answers, dispatched to `plugin.root` in JS.
+fn load_js_plugin(
+    js_host: &Entity<PluginHost>,
+    js_root: &Remote<JsRuntimeApi>,
+    surface: &Entity<Surface>,
+    cx: &mut App,
+) {
+    let loaded = js_root.load(js_plugin_source(), cx);
+    let surface = js_host.share(surface, cx);
+    let shown = js_root.call_raw(
+        "show_button",
+        encode(&ShowButton { surface }).expect("encode show_button"),
+        cx,
+    );
+    cx.spawn(async move |_| {
+        match loaded.await {
+            Ok(None) => {}
+            Ok(Some(error)) => log::error!("counter.js failed to load: {error}"),
+            Err(error) => log::error!("js runtime: load failed: {error:#}"),
+        }
+        if let Err(error) = shown.await {
+            log::error!("counter.js: show_button failed: {error:#}");
+        }
+    })
+    .detach();
+}
+
+fn open_demo_window(host: Entity<PluginHost>, js_host: Entity<PluginHost>, cx: &mut App) {
     let bounds = Bounds::centered(None, size(px(900.), px(700.)), cx);
     let opened = cx.open_window(
         WindowOptions {
@@ -158,6 +203,19 @@ fn open_demo_window(host: gpui::Entity<PluginHost>, cx: &mut App) {
                 workspace_ref: None,
             });
             host.share_root(&root, cx);
+            // The JavaScript runtime is another plugin with its own registry: it gets
+            // its own root over the same host entities.
+            let js_root_entity = cx.new(|_| HostRoot {
+                host: js_host.clone(),
+                counter: counter.clone(),
+                workspace: workspace.clone(),
+                counter_ref: None,
+                workspace_ref: None,
+            });
+            js_host.share_root(&js_root_entity, cx);
+            let js_root = js_host.root::<JsRuntimeApi>(cx);
+            let js_surface = cx.new(Surface::new);
+            load_js_plugin(&js_host, &js_root, &js_surface, cx);
             // Homed in the PLUGIN: the wasm input line's text and the command palette,
             // both reached through the plugin root's methods. Reads are calls, so
             // native rendering goes through local mirrors that refetch whenever the
@@ -208,6 +266,10 @@ fn open_demo_window(host: gpui::Entity<PluginHost>, cx: &mut App) {
                 });
                 DemoView {
                     _root: root,
+                    _js_root: js_root_entity,
+                    js_host,
+                    js_root,
+                    js_surface,
                     counter,
                     workspace,
                     typed_text: None,
@@ -232,24 +294,24 @@ fn open_demo_window(host: gpui::Entity<PluginHost>, cx: &mut App) {
     cx.activate(true);
 }
 
-fn resolve_wasm_path() -> Option<PathBuf> {
-    if let Some(argument) = std::env::args().nth(1) {
-        return Some(PathBuf::from(argument));
-    }
-
-    let plugin_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugin");
+/// Find (or build, on first run) a component crate under `example/`.
+fn resolve_wasm_path(crate_dir: &str, crate_name: &str) -> Option<PathBuf> {
+    let plugin_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join(crate_dir);
+    let file = format!("{crate_name}.wasm");
     for profile in ["release", "debug"] {
         let candidate = plugin_dir
             .join("target/wasm32-wasip2")
             .join(profile)
-            .join("example_plugin.wasm");
+            .join(&file);
         if candidate.exists() {
             return Some(candidate);
         }
     }
 
-    // First run: build the demo plugin ourselves so `cargo run` just works.
-    eprintln!("building example_plugin for wasm32-wasip2 (first run only)...");
+    // First run: build the component ourselves so `cargo run` just works.
+    eprintln!("building {crate_name} for wasm32-wasip2 (first run only)...");
     // Blocking is fine here: this is a demo binary's startup path.
     #[allow(clippy::disallowed_methods)]
     let status = std::process::Command::new("cargo")
@@ -260,13 +322,17 @@ fn resolve_wasm_path() -> Option<PathBuf> {
     if !status.success() {
         return None;
     }
-    let built = plugin_dir.join("target/wasm32-wasip2/release/example_plugin.wasm");
+    let built = plugin_dir.join("target/wasm32-wasip2/release").join(file);
     built.exists().then_some(built)
 }
 
 struct DemoView {
     /// Keeps the root's ref caches (and, through it, the plugin host) alive.
     _root: Entity<HostRoot>,
+    _js_root: Entity<HostRoot>,
+    js_host: Entity<PluginHost>,
+    js_root: Remote<JsRuntimeApi>,
+    js_surface: Entity<Surface>,
     counter: Entity<Counter>,
     workspace: Entity<Workspace>,
     /// `None` until the plugin root's `typed_text()` receipt resolves.
@@ -372,7 +438,36 @@ impl Render for DemoView {
                             .child(format!("wasm says: {typed:?}")),
                     ),
             )
-            .child(framed_slot(px(240.), px(100.), self.button_surface.clone()))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(framed_slot(px(240.), px(100.), self.button_surface.clone()))
+                    .child(framed_slot(px(240.), px(100.), self.js_surface.clone()))
+                    .child(
+                        div()
+                            .id("reload-js")
+                            .px_2()
+                            .py_1()
+                            .rounded(px(6.))
+                            .bg(rgb(0x3a3f45))
+                            .hover(|style| style.bg(rgb(0x4a5058)))
+                            .text_sm()
+                            .child("Reload counter.js")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    load_js_plugin(
+                                        &this.js_host,
+                                        &this.js_root,
+                                        &this.js_surface,
+                                        cx,
+                                    );
+                                }),
+                            ),
+                    ),
+            )
             .child(
                 div()
                     .flex()

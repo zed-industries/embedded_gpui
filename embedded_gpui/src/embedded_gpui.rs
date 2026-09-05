@@ -561,6 +561,12 @@ impl Registry {
         }
     }
 
+    /// A ref to an object id in this registry, for code that holds ids out of a ref
+    /// table rather than typed refs (forwarders, dynamic-language runtimes).
+    pub fn reference<S: Interface>(&self, id: u64) -> Ref<S> {
+        Ref::new(id, self.0.clone())
+    }
+
     /// Whether `id` is an object homed on this end.
     pub fn is_local(&self, id: u64) -> bool {
         self.0.upgrade().is_some_and(|objects| objects.is_local(id))

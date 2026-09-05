@@ -47,6 +47,16 @@ changes; nothing here is a supported API yet.
   membrane: every ref that crosses it is wrapped, one revoke severs them all),
   `Attenuated` (allowlist), `Audited` (call ledger), and `Mirror` (a local,
   observable cache of remote state — snapshots as a library, not a protocol).
+- **Plugins in JavaScript** (`example/js_runtime`): a plugin component that
+  embeds QuickJS. Scripts see the same object model — `host` is the host's
+  root, remotes are proxies with promise-returning methods and `observe`,
+  refs cross as `{"$ref": n}` so no schema is needed at runtime — and render
+  UI as a data tree that becomes GPUI elements on a host surface. Loading a
+  script is a method call, so hot reload is a second call. `typescript::
+  declarations` renders the Rust schemas as `.d.ts` for script authors.
+- **Resource limits**: a per-turn budget (wasmtime epoch deadline) and a memory
+  cap on `PluginOptions`; a plugin that overruns stops and its in-flight calls
+  fail instead of hanging.
 
 <img width="750" height="643" alt="Screenshot 2026-07-08 at 12 12 14 AM" src="https://github.com/user-attachments/assets/81d10dfa-bad7-4fb2-9385-5629880c11ca" />
 
@@ -93,9 +103,11 @@ cargo run -p example_host
 
 (the demo builds its wasm plugin automatically on first run)
 
-The demo window shows two embedded plugin surfaces (a counter button and a panel
-with text input, SVG, image, and an animated path) plus a native button — all
-three mutate the same shared counter entity.
+The demo window shows two Rust plugin surfaces (a counter button and a panel
+with text input, SVG, image, and an animated path), a JavaScript plugin's
+button (`example/js_runtime/plugins/counter.js`, with a reload button — edit the
+file and click it), and a native button — all of them mutating the same shared
+counter entity.
 
 ```sh
 cargo test -p tests -- --test-threads 1   # protocol tests
@@ -109,7 +121,9 @@ cargo test -p tests -- --test-threads 1   # protocol tests
   proc macros.
 - `embedded_gpui_util/` — object-capability patterns (`Revocable`, `Attenuated`,
   `Audited`, `Mirror`).
-- `example/` — the demo: `host/` (native window) and `plugin/` (the wasm component).
+- `example/` — the demo: `host/` (native window), `plugin/` (the Rust wasm
+  component), `js_runtime/` (the QuickJS component and `plugins/counter.js`),
+  and their schema crates.
 - `tests/` — protocol integration tests plus their `test_plugin/` fixture.
 
 ## Reading order

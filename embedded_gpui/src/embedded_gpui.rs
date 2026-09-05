@@ -27,7 +27,6 @@ extern crate self as embedded_gpui;
 pub(crate) mod registry;
 pub mod schema;
 pub mod surface;
-pub mod typescript;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod host;

@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use embedded_gpui::{
     PluginHost, PluginHostHandle as _, PluginOptions, Ref, Remote, Surface, encode, shared,
 };
+use embedded_gpui_js::{JsRuntimeApi, JsRuntimeApiCaller as _};
 use embedded_gpui_util::Mirror;
 use example_schema::{
     CommandApi, CommandApiCaller as _, Commands, CounterApi, DemoHost, DemoPlugin,
@@ -21,7 +22,6 @@ use gpui::{
     App, Application, Bounds, Context, Entity, EventEmitter, MouseButton, Pixels, Task,
     WindowBounds, WindowOptions, div, prelude::*, px, rgb, size,
 };
-use js_runtime_schema::{JsRuntimeApi, JsRuntimeApiCaller as _};
 use std::collections::HashMap;
 
 /// The home of the shared click counter: a plain host entity. The guest's views hold

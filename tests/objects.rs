@@ -18,7 +18,7 @@ use embedded_gpui::surface::{
 };
 use embedded_gpui::{
     Interface, Payload, PluginHost, PluginHostHandle as _, PluginInstance, PluginOptions, Ref,
-    Remote, Surface, TypeSchema, ViewApi, decode, encode, shared, typescript,
+    Remote, Surface, TypeSchema, decode, encode, shared,
 };
 use embedded_gpui_util::{Attenuated, Audited, Mirror};
 use gpui::{AppContext as _, Context, Entity, Task, TestAppContext};
@@ -710,18 +710,6 @@ async fn test_interfaces_describe_themselves(_cx: &mut TestAppContext) {
     };
     assert_eq!(fields[0].name, "count");
     assert_eq!(fields[0].ty, TypeSchema::Integer);
-
-    // The same schema renders as TypeScript declarations.
-    let declarations = typescript::declarations(&[ViewApi::schema(), TestCounterApi::schema()]);
-    assert!(declarations.contains("export interface ViewApi {"));
-    assert!(declarations.contains("  mouse(event: MouseEvent): Promise<void>;"));
-    assert!(declarations.contains("export interface Geometry {"));
-    assert!(declarations.contains("  | { Down: { keystroke: Keystroke; is_held: boolean } }"));
-    assert!(declarations.contains("  | \"Left\""));
-    assert!(declarations.contains("  increment(by: number): Promise<number>;"));
-    assert!(declarations.contains(
-        "export interface TestCounterApiEvents {\n  counter_milestone: CounterMilestone;"
-    ));
 }
 
 #[gpui::test]

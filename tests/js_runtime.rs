@@ -1,4 +1,4 @@
-//! End-to-end tests for the JavaScript runtime: the `js_runtime` component (QuickJS
+//! End-to-end tests for `embedded_gpui_js`: the `example/js_runtime` component (QuickJS
 //! inside wasm) loaded into a wasmtime store, driven from GPUI's deterministic test
 //! executor, running `tests/js_plugin.js` against a host root and a host surface.
 
@@ -13,8 +13,8 @@ use embedded_gpui::{
     PluginHost, PluginHostHandle as _, PluginInstance, PluginOptions, Ref, Remote, Surface, decode,
     encode, shared,
 };
+use embedded_gpui_js::{JsRuntimeApi, JsRuntimeApiCaller as _};
 use gpui::{AppContext as _, Context, Entity, TestAppContext};
-use js_runtime_schema::{JsRuntimeApi, JsRuntimeApiCaller as _};
 use serde::{Deserialize, Serialize};
 use test_schema::TestHost;
 
@@ -245,4 +245,22 @@ async fn test_reload_starts_clean(cx: &mut TestAppContext) {
     );
     let payload = decode::<String>(&encode(&"still decoding").expect("encode")).expect("decode");
     assert_eq!(payload, "still decoding");
+}
+
+#[gpui::test]
+async fn test_schemas_render_as_typescript(_cx: &mut TestAppContext) {
+    use embedded_gpui::{Interface as _, ViewApi};
+    use embedded_gpui_js::typescript;
+    use test_schema::TestCounterApi;
+
+    let declarations = typescript::declarations(&[ViewApi::schema(), TestCounterApi::schema()]);
+    assert!(declarations.contains("export interface ViewApi {"));
+    assert!(declarations.contains("  mouse(event: MouseEvent): Promise<void>;"));
+    assert!(declarations.contains("export interface Geometry {"));
+    assert!(declarations.contains("  | { Down: { keystroke: Keystroke; is_held: boolean } }"));
+    assert!(declarations.contains("  | \"Left\""));
+    assert!(declarations.contains("  increment(by: number): Promise<number>;"));
+    assert!(declarations.contains(
+        "export interface TestCounterApiEvents {\n  counter_milestone: CounterMilestone;"
+    ));
 }

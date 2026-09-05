@@ -47,8 +47,8 @@ changes; nothing here is a supported API yet.
   membrane: every ref that crosses it is wrapped, one revoke severs them all),
   `Attenuated` (allowlist), `Audited` (call ledger), and `Mirror` (a local,
   observable cache of remote state — snapshots as a library, not a protocol).
-- **Plugins in JavaScript** (`example/js_runtime`): a plugin component that
-  embeds QuickJS. Scripts see the same object model — `host` is the host's
+- **Plugins in JavaScript** (`embedded_gpui_js`, an optional crate on top):
+  a QuickJS runtime that is itself a plugin. Scripts see the same object model — `host` is the host's
   root, remotes are proxies with promise-returning methods and `observe`,
   refs cross as `{"$ref": n}` so no schema is needed at runtime — and render
   UI as a data tree that becomes GPUI elements on a host surface. Loading a
@@ -121,9 +121,11 @@ cargo test -p tests -- --test-threads 1   # protocol tests, and tests/js_plugin.
   proc macros.
 - `embedded_gpui_util/` — object-capability patterns (`Revocable`, `Attenuated`,
   `Audited`, `Mirror`).
+- `embedded_gpui_js/` — JavaScript plugins: the QuickJS runtime (guest only), its
+  `JsRuntimeApi` schema, and the `.d.ts` generator.
 - `example/` — the demo: `host/` (native window), `plugin/` (the Rust wasm
-  component), `js_runtime/` (the QuickJS component and `plugins/counter.js`),
-  and their schema crates.
+  component), `js_runtime/` (the one-line component that registers
+  `embedded_gpui_js`, plus `plugins/counter.js`), and `schema/`.
 - `tests/` — protocol integration tests plus their `test_plugin/` fixture.
 
 ## Reading order

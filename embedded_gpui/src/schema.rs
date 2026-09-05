@@ -3,7 +3,7 @@
 //! `#[interface]` implements [`Interface::schema`](crate::Interface::schema) and `#[data]`
 //! implements [`Describe`], so the same schema the Rust macros compile against is
 //! available at runtime: to a dynamic-language guest binding method calls, to an
-//! inspector, or to a bindings generator (see [`typescript`](crate::typescript)).
+//! inspector, or to a bindings generator (`embedded_gpui_js::typescript`).
 //!
 //! The wire format is JSON, so the type vocabulary here is JSON's plus two
 //! distinguished shapes: a [`TypeSchema::Ref`] travels as `{"$ref": index}` into the

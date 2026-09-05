@@ -32,11 +32,15 @@ app alive and re-enter it whenever the external run loop yields control).
   proc macros.
 - `embedded_gpui_util/` — side-agnostic OCAP patterns (`Revocable`, `Attenuated`,
   `Audited`, `Mirror`) built on `Remote`.
+- `embedded_gpui_js/` — the optional JavaScript layer: `JsRuntimeApi` (compiled
+  everywhere; how a host loads a script), `typescript::declarations` (`.d.ts` from any
+  schemas), and, on `wasm32` only, the QuickJS runtime (`JsPlugin`, `JsRoot`). See
+  "Plugins in other languages".
 - `example/` — the demo: `host/` (native window, `cargo run -p example_host`; builds
   the components automatically), `plugin/` (a Rust plugin component), and
-  `js_runtime/` (a plugin component embedding QuickJS; see "Plugins in other
-  languages"). Component crates are their own workspaces since they only compile to
-  `wasm32-wasip2`.
+  `js_runtime/` (the component that registers `embedded_gpui_js::JsPlugin`, with the
+  demo's `plugins/counter.js`). Component crates are their own workspaces since they
+  only compile to `wasm32-wasip2`.
 - `tests/` — the host-driven integration tests for the object protocol, with
   their guest fixture in `tests/test_plugin/`.
 
@@ -75,9 +79,11 @@ The spike proved the object model *works*; this pass made it the only one. Five 
 ## Plugins in other languages
 
 The object model is language-neutral by construction — JSON payloads, a ref table, a
-root object — and `example/js_runtime` is the proof: a plugin component that embeds
-QuickJS (via `rquickjs`; the wasi-sdk is fetched by its build script, no toolchain
-setup) and runs scripts against the same host objects a Rust plugin sees.
+root object — and `embedded_gpui_js` is the proof: an optional crate whose runtime
+embeds QuickJS (via `rquickjs`; the wasi-sdk is fetched by its build script, no
+toolchain setup) and runs scripts against the same host objects a Rust plugin sees.
+The host's only knowledge of it is the tiny `JsRuntimeApi` schema — `load(source)` —
+and a host that never loads scripts never compiles a line of it.
 
 - **It is just a plugin.** The host loads it like any component and shares its root;
   the runtime's own root answers `load(source)` and forwards every other method to the

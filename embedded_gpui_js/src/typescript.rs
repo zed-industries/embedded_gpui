@@ -3,14 +3,14 @@
 //! declarations give its author (or an agent writing it) type checking against the same
 //! schema the Rust side compiled.
 //!
-//! The runtime shape assumed here is the one the `js_runtime` component provides: a
+//! The runtime shape assumed here is the one this crate's runtime provides: a
 //! remote to an interface `Foo` is a `Remote<Foo>` whose methods return promises, with
 //! `observe`/`subscribe` for the home's notifies and events, and refs in payloads
 //! arriving as remotes.
 
 use std::fmt::Write as _;
 
-use crate::schema::{Schema, TypeDefinition, TypeKind, TypeSchema, VariantFields};
+use embedded_gpui::schema::{Schema, TypeDefinition, TypeKind, TypeSchema, VariantFields};
 
 /// Render `.d.ts` declarations for a set of interfaces: one `interface` per schema with
 /// promise-returning methods, one type alias or interface per named payload type, and

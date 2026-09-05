@@ -1,11 +1,11 @@
 [workspace]
 members = [
     "embedded_gpui",
+    "embedded_gpui_js",
     "embedded_gpui_macros",
     "embedded_gpui_util",
     "example/host",
     "example/schema",
-    "example/js_runtime_schema",
     "tests",
     "tests/schema",
 ]

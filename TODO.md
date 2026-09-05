@@ -4,46 +4,24 @@ What's deliberately not built yet, in rough priority order. The spike's goal is
 to prove the architecture; these are the known gaps between "proven" and
 "product".
 
-## Views as replicated objects (do this first)
+## Surfaces and views (done: views are objects)
 
-Today views are addressed by name (`host.view("panel")`) over a dedicated
-scene channel. That has the same weakness names always have: surfaces that are
-*data* — a widget per buffer line, a decoration per diagnostic — can't be a
-naming convention. The unification: **renderability becomes a feature of a
-shared object**. A home entity that implements `Render` streams its display
-list to the other side, where a remote to it can be mounted anywhere in the
-element tree.
+Views are `SurfaceApi`/`ViewApi` objects; see `DESIGN.md`. What remains:
 
-- `view("panel")` dissolves into a typed method on the plugin's root object
-  returning a renderable ref — the roots exist now, so this is the last string
-  identifier in the protocol; no view names, no view ids.
-- Inline surfaces are anonymous renderable refs traveling in payloads:
-  `Vec<(BufferRow, Ref<InlayWidget>)>`, connected and mounted by the
-  host wherever its own layout puts them.
-- Input flows backward along the same identity: mouse/key messages addressed to
-  the entity, not a view id. Each mount drives resize like a window, as today.
-- Composes with the OCAP layer for free: revoking a renderable ref unmounts it
-  everywhere; attenuating away input methods yields a render-only capability.
-
-Likely rendering shape (sketch): scenes upload to **tracks**, identified by a
-shared object id rather than a view id — keeping today's `PluginElement`-style
-retained replay, but with each track a disjoint rendering timeline the host
-composites out of a cache. That may need small gpui changes on the host side;
-display lists are big, so tracks want their own lane and eventually a delta
-encoding (frame-to-frame scene diffing), not the object-message channel.
-
-Implementation notes for later: on surface overhead, don't make windows
-lighter, make fewer windows. A gpui `Window`
-carries real baseline weight (two retained frames, a Taffy arena, per-window
-frame pump) that's irrelevant for a handful of panels but wasteful for hundreds
-of widgets — while "one window, thousands of elements" is exactly gpui's design
-envelope. So the guest should mount all renderable entities as
-absolutely-positioned regions inside a single hidden composition window and
-slice the scene into per-region display lists at serialization (a serializer
-change, not a protocol change). Single-window focus matches the host's
-one-focus model; window-granular dirtiness (one animating widget redraws the
-composition) is fine at gpui's normal scale, with per-region damage tracking as
-a later optimization.
+- [ ] **Data-shaped surfaces at scale**: a widget per buffer line means hundreds of
+  surfaces. Don't make windows lighter, make fewer windows: the guest should mount
+  every view as an absolutely-positioned region inside one hidden composition window
+  and slice the scene into per-surface display lists at serialization (a serializer
+  change, not a protocol change). Single-window focus matches the host's one-focus
+  model; per-region damage tracking is a later optimization.
+- [ ] **Cross-instance scenes**: a surface ref can already travel from one plugin to
+  another through the object model, but each `PluginHost` routes scenes only to
+  surfaces shared through its own registry, and image caches are per instance. Routing
+  scenes by surface id across hosts is the composition story.
+- [ ] **Display-only views** as an `open_view` option (attach an `Attenuated<ViewApi>`
+  allowing only `resize`), so a plugin can lend a surface it cannot be poked through.
+- [ ] **Delta-encoded scenes**: display lists are the one bulk path; frame-to-frame
+  diffing when a profile asks for it.
 
 ## Object model follow-ups (from the root-object pass)
 
@@ -60,14 +38,18 @@ a later optimization.
   Dedup wants a per-entity identity map (and interacts with release: both refs
   share one strong hold).
 - [ ] **Root versioning discipline**: the root schema is the real compatibility
-  surface (for Zed: the extension API). Unknown methods already fail soft, but
-  it wants an explicit convention — a `version()` method or probe-and-degrade —
+  surface (for Zed: the extension API). Unknown methods already fail soft and
+  `Interface::schema()` makes probing possible, but it wants an explicit
+  convention — a `version()` method, or a `describe()` returning the schema —
   before anything ships against it.
-- [ ] **A public symmetric handle**: `PluginHostHandle` (host) and the free
-  functions (plugin) expose the same operations with the same names; a shared
-  `Peer`-style handle type both ends hand out would finish the symmetry at the
-  API-surface level too.
-- [ ] **Payload codec: evolvable schemas (after views-as-objects)**: method calls
+- [ ] **Bindings from the schema**: `Interface::schema()` is the artifact a
+  dynamic-language guest (a QuickJS runtime component) binds against and a `.d.ts`
+  generator consumes. Argument types are Rust `type_name`s today; a portable type
+  description is the missing piece.
+- [x] **A public symmetric handle**: `Registry` — reachable from any `Remote`, `Ref`,
+  or inbound `Payload` — shares, connects, and reaches the root on either end. The
+  host's `PluginHostHandle` and the guest's free functions are thin wrappers over it.
+- [ ] **Payload codec: evolvable schemas**: method calls
   are RPC, and the published schema crates are the protocol, so payloads need
   protobuf-style evolution — a hand-rolled protobuf-subset codec owned by the
   `#[interface]`/`#[data]` macros (field tags from declaration order, explicit
@@ -77,31 +59,17 @@ a later optimization.
   keeping the wire format an honest protobuf subset lets non-Rust ends speak it
   with stock tooling. Encoding moves into the schema layer (`Message` owns its
   bytes); core never mentions a codec.
-- [ ] **Ref-table packets (before views)**: test-first — start with the
-  wire-delta race test (drop a remote while the same ref is in flight; today
-  the reconnect finds "entity dropped", which is the leak/race CapTP's
-  mention-counting exists to prevent). Then: the message packet becomes
-  `(method, payload, refs: list<u64>)` — a capability table, Cap'n-Proto style.
-  Inside payloads a `Ref` serializes as an index into the table via a
-  thread-local encode/decode context wired into `encode`/`decode` (strict:
-  serializing a `Ref` outside a packet context is an error — refs are
-  session-scoped bearer secrets). The boundary then sees every capability
-  crossing without parsing payloads: accounting, the inspector's who-holds-what
-  edges, deep membranes (a caretaker rewrites the table — wrapping each entry —
-  without understanding the payload), and hop-by-hop rewriting for multi-plugin
-  routing, all from one wire-shape change, independent of codec. It also makes
-  refs *countable in transit*, enabling CapTP-style wire-delta accounting
-  (`op:gc-exports`): releases that cannot race in-flight mentions, and
-  collection of the currently-leaked case where a minted ref is never
-  connected by the receiver. Same pass: resolver refs as the general reply
-  route on call frames (request-id stays as the answer-pos-style fast path),
-  restoring CapTP's delegation-of-reply.
+- [x] **Ref-table packets**: `(method, payload, refs: list<u64>)`; a `Ref` serializes
+  as an index via the encode/decode context (strict: a `Ref` outside `encode` is an
+  error). Still to do on top of it: wire-delta mention accounting (see "In-flight ref
+  accounting" below), hop-by-hop rewriting for multi-plugin routing, and resolver refs
+  as the general reply route on call frames (request id stays as the fast path).
 - [ ] **Object-graph inspector**: the registry already holds the whole graph —
   homes (with `std::any::type_name` labels), projections, observers, strong vs
   released, pending requests. Expose it as *another shared object* (a debug
   `Interface` whose home is the registry itself) and any end — or a dev-tools
   plugin — can render a live object-graph view. Dogfooding as observability;
-  pairs with tagged refs (below), which add the who-holds-what edges.
+  the ref table supplies the who-holds-what edges.
 
 ## Platform completeness
 
@@ -139,17 +107,23 @@ a later optimization.
 
 ## Advanced OCAPs
 
-- [ ] **Tagged refs on the wire**: `Ref` crosses as a bare u64 inside
-  opaque payloads, so nothing can find refs in transit. Making refs a
-  distinguished wire type enables everything below, plus host-side capability
-  accounting (knowing exactly which refs each plugin holds).
-- [ ] **Deep membrane**: wrap an object *graph* so every ref passing through in
-  either direction is auto-wrapped, and one revoke severs the whole surface.
-  Requires tagged refs.
+- [x] **Tagged refs on the wire**: every call and response carries a ref table;
+  payload bytes name refs by index. Forwarders rewrite the table without parsing.
+- [x] **Deep membrane**: `Revocable` wraps every ref crossing it in either direction
+  and unwraps its own wrappers coming back; one revoke severs the whole graph.
+- [ ] **In-flight ref accounting**: a home shared into a payload the other end never
+  connects is kept alive forever. With the ref table, homes can count mentions out
+  and receivers can ack them in (CapTP's `gc-exports` wire deltas). Every forwarder
+  must participate.
+- [ ] **Cycle collection**: refcounting cannot collect a host object and a guest
+  object that hold each other. `keep_alive = false` is the owner-side escape hatch
+  today; the principled next step is explicit retention (`Remote::owned_by(&entity)`)
+  so the registry has edges to run cycle detection over.
 - [ ] **Loopback routing**: a guest materializing a ref to its own home (needed
-  to stack same-side caretakers, e.g. Revocable over Audited in one guest).
-  The host is already the router; it would reflect guest-addressed traffic
-  back, rewriting request ids.
+  to stack same-side caretakers, e.g. Revocable over Audited in one guest, and
+  for a membrane to wrap refs homed on its own end — today they pass through
+  unwrapped). The host is already the router; it would reflect guest-addressed
+  traffic back, rewriting request ids.
 - [ ] **Expiring / N-use grants**: a `Revocable` that severs itself after a
   deadline or call budget.
 - [ ] **Sealer/unsealer pairs**: rights amplification, for when plugins trade
@@ -160,9 +134,9 @@ a later optimization.
 
 ## Zed integration
 
-- [ ] **Mount points**: where plugin views attach in the workspace (panels,
+- [ ] **Mount points**: where plugin surfaces attach in the workspace (panels,
   items, status bar) and how they're declared — as methods on the root
-  objects (see "stringless discovery"), not as a naming convention.
+  objects taking `Ref<SurfaceApi>`, not as a naming convention.
 - [ ] **Packaging**: shipping components through the extension registry;
   versioning the WIT protocol.
 - [ ] **Upstreaming**: `run_embedded`/`ApplicationHandle` is PR'd

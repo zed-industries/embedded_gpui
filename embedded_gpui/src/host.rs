@@ -329,7 +329,7 @@ impl PluginInstance {
 
     /// One guest turn: deliver `inbound`, run the guest's scheduler, collect its output.
     pub fn tick(&mut self, inbound: Vec<bindings::Frame>) -> Result<bindings::Turn> {
-        Ok(self.bindings.call_tick(&mut self.store, &inbound)?)
+        self.bindings.call_tick(&mut self.store, &inbound)
     }
 }
 

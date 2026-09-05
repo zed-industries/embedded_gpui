@@ -30,7 +30,10 @@ use syn::{FnArg, Ident, ItemImpl, ItemTrait, Token, TraitItem, Type, bracketed};
 ///   method per interface method, so remotes get `.increment(by, cx) -> Receipt<u32>`;
 /// - hidden `CounterApi::register_increment(...)` functions taking a checked function
 ///   pointer per method, which is how `#[shared]` type-checks a home
-///   implementation against this schema.
+///   implementation against this schema;
+/// - `CounterApi::schema()` (via `Interface`), the interface as a runtime value: method
+///   names, argument names and types, response types, and events, for reflection and
+///   generated bindings.
 ///
 /// Method shape: `&mut self`, any number of serde-serializable arguments, and a final
 /// `cx: &mut Context<Self>` parameter.

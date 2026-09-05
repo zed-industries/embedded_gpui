@@ -16,13 +16,18 @@ app alive and re-enter it whenever the external run loop yields control).
   - `wit/plugin.wit` — the wire protocol (package `gpui:embedded`, world `plugin`); the
     single source of truth both sides bind against.
   - `src/embedded_gpui.rs` — the always-compiled object layer: `Remote`, `Receipt`,
-    `Ref`, specs/messages/events, and the `Shared` home trait.
-  - `src/host.rs` (+ `src/host/`) — native targets only: wasmtime glue, host-side shared
-    entities, and the element that replays guest display lists.
+    `Ref`, `Payload`, `Registry`, interfaces/messages/events, and the `Shared` home
+    trait.
+  - `src/registry.rs` — the side-blind object registry both ends run.
+  - `src/surface.rs` — the two well-known UI schemas, `SurfaceApi` (host-homed: a
+    place pixels go) and `ViewApi` (guest-homed: the thing drawing there), plus the
+    input/geometry/cursor data types they carry.
+  - `src/host.rs` (+ `src/host/`) — native targets only: wasmtime glue, the turn
+    transport, and the `Surface` entity that replays guest display lists.
   - `src/guest.rs` (+ `src/guest/`) — wasm32 targets only: GPUI's
     `Platform`/`PlatformWindow`/`PlatformDispatcher`/`PlatformTextSystem`/`PlatformAtlas`
-    over the WIT boundary, `Plugin`/`register_plugin!`, and the guest half of shared
-    entities.
+    over the WIT boundary, `Plugin`/`register_plugin!`/`open_view`, and the guest half
+    of the registry.
 - `embedded_gpui_macros/` — the `#[interface]` / `#[shared]` / `#[data]`
   proc macros.
 - `embedded_gpui_util/` — side-agnostic OCAP patterns (`Revocable`, `Attenuated`,
@@ -33,17 +38,18 @@ app alive and re-enter it whenever the external run loop yields control).
 - `tests/` — the host-driven integration tests for the object protocol, with
   their guest fixture in `tests/test_plugin/`.
 
-## The object model, made correct (this pass)
+## The object model is the only model
 
-The spike proved the object model *works*; this pass makes it the only model. Target,
-written before the code so the diff can be reviewed against it:
+The spike proved the object model *works*; this pass made it the only one. Five rules:
 
 1. **Views are objects.** A slot is a host-homed `SurfaceApi` object; the thing drawing
    on it is a guest-homed `ViewApi` object. The host hands a `Ref<SurfaceApi>` to the
    plugin through an ordinary typed method; the guest opens a window on it, shares a
    view, and calls `surface.attach(view)`. Input, resize, and cursor are method calls on
    those two objects. There are no view ids, no view names, and no directional
-   view/input functions in the WIT.
+   view/input functions in the WIT. A surface belongs to its owner (it is shared with
+   `keep_alive = false`): drop the entity and the guest's view is released and its
+   window closes.
 2. **Refs are enumerable.** Every call and response carries a `refs` table; payload
    bytes name refs by table index. Forwarders rewrite the table without parsing the
    payload, which is what makes transitive membranes (`Revocable` wrapping every ref
@@ -53,7 +59,8 @@ written before the code so the diff can be reviewed against it:
    `tick(inbound: list<frame>) -> turn { frames, scenes, wake-after-ms }`. Imports
    cannot re-enter the guest because there are none left to re-enter with (text shaping
    stays a synchronous import because layout needs the answer mid-call). The WIT is pure
-   substrate: objects, scheduling, pixels, text.
+   substrate: objects, scheduling, pixels, text. One boundary crossing per burst: the
+   host worker coalesces every frame queued since the last turn into one `tick`.
 4. **A ref knows where it came from.** `Ref<S>` binds to the registry that delivered
    it, so `ref.connect()` works anywhere a ref is held — in handlers, after awaits, on
    either end. `connect` stops being a host/guest entry point.
@@ -71,10 +78,10 @@ written before the code so the diff can be reviewed against it:
    store (strictly one call at a time), and each call's effects are applied back on the
    foreground in the same order. A slow or hung plugin cannot stall the UI; FIFO
    request/effect pairing preserves all ordering guarantees below.
-3. **Re-entrancy is forbidden by the component model.** Guest imports (`request-tick`,
-   `update-scene`, …) must NOT call back into the guest. Host import implementations only
-   mutate state on the wasmtime `Store`'s data; the host drains that pending state after
-   each guest call returns and acts on it then.
+3. **Re-entrancy is impossible by construction.** The guest's only imports are the
+   synchronous text-shaping functions, which answer from the host's text system and
+   never touch the guest. Everything else the guest produces travels in the `turn` a
+   `tick` returns; the host applies it after the call.
 4. **Text is shaped and rasterized by the host.** The guest's `PlatformTextSystem` proxies
    shaping over imports (with guest-side caching via GPUI's own `LineLayoutCache`). The
    guest never rasterizes; its sprite atlas fabricates tiles and remembers
@@ -89,15 +96,19 @@ written before the code so the diff can be reviewed against it:
 6. **Z-order**: guest primitives carry their scene `order` (u32). The host replays groups of
    ascending `order` inside `Window::paint_layer` calls so each group gets a fresh host
    order, preserving guest stacking (including guest-side deferred draws / overlays).
-7. **Input**: the host forwards raw mouse events (slot-relative logical coordinates) to the
-   guest via `handle-mouse`; the guest window's own dispatch does hit-testing and runs
-   listeners. No callback registry crosses the boundary. Cursor styles flow back via the
-   `set-cursor-style` import.
-8. **Scheduling**: the guest dispatcher queues runnables/timers locally and asks the host
-   for wakeups via `request-tick(delay-ms)`. The host calls the `tick` export, which drains
-   due work and then pumps each plugin window's `request_frame` callback (GPUI itself
-   decides whether a window is dirty and needs to redraw; a redraw ends in
-   `PlatformWindow::draw(scene)`, which serializes and calls `update-scene`).
+7. **Input and geometry are method calls** on the guest-homed `ViewApi` object a
+   surface has attached: `resize`, `mouse`, `key` (slot-relative logical coordinates).
+   The guest window's own dispatch does hit-testing and runs listeners; no callback
+   registry crosses the boundary. Cursor styles flow back as `set_cursor` on the
+   host-homed `SurfaceApi`. Because `ViewApi` handlers run inside the registry's `App`
+   borrow and GPUI's window callbacks re-enter the app, the view queues events on its
+   window and the pump applies them once the borrow is released — same turn, same order.
+8. **Scheduling**: the guest dispatcher queues runnables/timers locally. Every `tick`
+   drains due work, pumps each window's `request_frame` callback (GPUI decides whether
+   a window is dirty; a redraw ends in `PlatformWindow::draw(scene)`, which serializes
+   into the turn's `scenes`), and reports the earliest remaining timer as
+   `wake-after-ms`, which the host schedules. A window is not rendered until the host
+   has pushed its first geometry, so its first frame is at the slot's real size.
 
 ## Status
 
@@ -107,9 +118,9 @@ positioning), tessellated paths, images (premultiplied-BGRA payloads shipped onc
 per instance), SVGs (guest-rasterized alpha masks, tint baked per color), keyboard input
 (host focus → forwarded keystrokes → guest focus dispatch, with unhandled printable keys
 falling through to the focused `EntityInputHandler`, Linux-backend style), hover styles,
-mouse input, cursor styles, and shared object state across two plugin views backed by one
-guest App. The release component (all of gpui + taffy, no fonts, no glyph rasterizers) is
-~3.8 MB.
+mouse input, cursor styles, and shared object state across two plugin surfaces backed by
+one guest App. The release component (all of gpui + taffy, no fonts, no glyph
+rasterizers) is ~6 MB unoptimized for size.
 
 Run it:
 
@@ -122,12 +133,12 @@ cargo run -p example_host
 A fair question: the WIT interface is a type system, and the object schema layer
 is another. Why both? Because they type different things, with opposite change profiles:
 
-- **WIT is the syscall boundary** — display lists, input, text shaping, scheduling, and
-  the handful of functions that move opaque entity traffic. It changes when the
-  *platform* changes: rarely, owned by one team, with hard commitments (a signature
-  mismatch fails instantiation outright). That hardness is right for the substrate and
-  wrong for an app API. Note the WIT here is already almost entirely machine protocol;
-  the whole object model rides on eight small functions with opaque payloads.
+- **WIT is the syscall boundary** — display lists, text shaping, and the two exports
+  (`init`, `tick`) that carry frames both ways. It changes when the *platform* changes:
+  rarely, owned by one team, with hard commitments (a signature mismatch fails
+  instantiation outright). That hardness is right for the substrate and wrong for an
+  app API. The WIT here is entirely machine protocol: nothing in it has UI meaning, and
+  the whole object model rides on one `frame` type.
 - **The object model is userspace** — the evolving semantic surface (what a host app
   exposes, what plugins expose to each other), side-blind and peer-to-peer (see
   "Symmetry" below), with soft, runtime-negotiated
@@ -146,10 +157,10 @@ the dynamic layer) and **ecosystem growth** (two plugins agreeing on a new inter
 a shared schema crate, without the host knowing or any world recompilation).
 
 The honest trade: dynamic calls are slower than generated WIT functions (serde plus
-string dispatch). The split encodes the rule — hot or foundational goes in WIT (display
-lists, input, text: already there), evolving semantics go through objects — and since
-the object wire is just bytes, encodings are swappable and any method that gets hot can
-be promoted into WIT. Precedents for the two-layer shape: syscalls vs. D-Bus, TCP vs.
+string dispatch). The split encodes the rule — bulk pixels and mid-call text shaping go
+in WIT, everything with meaning (including input, at a few microseconds per event) goes
+through objects — and since the object wire is just bytes, encodings are swappable and
+any method that gets hot can be promoted into WIT. Precedents for the two-layer shape: syscalls vs. D-Bus, TCP vs.
 HTTP APIs, Wayland's fixed wire vs. versioned interfaces.
 
 ## Performance philosophy
@@ -187,16 +198,17 @@ types), so shared state is built on three rules:
    the home, observe its `cx.notify`, and subscribe to its `cx.emit` events. State never
    replicates at the protocol level — reads are calls, and anything that needs a local
    copy builds one in userland (`embedded_gpui_util::Mirror`).
-2. **Dynamic dispatch on the wire, types on top.** All traffic is actor-style messages
-   `(entity_id, method: string, payload: bytes)` one way and events
-   `(entity_id, name: string, payload: bytes)` the other. The schema layer types this —
-   `#[interface]` generates the spec, the message types, and typed caller
-   methods — while `call_raw` / `Methods::on` (with a `"*"` wildcard)
-   remain available, so plugins can define their own entity kinds and methods without
-   protocol changes. The registry itself stores exactly one dispatch closure per
-   object and never interprets method names: the name-keyed table (and its wildcard)
-   is a userspace convention that `Methods` compiles down to. What crosses the
-   boundary is data with a name, never memory with a type.
+2. **Dynamic dispatch on the wire, types on top.** All traffic is actor-style calls
+   `(target, method: string, payload: bytes + refs)`. The payload's bytes name refs by
+   index into its ref table, so the registry never parses payloads yet every capability
+   in transit is enumerable. The schema layer types this — `#[interface]` generates the
+   spec, the message types, typed caller methods, and a runtime `schema()` — while
+   `call_raw` / `Methods::on` (with a `"*"` wildcard) remain available, so plugins can
+   define their own entity kinds and methods without protocol changes. The registry
+   itself stores exactly one dispatch closure per object and never interprets method
+   names: the name-keyed table (and its wildcard) is a userspace convention that
+   `Methods` compiles down to. What crosses the boundary is data with a name, never
+   memory with a type.
 3. **Single-threaded, queue-ordered, reentrancy-safe.** Everything runs on the host main
    thread; messages and responses ride the same deferred-effects machinery as display
    lists (events are just messages to observer objects), so there are no
@@ -210,8 +222,17 @@ unique for practical purposes (collisions are birthday-bounded), so a ref is
 universally applicable: nothing is namespaced per end, and an id can only be
 *known*, never guessed or enumerated. Discovery starts from **one root object per
 end** — see "Bootstrap" below — and every other object is reached through a method
-call, resolving directly as a connected `Remote`. `SharedSpec::TYPE_NAME` survives
-purely as diagnostic metadata in error messages; nothing on the wire checks it.
+call, resolving directly as a connected `Remote`. Interface names survive purely as
+diagnostic metadata in error messages; nothing on the wire checks them.
+
+Lifetimes are reference counted, and reference counting cannot collect cycles: two
+objects on opposite ends that hold remotes to each other, with nothing else owning
+either, live forever. Objects whose lifetime belongs to an owner outside the graph opt
+out with `#[shared(keep_alive = false)]` (a `Surface` lives as long as the embedder's
+UI keeps it; the guest's view is the other half of exactly such a cycle). A tracing
+collector would need each end's retention edges, which gpui entities do not expose;
+if cycles become a practical problem, the route is explicit retention
+(`Remote::owned_by`) plus cycle detection, not a tracer.
 
 ### Bootstrap: one root object per end
 
@@ -250,6 +271,7 @@ sandbox:
 
 | local gpui                   | across the boundary                                     |
 | ---------------------------- | ------------------------------------------------------- |
+| a view in the element tree   | a `Surface` entity in the tree, a `ViewApi` object drawing on it |
 | calling methods in `update`  | `remote.call(...)` (drop the receipt to fire-and-forget) |
 | `cx.observe(&entity, ...)`   | `remote.observe(cx, ...)`                               |
 | `cx.subscribe(&entity, ...)` | `remote.subscribe::<Event>(cx, ...)`                    |
@@ -272,8 +294,9 @@ primitive — chain `.decoded::<R>()` or `.acknowledged()` to interpret it. The 
 lives in the receipt, not the verb. Dropping a receipt is fire-and-forget; the message
 is unaffected.
 
-Every projection is born bound — `connect` always has the ref's id, and root ids are
-fixed — so there is no unresolved-name state and no pending-send queue. The cost is
+Every projection is born bound — a `Ref` carries its id and the registry it arrived
+through, so `ref.connect()` needs nothing else — and there is no unresolved-name state
+and no pending-send queue. The cost is
 that a ref returned by a method call must round-trip before you can call through it;
 Cap'n-Proto-style promise pipelining (calling through a not-yet-resolved ref) is
 deliberately not built yet (see TODO).
@@ -324,10 +347,13 @@ natively.
 
 ### References and capabilities (OCAP)
 
-Everything moves by reference: `Ref<S>` is a serializable entity reference (a
-bare id on the wire) that travels *inside* message and event payloads, including call
-responses. A home shares an entity (`share` returns the ref), embeds the ref wherever
-it likes, and the receiving end connects a remote to it (`connect`). The two roots are
+Everything moves by reference: `Ref<S>` is a serializable entity reference that
+travels *inside* message and event payloads, including call responses. On the wire a
+payload's bytes name a ref by its index into the frame's ref table, so the table is the
+complete list of capabilities a message carries: opaque to the registry, enumerable to
+forwarders, and rewritable without parsing. A home shares an entity (`share` returns
+the ref), embeds the ref wherever it likes, and the receiving end connects a remote to
+it (`ref.connect()` — the ref remembers which registry delivered it). The two roots are
 the only refs that exist by convention; every other ref was minted by a method call.
 The demo's command palette works this way: the plugin publishes
 `[(label, Ref<CommandApi>)]`, the host renders native buttons for the labels,
@@ -361,13 +387,18 @@ entity):
 - **Accounting** is `embedded_gpui_util::Audited`: a transparent forwarder that records
   every call (method, payload size, eventual outcome) in a ledger readable by whoever
   holds the wrapper entity — capability accountability without interference.
-- **Revocation** is `embedded_gpui_util::Revocable`: wrap any capability you hold in a
-  caretaker entity, share the wrapper, hand out *its* ref. Notifies and events pass
-  through, and a wildcard handler forwards every method — including ones the wrapper has
-  never heard of — to the wrapped capability as raw bytes (`Remote::call_raw`).
-  `revoke()` drops the inner remote (auto-release
-  cascades to its home) and fails all further calls. The integration tests drive a full
-  membrane (host vault → guest caretaker → host caller) through it.
+- **Revocation** is `embedded_gpui_util::Revocable`, and it is a *membrane*: wrap any
+  capability you hold in a caretaker entity, share the wrapper, hand out *its* ref.
+  Notifies and events pass through, and a wildcard handler forwards every method —
+  including ones the wrapper has never heard of — to the wrapped capability as raw
+  bytes (`Remote::call_raw`). Every ref that crosses in either direction (arguments,
+  responses, events) is rewritten in the ref table to a wrapper sharing the same
+  revocation switch, and wrapper refs coming back are unwrapped, so the wrapped object
+  sees its own objects. `revoke()` severs every wrapper at once (auto-release cascades
+  to the homes) and fails all further calls through any of them. The integration tests
+  drive a full membrane (host vault → guest caretaker → host caller) through it and
+  verify that a key obtained *through* the membrane dies with it. Refs homed on the
+  wrapper's own end pass through unwrapped (loopback connects are not supported).
 
 ### Async handlers
 
@@ -411,6 +442,11 @@ side's receipt connects it on arrival. Allocation over there, handle over here.
 Fully dynamic entities skip the schema: `share_with(&entity, |methods| ...)`
 registers handlers by name at runtime, including the `"*"` wildcard the wrappers use.
 
+The schema is also a value: `Interface::schema()` returns the interface's name,
+methods (argument names and types, response type, whether it returns a ref, whether it
+is async), and events — the same artifact the macros compile against, so a
+dynamic-language guest or an inspector can bind to it without generated code.
+
 Home transfer is not implemented (if ever needed: a serialize-and-swap barrier message;
 FIFO ordering makes it race-free by construction).
 
@@ -436,12 +472,12 @@ membrane at that edge only, Goblins objects appearing inside plugins as ordinary
 | session setup (fresh keys, crossed hellos) | the wasm boundary *is* the session; the host owns the guest's memory, so no cryptographic identity |
 | bootstrap object at export position 0  | the root object at address 0                              |
 | swiss-nums (unguessable object names)   | random u64 ids (bearer refs)                              |
-| per-session import/export positions, perspective-flipped | global random ids: no flip, so opaque payloads pass through membranes unrewritten (their refs are structural descriptors; ref-table packets are our equivalent step) |
+| per-session import/export positions, perspective-flipped | global random ids: no flip, so payload bytes pass through membranes unrewritten; refs travel in a per-frame table (their structural descriptors), which is what a membrane rewrites |
 | `op:deliver`                            | the `call` frame                                          |
 | resolver objects (`resolve-me-desc`)    | `request-id` + response record — a flattened resolver (the optimization CapTP itself evolves into via answer tables); resolver *refs* on calls, restoring delegation-of-reply, ride the ref-table pass |
 | promises + `op:listen`                  | `Receipt`s (one-shot); observer objects are our listen    |
 | pipelining via `answer-pos` (questions/answers) | the caller-allocated-ids design in TODO — same idea, reached from random ids |
-| `op:gc-exports` with wire-deltas        | release frames + drop guards; in-flight mention accounting is queued with ref-table packets |
+| `op:gc-exports` with wire-deltas        | release frames + drop guards; the ref table makes in-flight mention accounting possible (not built yet) |
 | third-party handoffs (gifter/receiver/exporter certificates) | multi-plugin routing stays host-mediated (the host is the powerbox); handoffs are the reference for unmediated introductions |
 | syrup (canonical s-expressions)         | JSON today; a protobuf-subset codec planned — version-skew tolerance via field tags is the requirement syrup meets only by convention |
 | vats                                    | the two gpui event loops, exactly (minus transactional turns) |
@@ -457,6 +493,9 @@ membrane at that edge only, Goblins objects appearing inside plugins as ordinary
   `replace_text_in_range` like GPUI's Linux backends. Dead keys/CJK composition would need
   the host to proxy its `PlatformInputHandler` into the guest.
 - Image/SVG payloads are cached per instance and never evicted; inset shadows are skipped.
-- Guest runs on the host's main thread via a synchronous wasmtime store.
+- The wasmtime store is synchronous; it lives on a background worker, one turn at a time.
+- A plugin's `Surface`s and the images its scenes reference are per plugin instance;
+  a surface handed from one plugin to another (composition) is expressible in the
+  object model but the host does not yet route scenes across instances.
 - Font fallback inside a run is whatever the host's `layout_line` returns; fonts are
   identified by host-global `FontId`s which are session-scoped.

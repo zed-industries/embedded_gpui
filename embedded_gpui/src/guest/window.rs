@@ -44,6 +44,9 @@ pub struct PluginWindowState {
     /// the registry's `App` borrow, and GPUI's window callbacks re-enter the app, so the
     /// pump applies these once the borrow is released.
     pending: RefCell<Vec<WindowEvent>>,
+    /// Set by the first `resize` from the host. Until then the window has a nominal
+    /// size and is not rendered: the first frame is drawn at the slot's real size.
+    measured: Cell<bool>,
 }
 
 /// One host-driven window event, applied by the pump.
@@ -70,6 +73,7 @@ impl PluginWindowState {
             input_handler: RefCell::new(None),
             last_input_surface,
             pending: RefCell::new(Vec::new()),
+            measured: Cell::new(false),
         }
     }
 
@@ -103,6 +107,9 @@ impl PluginWindowState {
     /// The callback is temporarily moved out so that it can freely re-enter this window's
     /// other methods without hitting the `callbacks` RefCell.
     pub fn pump_frame(&self) {
+        if !self.measured.get() {
+            return;
+        }
         let callback = self.callbacks.borrow_mut().request_frame.take();
         if let Some(mut callback) = callback {
             callback(RequestFrameOptions {
@@ -148,6 +155,10 @@ impl PluginWindowState {
 
     /// Apply a slot size or scale factor change coming from the host.
     pub fn resized(&self, size: Size<Pixels>, scale_factor: f32) {
+        if size.width <= Pixels::ZERO || size.height <= Pixels::ZERO {
+            return;
+        }
+        self.measured.set(true);
         self.size.set(size);
         self.scale_factor.set(scale_factor);
         let callback = self.callbacks.borrow_mut().resize.take();

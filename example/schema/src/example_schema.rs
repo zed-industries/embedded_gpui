@@ -6,6 +6,7 @@
 //! at its id 0, and every other capability here is reached by calling a root method
 //! that returns a ref. No names, no registries — discovery *is* the root schema.
 
+use embedded_gpui::surface::SurfaceApi;
 use embedded_gpui::{Ref, data, interface};
 
 /// The host's root object: everything the plugin can reach on the host.
@@ -28,6 +29,13 @@ pub trait DemoPlugin {
 
     /// The plugin's command palette, rendered natively by the host.
     fn palette(&mut self, cx: &mut gpui::Context<Self>) -> Ref<PaletteApi>;
+
+    /// Draw the counter button on the given host surface. Where a view goes is the
+    /// host's decision (it owns the surface); what is drawn there is the plugin's.
+    fn show_button(&mut self, surface: Ref<SurfaceApi>, cx: &mut gpui::Context<Self>);
+
+    /// Draw the panel (text input, SVG, image, animated path) on the given surface.
+    fn show_panel(&mut self, surface: Ref<SurfaceApi>, cx: &mut gpui::Context<Self>);
 }
 
 /// The click counter homed on the HOST: the wasm views call `increment`, mirror

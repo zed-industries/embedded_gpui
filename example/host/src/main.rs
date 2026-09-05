@@ -1,5 +1,5 @@
-//! Demo host binary: opens a native GPUI window with two embedded plugin views driven by
-//! the `example_plugin` guest component.
+//! Demo host binary: opens a native GPUI window with two embedded plugin surfaces drawn
+//! by the `example_plugin` guest component.
 //!
 //! The bootstrap is two root objects: this host installs its `DemoHost` root at the
 //! reserved address 0 (`share_root`), and reaches the plugin through the plugin's
@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use embedded_gpui::{
-    PluginHost, PluginHostHandle as _, PluginOptions, PluginViewState, Ref, Remote, shared,
+    PluginHost, PluginHostHandle as _, PluginOptions, Ref, Remote, Surface, shared,
 };
 use embedded_gpui_util::Mirror;
 use example_schema::{
@@ -72,20 +72,20 @@ struct HostRoot {
 #[shared]
 impl DemoHost for HostRoot {
     fn counter(&mut self, cx: &mut Context<Self>) -> Ref<CounterApi> {
-        if let Some(reference) = self.counter_ref {
-            return reference;
+        if let Some(reference) = &self.counter_ref {
+            return reference.clone();
         }
         let reference = self.host.share(&self.counter, cx);
-        self.counter_ref = Some(reference);
+        self.counter_ref = Some(reference.clone());
         reference
     }
 
     fn workspace(&mut self, cx: &mut Context<Self>) -> Ref<WorkspaceApi> {
-        if let Some(reference) = self.workspace_ref {
-            return reference;
+        if let Some(reference) = &self.workspace_ref {
+            return reference.clone();
         }
         let reference = self.host.share(&self.workspace, cx);
-        self.workspace_ref = Some(reference);
+        self.workspace_ref = Some(reference.clone());
         reference
     }
 }
@@ -165,9 +165,12 @@ fn open_demo_window(host: gpui::Entity<PluginHost>, cx: &mut App) {
             let plugin = host.root::<DemoPlugin>(cx);
             let typed_text_receipt = plugin.typed_text(cx);
             let palette_receipt = plugin.palette(cx);
-            // Views by name; each fills whatever slot the host lays out for it.
-            let view0 = host.view("button", cx);
-            let view1 = host.view("panel", cx);
+            // Surfaces are ordinary entities the host owns and places; the plugin is
+            // handed a ref to each and draws whatever it likes there.
+            let button_surface = cx.new(Surface::new);
+            let panel_surface = cx.new(Surface::new);
+            plugin.show_button(host.share(&button_surface, cx), cx);
+            plugin.show_panel(host.share(&panel_surface, cx), cx);
             cx.new(|cx| {
                 cx.observe(&counter, |_, _, cx| cx.notify()).detach();
                 cx.observe(&workspace, |_, _, cx| cx.notify()).detach();
@@ -204,7 +207,6 @@ fn open_demo_window(host: gpui::Entity<PluginHost>, cx: &mut App) {
                     });
                 });
                 DemoView {
-                    host,
                     _root: root,
                     counter,
                     workspace,
@@ -214,8 +216,8 @@ fn open_demo_window(host: gpui::Entity<PluginHost>, cx: &mut App) {
                     command_status: None,
                     command_task: None,
                     _discovery: discovery,
-                    view0,
-                    view1,
+                    button_surface,
+                    panel_surface,
                 }
             })
         },
@@ -263,8 +265,7 @@ fn resolve_wasm_path() -> Option<PathBuf> {
 }
 
 struct DemoView {
-    host: Entity<PluginHost>,
-    /// Keeps the root's ref caches alive; the registry holds it for the plugin anyway.
+    /// Keeps the root's ref caches (and, through it, the plugin host) alive.
     _root: Entity<HostRoot>,
     counter: Entity<Counter>,
     workspace: Entity<Workspace>,
@@ -278,8 +279,8 @@ struct DemoView {
     command_status: Option<String>,
     command_task: Option<gpui::Task<()>>,
     _discovery: Task<()>,
-    view0: Entity<PluginViewState>,
-    view1: Entity<PluginViewState>,
+    button_surface: Entity<Surface>,
+    panel_surface: Entity<Surface>,
 }
 
 impl DemoView {
@@ -289,7 +290,7 @@ impl DemoView {
         let command = self
             .command_remotes
             .entry(reference.entity_id())
-            .or_insert_with(|| self.host.connect(reference, cx))
+            .or_insert_with(|| reference.connect())
             .clone();
         let receipt = command.invoke(cx);
         self.command_task = Some(cx.spawn(async move |this, cx| {
@@ -371,7 +372,7 @@ impl Render for DemoView {
                             .child(format!("wasm says: {typed:?}")),
                     ),
             )
-            .child(framed_slot(px(240.), px(100.), self.view0.clone()))
+            .child(framed_slot(px(240.), px(100.), self.button_surface.clone()))
             .child(
                 div()
                     .flex()
@@ -401,7 +402,7 @@ impl Render for DemoView {
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(move |this, _, _, cx| {
-                                            this.run_command(entry.command, cx);
+                                            this.run_command(entry.command.clone(), cx);
                                         }),
                                     )
                             })),
@@ -415,7 +416,7 @@ impl Render for DemoView {
                         )
                     }),
             )
-            .child(framed_slot(px(480.), px(320.), self.view1.clone()))
+            .child(framed_slot(px(480.), px(320.), self.panel_surface.clone()))
             .when_some(toast, |this, message| {
                 this.child(
                     div()
@@ -432,11 +433,11 @@ impl Render for DemoView {
     }
 }
 
-fn framed_slot(width: Pixels, height: Pixels, view: Entity<PluginViewState>) -> impl IntoElement {
+fn framed_slot(width: Pixels, height: Pixels, surface: Entity<Surface>) -> impl IntoElement {
     div()
         .w(width)
         .h(height)
         .border_1()
         .border_color(rgb(0x3c3c3c))
-        .child(view)
+        .child(surface)
 }

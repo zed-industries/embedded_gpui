@@ -1,5 +1,5 @@
-//! A demo GPUI plugin: two views (a button and a panel) sharing one guest App, rendered
-//! by the `embedded_gpui` host. The panel exercises text, SVGs, images, paths, and
+//! A demo GPUI plugin: two views (a button and a panel) sharing one guest App, drawn on
+//! surfaces the host hands over. The panel exercises text, SVGs, images, paths, and
 //! keyboard input. See `DESIGN.md`.
 //!
 //! The bootstrap is two root objects: this plugin installs its `DemoPlugin` root at
@@ -8,8 +8,9 @@
 //! from there; methods declared to return refs resolve directly with connected
 //! `Remote`s.
 
+use embedded_gpui::surface::SurfaceApi;
 use embedded_gpui::{
-    Plugin, Receipt, Ref, Remote, register_plugin, root, share, share_root, shared,
+    Plugin, Receipt, Ref, Remote, open_view, register_plugin, root, share, share_root, shared,
 };
 use embedded_gpui_util::Mirror;
 use example_schema::{
@@ -17,7 +18,7 @@ use example_schema::{
     Milestone, PaletteApi, PaletteEntry, TextApi, WorkspaceApi, WorkspaceApiCaller as _,
 };
 use gpui::{
-    AnyView, App, AssetSource, Bounds, Context, ElementInputHandler, Entity, EntityInputHandler,
+    App, AssetSource, Bounds, Context, ElementInputHandler, Entity, EntityInputHandler,
     FocusHandle, KeyDownEvent, MouseButton, PathBuilder, Pixels, RenderImage, SharedString,
     Subscription, UTF16Selection, Window, canvas, div, hsla, img, point, prelude::*, px, rgb, svg,
 };
@@ -44,37 +45,15 @@ impl AssetSource for PluginAssets {
 }
 
 struct ExamplePlugin {
-    /// The host's root object: the single capability this plugin starts from.
-    host: Remote<DemoHost>,
-    /// This plugin's root object, installed at this end's id 0.
-    root: Entity<PluginRoot>,
+    /// This plugin's root object, installed at this end's address 0.
+    _root: Entity<PluginRoot>,
 }
 
 impl Plugin for ExamplePlugin {
     fn new(cx: &mut App) -> Self {
-        let host = root::<DemoHost>();
-        let plugin_root = cx.new(|_| PluginRoot::default());
+        let plugin_root = cx.new(|_| PluginRoot::new(root::<DemoHost>()));
         share_root(&plugin_root, cx);
-        Self {
-            host,
-            root: plugin_root,
-        }
-    }
-
-    fn create_view(&mut self, name: &str, _window: &mut Window, cx: &mut App) -> AnyView {
-        match name {
-            "button" => cx.new(|cx| ButtonView::new(self.host.clone(), cx)).into(),
-            _ => {
-                // The panel renders the same entities the root's methods publish: the
-                // lazy factories converge on one input line and one wave, whichever
-                // side asks first.
-                let (input_line, wave) = self.root.update(cx, |root, cx| {
-                    (root.ensure_input_line(cx), root.ensure_wave(cx))
-                });
-                cx.new(|cx| PanelView::new(self.host.clone(), input_line, wave, cx))
-                    .into()
-            }
-        }
+        Self { _root: plugin_root }
     }
 
     fn assets() -> Option<Box<dyn AssetSource>> {
@@ -88,8 +67,9 @@ register_plugin!(ExamplePlugin);
 /// lazy factory — the entity is created on the first call (from either end) and cached,
 /// so repeated calls return the same ref and `connect` on the host dedups to one
 /// projection.
-#[derive(Default)]
 struct PluginRoot {
+    /// The host's root object: the single capability this plugin starts from.
+    host: Remote<DemoHost>,
     input_line: Option<Entity<InputLine>>,
     input_line_ref: Option<Ref<TextApi>>,
     wave: Option<Entity<Wave>>,
@@ -99,6 +79,17 @@ struct PluginRoot {
 }
 
 impl PluginRoot {
+    fn new(host: Remote<DemoHost>) -> Self {
+        Self {
+            host,
+            input_line: None,
+            input_line_ref: None,
+            wave: None,
+            palette: None,
+            commands: Vec::new(),
+        }
+    }
+
     fn ensure_input_line(&mut self, cx: &mut Context<Self>) -> Entity<InputLine> {
         if let Some(input_line) = &self.input_line {
             return input_line.clone();
@@ -124,18 +115,18 @@ impl PluginRoot {
 #[shared]
 impl DemoPlugin for PluginRoot {
     fn typed_text(&mut self, cx: &mut Context<Self>) -> Ref<TextApi> {
-        if let Some(reference) = self.input_line_ref {
-            return reference;
+        if let Some(reference) = &self.input_line_ref {
+            return reference.clone();
         }
         let input_line = self.ensure_input_line(cx);
         let reference = share(&input_line, cx);
-        self.input_line_ref = Some(reference);
+        self.input_line_ref = Some(reference.clone());
         reference
     }
 
     fn palette(&mut self, cx: &mut Context<Self>) -> Ref<PaletteApi> {
         if let Some((_, reference)) = &self.palette {
-            return *reference;
+            return reference.clone();
         }
         // The command palette: each command is a shared entity whose ref travels in the
         // palette carries their refs. The host renders the labels as native buttons;
@@ -185,8 +176,28 @@ impl DemoPlugin for PluginRoot {
         let palette = cx.new(|_| Palette { entries });
         let reference = share(&palette, cx);
         self.commands = commands;
-        self.palette = Some((palette, reference));
+        self.palette = Some((palette, reference.clone()));
         reference
+    }
+
+    fn show_button(&mut self, surface: Ref<SurfaceApi>, cx: &mut Context<Self>) {
+        let host = self.host.clone();
+        if let Err(error) = open_view(surface, cx, |_, cx| cx.new(|cx| ButtonView::new(host, cx))) {
+            eprintln!("[example_plugin] show_button failed: {error:#}");
+        }
+    }
+
+    fn show_panel(&mut self, surface: Ref<SurfaceApi>, cx: &mut Context<Self>) {
+        // The panel renders the same entities the root's methods publish: the lazy
+        // factories converge on one input line and one wave, whichever side asks first.
+        let input_line = self.ensure_input_line(cx);
+        let wave = self.ensure_wave(cx);
+        let host = self.host.clone();
+        if let Err(error) = open_view(surface, cx, |_, cx| {
+            cx.new(|cx| PanelView::new(host, input_line, wave, cx))
+        }) {
+            eprintln!("[example_plugin] show_panel failed: {error:#}");
+        }
     }
 }
 

@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::registry::{Call, Frame, Objects, Response};
@@ -16,7 +17,7 @@ use futures::StreamExt as _;
 use futures::channel::mpsc;
 use gpui::{AppContext as _, Context, Entity, PlatformTextSystem, Task, px};
 use wasmtime::component::{Component, Linker};
-use wasmtime::{Config, Engine, Store};
+use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 pub(crate) mod bindings {
@@ -38,6 +39,7 @@ struct HostState {
     wasi: WasiCtx,
     table: ResourceTable,
     text_system: Arc<dyn PlatformTextSystem>,
+    limits: StoreLimits,
 }
 
 impl WasiView for HostState {
@@ -251,11 +253,25 @@ fn convert_line_layout(layout: &gpui::LineLayout) -> bindings::LineLayout {
 }
 
 /// A synchronous wasmtime store plus its instantiated bindings: the two exports, `init`
-/// and `tick`, are the whole runtime surface.
+/// and `tick`, are the whole runtime surface. Every call runs under the turn budget:
+/// a guest that exceeds it traps, and the instance is considered dead.
 pub struct PluginInstance {
     store: Store<HostState>,
     bindings: Plugin,
+    /// Epoch ticks a single guest turn may take before it traps.
+    turn_deadline_ticks: u64,
+    /// Stops the epoch ticker thread when the instance drops.
+    ticker_alive: Arc<AtomicBool>,
 }
+
+impl Drop for PluginInstance {
+    fn drop(&mut self) {
+        self.ticker_alive.store(false, Ordering::Relaxed);
+    }
+}
+
+/// How often the engine's epoch advances; the granularity of the turn budget.
+const EPOCH_TICK: Duration = Duration::from_millis(10);
 
 /// Grants extra WASI authority to a plugin's sandbox at instantiation.
 pub type ConfigureWasi = Box<dyn FnOnce(&mut WasiCtxBuilder) + Send>;
@@ -269,6 +285,12 @@ pub struct PluginOptions {
     /// inherited stdout/stderr; every additional authority (filesystem, network, env)
     /// is an explicit choice made here.
     pub configure_wasi: Option<ConfigureWasi>,
+    /// The most wall-clock time one guest turn (`init` or `tick`) may take. A guest
+    /// that exceeds it traps and the instance stops; the host UI never waits on it
+    /// either way, since turns run on a worker. Default: one second.
+    pub turn_budget: Duration,
+    /// The most linear memory the guest may grow to. Default: 512 MiB.
+    pub memory_limit: usize,
 }
 
 impl PluginOptions {
@@ -276,7 +298,19 @@ impl PluginOptions {
         Self {
             text_system,
             configure_wasi: None,
+            turn_budget: Duration::from_secs(1),
+            memory_limit: 512 << 20,
         }
+    }
+
+    pub fn with_turn_budget(mut self, budget: Duration) -> Self {
+        self.turn_budget = budget;
+        self
+    }
+
+    pub fn with_memory_limit(mut self, bytes: usize) -> Self {
+        self.memory_limit = bytes;
+        self
     }
 
     /// Grant the plugin additional WASI authority (preopened dirs, env vars, ...).
@@ -293,7 +327,25 @@ impl PluginInstance {
     pub fn new(component_path: &Path, options: PluginOptions) -> Result<Self> {
         let mut config = Config::new();
         config.wasm_component_model(true);
+        config.epoch_interruption(true);
         let engine = Engine::new(&config).context("creating wasmtime engine")?;
+
+        // The epoch is the clock the turn budget is measured in. A thread per instance
+        // is cheap; it exits when the instance drops.
+        let ticker_alive = Arc::new(AtomicBool::new(true));
+        std::thread::Builder::new()
+            .name("embedded_gpui epoch".into())
+            .spawn({
+                let engine = engine.clone();
+                let alive = ticker_alive.clone();
+                move || {
+                    while alive.load(Ordering::Relaxed) {
+                        std::thread::sleep(EPOCH_TICK);
+                        engine.increment_epoch();
+                    }
+                }
+            })
+            .context("spawning epoch ticker")?;
 
         let component = Component::from_file(&engine, component_path)
             .with_context(|| format!("loading component {}", component_path.display()))?;
@@ -313,22 +365,39 @@ impl PluginInstance {
             wasi,
             table: ResourceTable::new(),
             text_system: options.text_system,
+            limits: StoreLimitsBuilder::new()
+                .memory_size(options.memory_limit)
+                .build(),
         };
         let mut store = Store::new(&engine, state);
+        store.limiter(|state| &mut state.limits);
+        let turn_deadline_ticks = options
+            .turn_budget
+            .as_millis()
+            .div_ceil(EPOCH_TICK.as_millis())
+            .max(1) as u64;
+        store.set_epoch_deadline(turn_deadline_ticks);
         let bindings = Plugin::instantiate(&mut store, &component, &linker)
             .context("instantiating plugin component")?;
 
-        Ok(Self { store, bindings })
+        Ok(Self {
+            store,
+            bindings,
+            turn_deadline_ticks,
+            ticker_alive,
+        })
     }
 
     /// Run `Plugin::new` in the guest, then collect what it queued with an empty tick.
     pub fn init(&mut self) -> Result<bindings::Turn> {
+        self.store.set_epoch_deadline(self.turn_deadline_ticks);
         self.bindings.call_init(&mut self.store)?;
         self.tick(Vec::new())
     }
 
     /// One guest turn: deliver `inbound`, run the guest's scheduler, collect its output.
     pub fn tick(&mut self, inbound: Vec<bindings::Frame>) -> Result<bindings::Turn> {
+        self.store.set_epoch_deadline(self.turn_deadline_ticks);
         self.bindings.call_tick(&mut self.store, &inbound)
     }
 }
@@ -419,7 +488,7 @@ impl PluginHost {
     /// foreground in the same order.
     pub fn new(mut instance: PluginInstance, cx: &mut Context<Self>) -> Self {
         let (requests, mut request_rx) = mpsc::unbounded::<PluginRequest>();
-        let (turns_tx, mut turns_rx) = mpsc::unbounded::<bindings::Turn>();
+        let (turns_tx, mut turns_rx) = mpsc::unbounded::<Result<bindings::Turn, String>>();
 
         let worker = cx.background_spawn(async move {
             while let Some(request) = request_rx.next().await {
@@ -438,11 +507,19 @@ impl PluginHost {
                 };
                 match turn {
                     Ok(turn) => {
-                        if turns_tx.unbounded_send(turn).is_err() {
+                        if turns_tx.unbounded_send(Ok(turn)).is_err() {
                             break;
                         }
                     }
-                    Err(error) => log::error!("embedded_gpui: plugin call failed: {error:#}"),
+                    Err(error) => {
+                        // A trap (turn budget, memory limit, guest panic) leaves the
+                        // guest in an unknown state: stop driving it, and tell the
+                        // pump so in-flight calls fail instead of hanging.
+                        let reason = format!("plugin stopped: {error:#}");
+                        log::error!("embedded_gpui: {reason}");
+                        turns_tx.unbounded_send(Err(reason)).ok();
+                        break;
+                    }
                 }
             }
         });
@@ -462,6 +539,13 @@ impl PluginHost {
         let pump_objects = objects.clone();
         let pump = cx.spawn(async move |host, cx| {
             while let Some(turn) = turns_rx.next().await {
+                let turn = match turn {
+                    Ok(turn) => turn,
+                    Err(reason) => {
+                        pump_objects.fail_pending(&reason);
+                        break;
+                    }
+                };
                 let applied = cx.update(|cx| {
                     pump_objects.drain_releases();
                     for frame in turn.frames {

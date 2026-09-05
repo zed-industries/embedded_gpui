@@ -12,12 +12,13 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+use embedded_gpui::schema::TypeKind;
 use embedded_gpui::surface::{
     Geometry, Modifiers, MouseButton, MouseButtonEvent, MouseEvent, Point, ViewApiCaller as _,
 };
 use embedded_gpui::{
     Interface, Payload, PluginHost, PluginHostHandle as _, PluginInstance, PluginOptions, Ref,
-    Remote, Surface, decode, encode, shared,
+    Remote, Surface, TypeSchema, ViewApi, decode, encode, shared, typescript,
 };
 use embedded_gpui_util::{Attenuated, Audited, Mirror};
 use gpui::{AppContext as _, Context, Entity, Task, TestAppContext};
@@ -68,13 +69,16 @@ impl TestHost for HostRoot {
 
 /// A host without its root installed yet, for exercising the bootstrap race.
 fn setup_without_root(cx: &mut TestAppContext) -> Entity<PluginHost> {
+    setup_with_options(
+        PluginOptions::new(Arc::new(gpui::NoopTextSystem::new())),
+        cx,
+    )
+}
+
+fn setup_with_options(options: PluginOptions, cx: &mut TestAppContext) -> Entity<PluginHost> {
     let path = test_plugin_path();
     let instance = cx.update(|_| {
-        PluginInstance::new(
-            &path,
-            PluginOptions::new(Arc::new(gpui::NoopTextSystem::new())),
-        )
-        .expect("failed to instantiate test plugin")
+        PluginInstance::new(&path, options).expect("failed to instantiate test plugin")
     });
     cx.new(|cx| PluginHost::new(instance, cx))
 }
@@ -634,6 +638,38 @@ async fn test_views_are_objects(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_turn_budget_stops_a_runaway_plugin(cx: &mut TestAppContext) {
+    let host = setup_with_options(
+        PluginOptions::new(Arc::new(gpui::NoopTextSystem::new()))
+            .with_turn_budget(Duration::from_millis(200)),
+        cx,
+    );
+    cx.update(|cx| {
+        let root = cx.new(|_| HostRoot { pings: 0 });
+        host.share_root(&root, cx);
+    });
+    let root = cx.update(|cx| host.root::<TestPlugin>(cx));
+
+    // A well-behaved call goes through.
+    let pong = cx.update(|cx| root.ping_host("hi".to_string(), cx));
+    settle(cx);
+    assert_eq!(pong.await.expect("ping"), "pong: hi");
+
+    // A turn that overruns the budget traps; the worker stops driving the guest, and
+    // everything still in flight resolves with an error instead of hanging.
+    let spun = cx.update(|cx| root.spin(5_000, cx));
+    let after = cx.update(|cx| root.ping_host("again".to_string(), cx));
+    for _ in 0..30 {
+        settle(cx);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    spun.await.expect_err("the spinning turn must not complete");
+    after
+        .await
+        .expect_err("calls after the trap must fail, not hang");
+}
+
+#[gpui::test]
 async fn test_interfaces_describe_themselves(_cx: &mut TestAppContext) {
     let schema = TestPlugin::schema();
     assert_eq!(schema.name, "TestPlugin");
@@ -646,24 +682,46 @@ async fn test_interfaces_describe_themselves(_cx: &mut TestAppContext) {
             "gatekeeper",
             "chameleon",
             "ping_host",
-            "mount"
+            "mount",
+            "spin"
         ]
     );
     let ping = &schema.methods[4];
     assert!(ping.is_async);
     assert_eq!(ping.arguments.len(), 1);
     assert_eq!(ping.arguments[0].name, "message");
-    assert!(ping.arguments[0].ty.ends_with("String"));
+    assert_eq!(ping.arguments[0].ty, TypeSchema::String);
     let mount = &schema.methods[5];
-    assert!(
-        mount
-            .returns_ref
-            .is_some_and(|ty| ty.ends_with("ViewProbeApi"))
-    );
+    assert_eq!(mount.arguments[0].ty, TypeSchema::Ref("SurfaceApi"));
+    assert_eq!(mount.response, TypeSchema::Ref("ViewProbeApi"));
 
+    // Named payload types travel with the schema, transitively and once each.
     let counter = TestCounterApi::schema();
     assert_eq!(counter.events.len(), 1);
     assert_eq!(counter.events[0].name, "counter_milestone");
+    assert_eq!(counter.events[0].ty, TypeSchema::Named("CounterMilestone"));
+    let milestone = counter
+        .types
+        .iter()
+        .find(|definition| definition.name == "CounterMilestone")
+        .expect("event type is defined in the schema");
+    let TypeKind::Struct(fields) = &milestone.kind else {
+        panic!("CounterMilestone is a struct");
+    };
+    assert_eq!(fields[0].name, "count");
+    assert_eq!(fields[0].ty, TypeSchema::Integer);
+
+    // The same schema renders as TypeScript declarations.
+    let declarations = typescript::declarations(&[ViewApi::schema(), TestCounterApi::schema()]);
+    assert!(declarations.contains("export interface ViewApi {"));
+    assert!(declarations.contains("  mouse(event: MouseEvent): Promise<void>;"));
+    assert!(declarations.contains("export interface Geometry {"));
+    assert!(declarations.contains("  | { Down: { keystroke: Keystroke; is_held: boolean } }"));
+    assert!(declarations.contains("  | \"Left\""));
+    assert!(declarations.contains("  increment(by: number): Promise<number>;"));
+    assert!(declarations.contains(
+        "export interface TestCounterApiEvents {\n  counter_milestone: CounterMilestone;"
+    ));
 }
 
 #[gpui::test]

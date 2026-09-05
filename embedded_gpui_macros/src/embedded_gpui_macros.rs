@@ -85,13 +85,103 @@ pub fn shared(attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 /// Derives everything a struct or enum needs to travel in object payloads
-/// (message arguments, return values, event fields): `Clone`, `Debug`, and serde
-/// `Serialize`/`Deserialize` through `embedded_gpui`'s re-exported serde, so schema
-/// crates need no serde dependency of their own.
+/// (message arguments, return values, event fields): `Clone`, `Debug`, serde
+/// `Serialize`/`Deserialize` through `embedded_gpui`'s re-exported serde (so schema
+/// crates need no serde dependency of their own), and `Describe`, which puts the type's
+/// definition into the schemas of every interface that mentions it.
 #[proc_macro_attribute]
 pub fn data(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let item = proc_macro2::TokenStream::from(item);
-    quote! {
+    let item = syn::parse_macro_input!(item as syn::DeriveInput);
+    match expand_data(item) {
+        Ok(tokens) => tokens.into(),
+        Err(error) => error.to_compile_error().into(),
+    }
+}
+
+fn expand_data(item: syn::DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
+    let ident = &item.ident;
+    let name = ident.to_string();
+    if !item.generics.params.is_empty() {
+        return Err(syn::Error::new(
+            item.generics.span(),
+            "#[data] types cannot be generic",
+        ));
+    }
+    let field_schemas = |fields: &syn::FieldsNamed| {
+        let entries = fields.named.iter().map(|field| {
+            let field_name = field
+                .ident
+                .as_ref()
+                .map(|ident| ident.to_string())
+                .unwrap_or_default();
+            let ty = &field.ty;
+            quote! {
+                embedded_gpui::schema::FieldSchema {
+                    name: #field_name,
+                    ty: <#ty as embedded_gpui::Describe>::describe(),
+                }
+            }
+        });
+        quote!(vec![#(#entries,)*])
+    };
+    let mut component_types: Vec<syn::Type> = Vec::new();
+    let kind = match &item.data {
+        syn::Data::Struct(data) => match &data.fields {
+            syn::Fields::Named(fields) => {
+                component_types.extend(fields.named.iter().map(|field| field.ty.clone()));
+                let fields = field_schemas(fields);
+                quote!(embedded_gpui::schema::TypeKind::Struct(#fields))
+            }
+            other => {
+                return Err(syn::Error::new(
+                    other.span(),
+                    "#[data] structs need named fields (tuple and unit structs have no \
+                     stable JSON shape to describe)",
+                ));
+            }
+        },
+        syn::Data::Enum(data) => {
+            let variants = data.variants.iter().map(|variant| {
+                let variant_name = variant.ident.to_string();
+                let fields = match &variant.fields {
+                    syn::Fields::Unit => quote!(embedded_gpui::schema::VariantFields::Unit),
+                    syn::Fields::Named(fields) => {
+                        component_types.extend(fields.named.iter().map(|field| field.ty.clone()));
+                        let fields = field_schemas(fields);
+                        quote!(embedded_gpui::schema::VariantFields::Named(#fields))
+                    }
+                    syn::Fields::Unnamed(fields) => {
+                        component_types.extend(fields.unnamed.iter().map(|field| field.ty.clone()));
+                        let types = fields.unnamed.iter().map(|field| {
+                            let ty = &field.ty;
+                            quote!(<#ty as embedded_gpui::Describe>::describe())
+                        });
+                        quote!(embedded_gpui::schema::VariantFields::Unnamed(
+                            vec![#(#types,)*]
+                        ))
+                    }
+                };
+                quote! {
+                    embedded_gpui::schema::VariantSchema {
+                        name: #variant_name,
+                        fields: #fields,
+                    }
+                }
+            });
+            quote!(embedded_gpui::schema::TypeKind::Enum(vec![#(#variants,)*]))
+        }
+        syn::Data::Union(data) => {
+            return Err(syn::Error::new(
+                data.union_token.span(),
+                "#[data] does not support unions",
+            ));
+        }
+    };
+    let collects = component_types
+        .iter()
+        .map(|ty| quote!(<#ty as embedded_gpui::Describe>::collect(types);));
+
+    Ok(quote! {
         #[derive(
             Clone,
             Debug,
@@ -100,8 +190,24 @@ pub fn data(_attr: TokenStream, item: TokenStream) -> TokenStream {
         )]
         #[serde(crate = "embedded_gpui::serde")]
         #item
-    }
-    .into()
+
+        impl embedded_gpui::Describe for #ident {
+            fn describe() -> embedded_gpui::TypeSchema {
+                embedded_gpui::TypeSchema::Named(#name)
+            }
+
+            fn collect(types: &mut Vec<embedded_gpui::TypeDefinition>) {
+                let definition = embedded_gpui::TypeDefinition {
+                    name: #name,
+                    kind: #kind,
+                };
+                // Recurse only on first sight, so recursive types terminate.
+                if embedded_gpui::schema::collect_definition(types, definition) {
+                    #(#collects)*
+                }
+            }
+        }
+    })
 }
 
 struct SharedArgs {
@@ -468,26 +574,20 @@ fn expand_interface(
             field_names,
             field_types,
             response,
-            ref_response,
             is_async,
             ..
         } = method;
         let argument_names = field_names.iter().map(|name| name.to_string());
-        let returns_ref = match ref_response {
-            Some(inner) => quote!(Some(::std::any::type_name::<#inner>())),
-            None => quote!(None),
-        };
         quote! {
             embedded_gpui::MethodSchema {
                 name: #method_name,
                 arguments: vec![
                     #(embedded_gpui::ArgumentSchema {
                         name: #argument_names,
-                        ty: ::std::any::type_name::<#field_types>(),
+                        ty: <#field_types as embedded_gpui::Describe>::describe(),
                     },)*
                 ],
-                response: ::std::any::type_name::<#response>(),
-                returns_ref: #returns_ref,
+                response: <#response as embedded_gpui::Describe>::describe(),
                 is_async: #is_async,
             }
         }
@@ -503,10 +603,22 @@ fn expand_interface(
         quote! {
             embedded_gpui::EventSchema {
                 name: #event_name,
-                ty: ::std::any::type_name::<#event>(),
+                ty: <#event as embedded_gpui::Describe>::describe(),
             }
         }
     });
+    // Every type a method or event mentions contributes its named definitions.
+    let schema_collects = methods
+        .iter()
+        .flat_map(|method| {
+            method
+                .field_types
+                .iter()
+                .map(|ty| quote!(#ty))
+                .chain(std::iter::once(method.response.clone()))
+        })
+        .chain(events.iter().map(|event| quote!(#event)))
+        .map(|ty| quote!(<#ty as embedded_gpui::Describe>::collect(&mut types);));
     let spec_name = spec_ident.to_string();
 
     let spec_doc = format!(
@@ -528,10 +640,13 @@ fn expand_interface(
 
         impl embedded_gpui::Interface for #spec_ident {
             fn schema() -> embedded_gpui::Schema {
+                let mut types = Vec::new();
+                #(#schema_collects)*
                 embedded_gpui::Schema {
                     name: #spec_name,
                     methods: vec![#(#schema_methods,)*],
                     events: vec![#(#schema_events,)*],
+                    types,
                 }
             }
         }

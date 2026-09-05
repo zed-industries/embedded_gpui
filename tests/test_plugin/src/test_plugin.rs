@@ -144,6 +144,13 @@ impl TestPlugin for Root {
         cx.spawn(async move |_, _| receipt.await)
     }
 
+    fn spin(&mut self, millis: u64, _cx: &mut Context<Self>) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(millis);
+        while std::time::Instant::now() < deadline {
+            std::hint::spin_loop();
+        }
+    }
+
     fn mount(&mut self, surface: Ref<SurfaceApi>, cx: &mut Context<Self>) -> Ref<ViewProbeApi> {
         let probe = cx.new(|_| ViewProbe { view: None });
         let weak_probe = probe.downgrade();

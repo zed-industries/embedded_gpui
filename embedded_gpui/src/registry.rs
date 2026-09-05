@@ -645,6 +645,15 @@ impl Objects {
         sender.send(outcome).ok();
     }
 
+    /// The other end is gone for good (the plugin trapped or was unloaded): fail every
+    /// call still waiting on it so callers see an error instead of a hang.
+    pub fn fail_pending(&self, reason: &str) {
+        let pending = std::mem::take(&mut self.inner.state.borrow_mut().pending_responses);
+        for (_, sender) in pending {
+            sender.send(Err(reason.to_string())).ok();
+        }
+    }
+
     /// Flush queued capability releases (projections whose last `Remote` dropped) into
     /// `release` frames. Called from the boundary's pump, and before applying incoming
     /// work, so drops become observable promptly.

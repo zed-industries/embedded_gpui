@@ -27,6 +27,10 @@ pub trait TestPlugin {
         surface: Ref<SurfaceApi>,
         cx: &mut gpui::Context<Self>,
     ) -> Ref<ViewProbeApi>;
+
+    /// Busy-loop for the given wall-clock time: a misbehaving plugin, for the host's
+    /// turn budget to catch.
+    fn spin(&mut self, millis: u64, cx: &mut gpui::Context<Self>);
 }
 
 /// What the plugin observed of a mounted view.

@@ -25,7 +25,9 @@
 extern crate self as embedded_gpui;
 
 pub(crate) mod registry;
+pub mod schema;
 pub mod surface;
+pub mod typescript;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod host;
@@ -41,6 +43,9 @@ pub use guest::*;
 #[cfg(target_arch = "wasm32")]
 pub(crate) use guest::{dispatcher, platform, text_system, window, wit};
 
+pub use schema::{
+    ArgumentSchema, Describe, EventSchema, MethodSchema, Schema, TypeDefinition, TypeSchema,
+};
 pub use surface::{SurfaceApi, SurfaceApiCaller, ViewApi, ViewApiCaller};
 
 use gpui::AppContext as _;
@@ -83,39 +88,9 @@ impl Interface for Opaque {
             name: "Opaque",
             methods: Vec::new(),
             events: Vec::new(),
+            types: Vec::new(),
         }
     }
-}
-
-/// An interface described as data. Method and event names are the wire vocabulary;
-/// type names are Rust `type_name`s, for humans and for generating bindings.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Schema {
-    pub name: &'static str,
-    pub methods: Vec<MethodSchema>,
-    pub events: Vec<EventSchema>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MethodSchema {
-    pub name: &'static str,
-    pub arguments: Vec<ArgumentSchema>,
-    /// The response type; `Some` for methods declared to return `Ref<T>`, naming `T`.
-    pub response: &'static str,
-    pub returns_ref: Option<&'static str>,
-    pub is_async: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ArgumentSchema {
-    pub name: &'static str,
-    pub ty: &'static str,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EventSchema {
-    pub name: &'static str,
-    pub ty: &'static str,
 }
 
 /// A message that can be sent to a shared object's home end.
@@ -792,11 +767,13 @@ impl<S: Interface> Remote<S> {
 /// travel. An entity lives on one end; a [`Remote`] is how the other end holds it; a
 /// `Ref` is how it moves through payloads (including call responses and events).
 ///
-/// On the wire this is nothing but the entity id, carried in the payload's ref table —
-/// random, so possession is the authority: a ref can be known but never guessed. A ref
-/// also remembers the registry it was minted by or arrived through, so
-/// [`Ref::connect`] turns it back into a live handle from anywhere (schema methods
-/// declared to return a `Ref` do this on arrival, resolving with a connected `Remote`).
+/// On the wire this is `{"$ref": index}` into the payload's ref table, which holds the
+/// entity id — random, so possession is the authority: a ref can be known but never
+/// guessed. The `$ref` shape makes refs findable in a payload without its schema, which
+/// is what a dynamic-language guest needs. A ref also remembers the registry it was
+/// minted by or arrived through, so [`Ref::connect`] turns it back into a live handle
+/// from anywhere (schema methods declared to return a `Ref` do this on arrival,
+/// resolving with a connected `Remote`).
 pub struct Ref<S: Interface> {
     entity_id: u64,
     objects: registry::WeakObjects,
@@ -868,7 +845,7 @@ impl<S: Interface> Serialize for Ref<S> {
             Some(index as u64)
         });
         match index {
-            Some(index) => serializer.serialize_u64(index),
+            Some(index) => RefWire { index }.serialize(serializer),
             None => Err(serde::ser::Error::custom(
                 "a Ref can only be serialized inside embedded_gpui::encode",
             )),
@@ -876,9 +853,16 @@ impl<S: Interface> Serialize for Ref<S> {
     }
 }
 
+/// The JSON shape of a ref: `{"$ref": index}`.
+#[derive(Serialize, serde::Deserialize)]
+struct RefWire {
+    #[serde(rename = "$ref")]
+    index: u64,
+}
+
 impl<'de, S: Interface> serde::Deserialize<'de> for Ref<S> {
     fn deserialize<De: serde::Deserializer<'de>>(deserializer: De) -> Result<Self, De::Error> {
-        let index = u64::deserialize(deserializer)? as usize;
+        let index = RefWire::deserialize(deserializer)?.index as usize;
         let resolved = REF_TABLE.with(|slot| {
             let slot = slot.borrow();
             let table = slot.as_ref()?;

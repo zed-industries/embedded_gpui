@@ -535,7 +535,9 @@ membrane at that edge only, Goblins objects appearing inside plugins as ordinary
 - The JS runtime keeps every remote a script has ever received connected until the
   next reload, and scripts cannot cancel observers. Reload replays the host's root
   calls verbatim, which is right for mount-style calls and wrong for calls that were
-  meant to happen once; the runtime cannot tell them apart.
+  meant to happen once; the runtime cannot tell them apart. Replayed calls are
+  fire-and-forget: one that fails against the new script is dropped silently and the
+  rest of the history keeps going (see TODO, "Reload replay can desync").
 - Reload is detected by polling the entry point's modification time twice a second;
   WASI has no file watching.
 

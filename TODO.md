@@ -44,6 +44,20 @@ Views are `SurfaceApi`/`ViewApi` objects; see `DESIGN.md`. What remains:
   before anything ships against it.
 - [x] **Bindings from the schema**: `Describe` gives `Interface::schema()` structural
   types and every named definition; `typescript::declarations` renders `.d.ts`.
+- [ ] **Reload replay can desync** (`embedded_gpui_js`): replay re-issues the host's
+  root calls to the new script fire-and-forget (`JsRoot::load` detaches every result), so
+  a replayed call that fails against the edited script is dropped silently and the rest
+  of the history keeps replaying against a half-initialized script. Ordinary edits —
+  renaming a root method, changing an argument shape, a mount handler that now expects
+  state an earlier call used to set up — leave the script disagreeing with what the host
+  believes it mounted, and neither side gets a signal. Think through: stop on the first
+  replay failure and report it through `load`'s error (method name + position in the
+  history), degrade to "loaded, nothing mounted" rather than half-mounted; whether
+  history should be pruned by releases (a surface the host has since released should
+  not be re-attached) and whether a ref in history is even guaranteed live; whether
+  scripts should mark which root methods are replayable, or whether replay should move
+  to the host entirely (a `reloaded` event on the runtime root — the host knows which of
+  its calls were mounts and can re-issue them itself).
 - [ ] **JS runtime, next steps** (`embedded_gpui_js`): let a script opt out of replay
   for one-shot root calls (or mark a method replayable); `observe` cancellation; typed events
   (`subscribe`) in the prelude; a `.d.ts` bundle emitted by the demo host next to

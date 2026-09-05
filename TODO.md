@@ -50,10 +50,9 @@ Views are `SurfaceApi`/`ViewApi` objects; see `DESIGN.md`. What remains:
   of the history keeps replaying against a half-initialized script. Ordinary edits —
   renaming a root method, changing an argument shape, a mount handler that now expects
   state an earlier call used to set up — leave the script disagreeing with what the host
-  believes it mounted, and neither side gets a signal. Think through: keep replaying
-  past failures (half-mounted is fine while live-editing — get as close as possible) but
-  report every failure through `load`'s error (method name + position in the history)
-  instead of dropping it; whether
+  believes it mounted, and neither side gets a signal. Decision: bail on the first
+  replay failure and report it through `load`'s error (method name + position in the
+  history); whatever mounted before that point stays up. Still open: whether
   history should be pruned by releases (a surface the host has since released should
   not be re-attached) and whether a ref in history is even guaranteed live; whether
   scripts should mark which root methods are replayable, or whether replay should move

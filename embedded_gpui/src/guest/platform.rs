@@ -73,8 +73,11 @@ impl PluginPlatform {
         self.windows.borrow_mut().remove(&surface)
     }
 
+    /// The live windows; states whose GPUI window has been removed are forgotten here.
     pub fn window_states(&self) -> Vec<Rc<PluginWindowState>> {
-        self.windows.borrow().values().cloned().collect()
+        let mut windows = self.windows.borrow_mut();
+        windows.retain(|_, window| !window.is_closed());
+        windows.values().cloned().collect()
     }
 
     /// The cursor change GPUI requested since the last pump, and the surface it is for.

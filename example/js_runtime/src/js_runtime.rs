@@ -20,8 +20,9 @@ use embedded_gpui::{
 };
 use futures::channel::oneshot;
 use gpui::{
-    AnyElement, App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
-    MouseButton, ParentElement as _, Render, Styled as _, Subscription, Task, Window, div, px, rgb,
+    AnyElement, AnyWindowHandle, App, AppContext as _, Context, Entity, InteractiveElement as _,
+    IntoElement, MouseButton, ParentElement as _, Render, Styled as _, Subscription, Task, Window,
+    div, px, rgb,
 };
 use js_runtime_schema::JsRuntimeApi;
 use rquickjs::{CatchResultExt as _, Ctx, Function, Persistent, Runtime, Value};
@@ -51,7 +52,11 @@ register_plugin!(JsPlugin);
 struct JsRoot;
 
 impl JsRoot {
+    /// Evaluate a script in a fresh context. Whatever the previous script built —
+    /// views, observers, the remotes it held — is torn down first, so a reload is a
+    /// clean start rather than a second layer.
     fn load(&mut self, source: String, cx: &mut Context<Self>) -> Option<String> {
+        JsState::reset(cx);
         run_js(cx, |ctx| {
             ctx.eval::<(), _>(source.as_bytes())
                 .catch(ctx)
@@ -137,10 +142,11 @@ struct JsState {
     runtime: Runtime,
     context: rquickjs::Context,
     ops: Vec<Op>,
-    /// Remotes the script holds, kept connected for as long as the runtime lives.
+    /// Remotes the script holds, kept connected for as long as the script is loaded.
     remotes: HashMap<u64, Remote<Opaque>>,
     subscriptions: Vec<Subscription>,
-    views: HashMap<u32, Entity<JsView>>,
+    /// The script's open views: the window each one is the root of, and the entity.
+    views: HashMap<u32, (AnyWindowHandle, Entity<JsView>)>,
     pending: HashMap<u64, oneshot::Sender<Result<Payload, String>>>,
     next_request: u64,
     next_view: u32,
@@ -177,6 +183,27 @@ impl JsState {
 
     fn with<R>(f: impl FnOnce(&mut JsState) -> R) -> R {
         STATE.with(|slot| f(slot.borrow_mut().as_mut().expect("js runtime installed")))
+    }
+
+    /// Discard the running script and everything it built, and start a fresh context.
+    /// Windows are removed (the host's surfaces then show nothing until a new view
+    /// attaches), observers are cancelled, and held remotes are released. Requests the
+    /// old script never answered fail.
+    fn reset(cx: &mut App) {
+        let previous = STATE.with(|slot| slot.borrow_mut().take());
+        if let Some(previous) = previous {
+            for (handle, _) in previous.views.into_values() {
+                handle
+                    .update(cx, |_, window, _| window.remove_window())
+                    .ok();
+            }
+            for (_, sender) in previous.pending {
+                sender.send(Err("the script was reloaded".to_string())).ok();
+            }
+            drop(previous.subscriptions);
+            drop(previous.remotes);
+        }
+        Self::install();
     }
 
     fn push(op: Op) {
@@ -271,14 +298,14 @@ fn apply_op(op: Op, cx: &mut App) {
             let view = cx.new(|_| JsView { tree: None });
             let root = view.clone();
             match open_view(surface, cx, move |_, _| root) {
-                Ok(_) => JsState::with(|state| {
-                    state.views.insert(key, view);
+                Ok(handle) => JsState::with(|state| {
+                    state.views.insert(key, (handle.into(), view));
                 }),
                 Err(error) => log::error!("js_runtime: open_view failed: {error:#}"),
             }
         }
         Op::Render { key, tree } => {
-            let view = JsState::with(|state| state.views.get(&key).cloned());
+            let view = JsState::with(|state| state.views.get(&key).map(|(_, view)| view.clone()));
             let Some(view) = view else {
                 log::warn!("js_runtime: render for unknown view {key}");
                 return;

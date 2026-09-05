@@ -13,10 +13,17 @@ workspace = true
 name = "objects"
 path = "objects.rs"
 
+[[test]]
+name = "js_runtime"
+path = "js_runtime.rs"
+
 [dev-dependencies]
 anyhow = "1.0"
 embedded_gpui = { path = "../embedded_gpui" }
 embedded_gpui_util = { path = "../embedded_gpui_util" }
 test_schema = { path = "schema" }
+js_runtime_schema = { path = "../example/js_runtime_schema" }
+futures = "0.3"
+serde = { version = "1.0", features = ["derive"] }
 gpui = { git = "https://github.com/zed-industries/zed.git", branch = "gpui-embedded-in-gpui", features = ["test-support"] }
 rand = "0.9"

@@ -68,7 +68,11 @@ function decode(json, refs) {
 function dispatch(requestId, method, json, refs) {
   const respond = (value, isError) => {
     if (isError) {
-      __rt.respond(requestId, JSON.stringify(String(value?.stack ?? value)), [], true);
+      // QuickJS's `stack` is the frames only; keep the message in front of it.
+      const message = value instanceof Error
+        ? `${value.name}: ${value.message}\n${value.stack ?? ""}`.trimEnd()
+        : String(value);
+      __rt.respond(requestId, JSON.stringify(message), [], true);
       return;
     }
     const { json, refs } = encode(value === undefined ? null : value);
@@ -100,11 +104,14 @@ function serializeTree(node) {
   if (typeof node === "string" || typeof node === "number") {
     return { type: "text", text: String(node) };
   }
-  const out = { type: node.type, style: node.style ?? {}, children: [] };
+  // `div({ ..., on_click })` puts the handler in the style bag; either place works.
+  const { on_click, ...style } = node.style ?? {};
+  const out = { type: node.type, style, children: [] };
   if (node.text !== undefined) out.text = String(node.text);
-  if (typeof node.on_click === "function") {
+  const handler = node.on_click ?? on_click;
+  if (typeof handler === "function") {
     const id = nextHandler++;
-    handlers.set(id, node.on_click);
+    handlers.set(id, handler);
     out.on_click = id;
   }
   for (const child of node.children ?? []) {

@@ -81,8 +81,9 @@ setup) and runs scripts against the same host objects a Rust plugin sees.
 
 - **It is just a plugin.** The host loads it like any component and shares its root;
   the runtime's own root answers `load(source)` and forwards every other method to the
-  script's `plugin.root`. Loading again is hot reload. The sandbox is the wasm
-  boundary, not QuickJS: a bug in the engine cannot reach the host.
+  script's `plugin.root`. Loading again is hot reload: the previous script's windows,
+  observers, and remotes are torn down and a fresh context starts. The sandbox is the
+  wasm boundary, not QuickJS: a bug in the engine cannot reach the host.
 - **Remotes are proxies.** `host.counter()` returns a promise of a remote;
   `counter.increment({ by: 1 })` is `call("increment", { by: 1 })`; `observe` mirrors
   `cx.notify`. Object ids travel as strings (u64 does not fit a JS number). No schema
@@ -519,9 +520,9 @@ membrane at that edge only, Goblins objects appearing inside plugins as ordinary
 
 ## Known spike limitations (intentional)
 
-- The JS runtime keeps every remote a script has ever received connected, and never
-  cancels observers; reloading a script layers new views and observers on the old
-  ones. Teardown on reload is the obvious next step.
+- The JS runtime keeps every remote a script has ever received connected until the
+  next `load`, and scripts cannot cancel observers; `load` tears the previous script's
+  views, observers, and remotes down and starts a fresh context.
 
 - No video `Surface` primitives; no gradient backgrounds (solid color fallback); no sprite
   transformation matrices (painted untransformed with a warning).

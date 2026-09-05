@@ -110,7 +110,7 @@ file and click it), and a native button — all of them mutating the same shared
 counter entity.
 
 ```sh
-cargo test -p tests -- --test-threads 1   # protocol tests
+cargo test -p tests -- --test-threads 1   # protocol tests, and tests/js_plugin.js through the JS runtime
 ```
 
 ## Layout

@@ -47,6 +47,9 @@ pub struct PluginWindowState {
     /// Set by the first `resize` from the host. Until then the window has a nominal
     /// size and is not rendered: the first frame is drawn at the slot's real size.
     measured: Cell<bool>,
+    /// GPUI dropped its `PlatformWindow` (the window was removed): nothing may be
+    /// dispatched to this state again, and the platform forgets it on its next pump.
+    closed: Cell<bool>,
 }
 
 /// One host-driven window event, applied by the pump.
@@ -74,7 +77,12 @@ impl PluginWindowState {
             last_input_surface,
             pending: RefCell::new(Vec::new()),
             measured: Cell::new(false),
+            closed: Cell::new(false),
         }
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed.get()
     }
 
     /// Queue a host-driven event for the next pump.
@@ -85,6 +93,9 @@ impl PluginWindowState {
     /// Apply the queued events, in order. Called outside any `App` borrow.
     pub fn flush_events(&self) {
         let events = std::mem::take(&mut *self.pending.borrow_mut());
+        if self.closed.get() {
+            return;
+        }
         for event in events {
             match event {
                 WindowEvent::Resize(size, scale_factor) => self.resized(size, scale_factor),
@@ -107,7 +118,7 @@ impl PluginWindowState {
     /// The callback is temporarily moved out so that it can freely re-enter this window's
     /// other methods without hitting the `callbacks` RefCell.
     pub fn pump_frame(&self) {
-        if !self.measured.get() {
+        if !self.measured.get() || self.closed.get() {
             return;
         }
         let callback = self.callbacks.borrow_mut().request_frame.take();
@@ -186,6 +197,14 @@ impl PluginWindow {
             origin: Point::default(),
             size: self.state.size.get(),
         }
+    }
+}
+
+impl Drop for PluginWindow {
+    fn drop(&mut self) {
+        self.state.closed.set(true);
+        *self.state.callbacks.borrow_mut() = Callbacks::default();
+        self.state.input_handler.take();
     }
 }
 

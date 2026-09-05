@@ -5951,8 +5951,11 @@ dependencies = [
  "anyhow",
  "embedded_gpui",
  "embedded_gpui_util",
+ "futures",
  "gpui",
+ "js_runtime_schema",
  "rand 0.9.4",
+ "serde",
  "test_schema",
 ]
 

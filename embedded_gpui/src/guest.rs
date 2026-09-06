@@ -240,61 +240,20 @@ fn ensure_window(
     Ok((window, handle))
 }
 
-/// A view opened with [`open_view`]: the entity, and its place in the guest's window.
-pub struct ViewHandle<V> {
-    view: Entity<V>,
-    window: Rc<window::PluginWindowState>,
-    handle: AnyWindowHandle,
-    surface: u64,
-    generation: u64,
-}
-
-impl<V: 'static> ViewHandle<V> {
-    pub fn entity(&self) -> &Entity<V> {
-        &self.view
-    }
-
-    /// The window the view is a root of: the plugin's one composition window, which is
-    /// where `open_view`'s builder ran.
-    pub fn window(&self) -> AnyWindowHandle {
-        self.handle
-    }
-
-    /// Update the view with its window in scope, as `WindowHandle::update` would.
-    pub fn update<R>(
-        &self,
-        cx: &mut App,
-        update: impl FnOnce(&mut V, &mut Window, &mut Context<V>) -> R,
-    ) -> anyhow::Result<R> {
-        let view = self.view.clone();
-        self.handle.update(cx, |_, window, cx| {
-            view.update(cx, |view, cx| update(view, window, cx))
-        })
-    }
-
-    /// Stop drawing on the surface: the view's root is detached and the host's geometry
-    /// and input for it are ignored from here on. The surface itself is untouched; the
-    /// host may attach another view to it.
-    pub fn close(&self, cx: &mut App) {
-        self.window
-            .remove_surface(self.surface, self.generation, cx);
-    }
-}
-
 /// Draw on a host surface. `build` constructs a view in the plugin's window, exactly as a
 /// window's root view is built with `cx.open_window`; the view becomes a root of that
 /// window at the surface's slot (a node of its own, memoized like any mounted view), the
 /// resulting view object is shared and attached to the surface, and the host then drives
 /// its geometry and input.
 ///
-/// The view lives as long as the host keeps the surface: when the host drops it, the
-/// view object is released and its root is detached. [`ViewHandle::close`] ends it
-/// early.
+/// The surface's lifetime is the host's: when the host drops it, the view object is
+/// released and the root is detached. Opening another view on the same surface replaces
+/// this one. The entity returned is an ordinary view; hold it to reach its state.
 pub fn open_view<V: Render + 'static>(
     surface: Ref<SurfaceApi>,
     cx: &mut App,
     build: impl FnOnce(&mut Window, &mut App) -> Entity<V>,
-) -> anyhow::Result<ViewHandle<V>> {
+) -> anyhow::Result<Entity<V>> {
     let (_, platform) =
         runtime_handles().ok_or_else(|| anyhow::anyhow!("open_view before init"))?;
     let surface: Remote<SurfaceApi> = surface.connect();
@@ -316,13 +275,7 @@ pub fn open_view<V: Render + 'static>(
     });
     let view_ref = share(&guest_view, cx);
     surface.attach(view_ref, cx);
-    Ok(ViewHandle {
-        view,
-        window,
-        handle,
-        surface: surface_id,
-        generation,
-    })
+    Ok(view)
 }
 
 struct Component;

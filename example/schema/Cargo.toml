@@ -14,4 +14,4 @@ path = "src/example_schema.rs"
 
 [dependencies]
 embedded_gpui = { path = "../../embedded_gpui" }
-gpui = { git = "https://github.com/zed-industries/zed.git", branch = "gpui-embedded-in-gpui", default-features = false }
+gpui = { path = "../../../zed/crates/gpui", default-features = false }

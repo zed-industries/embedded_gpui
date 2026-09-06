@@ -6,19 +6,18 @@ what it would do with the node engine, and the specific capability that needs.
 
 ## Where we stand
 
-A plugin is a GPUI `App` inside a wasm component. Every host **surface** a plugin draws
-on is a guest `Window`: the guest renders it to a `Scene`, serializes the whole scene as a
-display list, and the host replays the list into its own frame. Input is forwarded as raw
-mouse/key events into the guest window's dispatch. This is correct and fast enough for a
-handful of panels. It does not scale to data-shaped UI (a widget per buffer line), and it
-reships a whole scene when one leaf changes.
+A plugin is a GPUI `App` inside a wasm component with one `Window`. Every host **surface**
+a plugin draws on is a root attached to that window (`Window::attach_root`, added on top
+of the node engine as branch `gpui-multi-root-embedded`): a node of its own, memoized,
+hit-tested and dispatched to like any mounted view. After a frame the guest reads each
+root's scene back (`Window::take_root_scene`), which answers only for roots whose node was
+redrawn, and ships that as the surface's display list; the host replays the list into its
+own frame. Items 1 and 2 below are therefore done on the guest side; 3–6 remain.
 
-The workaround we were about to build — one hidden composition window per guest, with
-surfaces as absolutely positioned regions and the scene sliced per region at
-serialization — fakes three things a `Window` owns: scale factor, focus, and the input
-dispatch tree. The node engine makes the honest version possible instead.
+Before this, every surface was a guest `Window` of its own: the whole scene reshipped when
+one leaf changed, and a widget per buffer line meant a window per line.
 
-## 1. A surface is a view node, not a window
+## 1. A surface is a view node, not a window — done
 
 **Need:** a stable identity for a mounted view occurrence (`Entity<ViewNode>`) whose
 retained output — Taffy subtree, geometry, recorded scene fragment — can be addressed
@@ -32,9 +31,12 @@ design envelope, instead of hundreds of windows.
 **Specifically:** a public way to (a) mark a node as a "fragment root" and (b) read its
 recorded scene fragment and geometry after a frame, by node identity. The PR's "store
 scene fragments with child-node references" is exactly the data; it needs an
-outside-the-frame reader.
+outside-the-frame reader. *This is `Window::attach_root(view, bounds) -> AttachedRootId`
+and `Window::take_root_scene(id) -> Option<Scene>`: the root is drawn beside the window's
+root view, and its node's recording (plus the deferred draws its subtree attached) is
+replayed into a scene of its own.*
 
-## 2. Only dirty fragments cross the boundary
+## 2. Only dirty fragments cross the boundary — done at root granularity
 
 **Need:** per-node dirtiness and fragment stability across frames, as the PR already
 tracks for reuse.
@@ -45,7 +47,10 @@ views — the top "known risk" in `DESIGN.md` — stops being a risk.
 
 **Specifically:** a frame-level report of which fragment roots changed this frame (the
 retained-frame statistics almost have this), and a guarantee that an unchanged fragment
-root's child-node references remain valid, so a host-side splice can keep them.
+root's child-node references remain valid, so a host-side splice can keep them. *Done for
+whole roots: `take_root_scene` compares the node's output generation and answers only
+when the root was redrawn. Finer than a root (one dirty leaf shipping alone) waits on the
+engine's fine-grained caching.*
 
 ## 3. The host side: a plugin's output as a retained fragment
 
@@ -83,8 +88,9 @@ factor, and a fragment root should be able to render at a scale different from i
 window's.
 
 **Why:** two surfaces of one plugin can sit on two host windows with different scale
-factors. Today that's fine only because each surface is its own guest window. With one
-guest window per plugin, per-node scale is what keeps text crisp on both displays.
+factors. With one guest window per plugin (which is what we have now), the window takes
+whichever factor the host last reported; per-node scale is what keeps text crisp on both
+displays.
 
 ## 6. Focus per node, with an explicit boundary
 

@@ -1,9 +1,10 @@
 //! Guest-side GPUI platform for the "GPUI embedded in GPUI" spike.
 //!
-//! A plugin runs a real GPUI [`App`] inside a `wasm32-wasip2` component. Each host
-//! surface the plugin draws on becomes a GPUI window backed by [`window::PluginWindow`],
-//! whose painted scenes are serialized into the turn instead of being sent to a GPU. See
-//! `DESIGN.md`.
+//! A plugin runs a real GPUI [`App`] inside a `wasm32-wasip2` component, with one window:
+//! a composition window backed by [`window::PluginWindow`]. Every host surface the plugin
+//! draws on is a root attached to that window (`Window::attach_root`), and after each
+//! frame the root's scene is read back on its own and serialized into the turn for its
+//! surface, instead of being sent to a GPU. See `DESIGN.md`.
 
 pub(crate) mod dispatcher;
 mod objects;
@@ -27,7 +28,7 @@ use crate::surface::{Geometry, KeyEvent, MouseEvent, SurfaceApi, SurfaceApiCalle
 use crate::{Ref, Remote};
 use gpui::{
     AnyWindowHandle, App, Application, ApplicationHandle, AssetSource, AsyncApp, Bounds, Context,
-    Entity, Point, Render, SharedString, Window, WindowBounds, WindowHandle, WindowOptions,
+    Empty, Entity, IntoElement, Point, Render, SharedString, Window, WindowBounds, WindowOptions,
     prelude::*, px, size,
 };
 use platform::PluginPlatform;
@@ -137,20 +138,24 @@ fn runtime_handles() -> Option<(AsyncApp, Rc<PluginPlatform>)> {
     })
 }
 
-/// Drain the guest scheduler and let dirty windows redraw, then report the next wakeup:
+/// Drain the guest scheduler and let the window redraw, then report the next wakeup:
 /// everything queued is drained before this returns, so only the earliest remaining timer
 /// needs a host tick.
 fn pump(platform: &PluginPlatform, async_app: &mut AsyncApp) -> Option<u32> {
     objects::drain_releases();
     let dispatcher = platform.dispatcher();
-    for window in platform.window_states() {
-        window.flush_events();
+    let window = platform.window();
+    if let Some(window) = &window {
+        window.flush_events(async_app);
     }
     dispatcher.run_until_idle();
-    for window in platform.window_states() {
+    if let Some(window) = &window {
         window.pump_frame();
     }
     dispatcher.run_until_idle();
+    if let Some(window) = &window {
+        async_app.update(|cx| window.ship_scenes(cx));
+    }
     if let Some((surface, cursor)) = platform.take_pending_cursor() {
         async_app.update(|cx| {
             surface.set_cursor(cursor, cx);
@@ -163,79 +168,161 @@ fn pump(platform: &PluginPlatform, async_app: &mut AsyncApp) -> Option<u32> {
 }
 
 /// The guest end of a host surface: the object the host drives with geometry and input.
-/// One exists per window opened with [`open_view`]; it lives exactly as long as the host
-/// holds it, and closes its window when released.
+/// One exists per view opened with [`open_view`]; it lives exactly as long as the host
+/// holds it, and detaches its root when released.
 struct GuestView {
     window: Rc<window::PluginWindowState>,
-    handle: AnyWindowHandle,
+    surface: u64,
+    generation: u64,
 }
 
 #[crate::shared]
 impl ViewApi for GuestView {
     fn resize(&mut self, geometry: Geometry, _cx: &mut Context<Self>) {
-        self.window.push_event(WindowEvent::Resize(
-            size(px(geometry.width), px(geometry.height)),
-            geometry.scale_factor,
-        ));
+        self.window.push_event(WindowEvent::Resize {
+            surface: self.surface,
+            size: size(px(geometry.width), px(geometry.height)),
+            scale_factor: geometry.scale_factor,
+        });
     }
 
     fn mouse(&mut self, event: MouseEvent, _cx: &mut Context<Self>) {
-        self.window
-            .push_event(WindowEvent::Input(event.to_platform_input()));
+        self.window.push_event(WindowEvent::Input {
+            surface: self.surface,
+            input: event.to_platform_input(),
+        });
     }
 
     fn key(&mut self, event: KeyEvent, _cx: &mut Context<Self>) {
-        self.window
-            .push_event(WindowEvent::Input(event.to_platform_input()));
+        self.window.push_event(WindowEvent::Input {
+            surface: self.surface,
+            input: event.to_platform_input(),
+        });
     }
 }
 
-/// Open a GPUI window that draws on a host surface. `build` constructs the window's root
-/// view exactly as with `cx.open_window`; the resulting view object is shared and
-/// attached to the surface, after which the host drives its geometry and input.
+/// The root view of the composition window. Nothing is drawn at the window level; every
+/// visible thing is a surface's root.
+struct CompositionRoot;
+
+impl Render for CompositionRoot {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
+}
+
+/// Open the composition window if it is not open yet.
+fn ensure_window(
+    platform: &PluginPlatform,
+    cx: &mut App,
+) -> anyhow::Result<(Rc<window::PluginWindowState>, AnyWindowHandle)> {
+    if let Some(window) = platform.window()
+        && let Some(handle) = window.handle()
+    {
+        return Ok((window, handle));
+    }
+    let handle: AnyWindowHandle = cx
+        .open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: Point::default(),
+                    size: window::composition_size(),
+                })),
+                ..Default::default()
+            },
+            |_, cx| cx.new(|_| CompositionRoot),
+        )?
+        .into();
+    let window = platform
+        .window()
+        .ok_or_else(|| anyhow::anyhow!("open_window did not create the composition window"))?;
+    window.set_handle(handle);
+    Ok((window, handle))
+}
+
+/// A view opened with [`open_view`]: the entity, and its place in the guest's window.
+pub struct ViewHandle<V> {
+    view: Entity<V>,
+    window: Rc<window::PluginWindowState>,
+    handle: AnyWindowHandle,
+    surface: u64,
+    generation: u64,
+}
+
+impl<V: 'static> ViewHandle<V> {
+    pub fn entity(&self) -> &Entity<V> {
+        &self.view
+    }
+
+    /// The window the view is a root of: the plugin's one composition window, which is
+    /// where `open_view`'s builder ran.
+    pub fn window(&self) -> AnyWindowHandle {
+        self.handle
+    }
+
+    /// Update the view with its window in scope, as `WindowHandle::update` would.
+    pub fn update<R>(
+        &self,
+        cx: &mut App,
+        update: impl FnOnce(&mut V, &mut Window, &mut Context<V>) -> R,
+    ) -> anyhow::Result<R> {
+        let view = self.view.clone();
+        self.handle.update(cx, |_, window, cx| {
+            view.update(cx, |view, cx| update(view, window, cx))
+        })
+    }
+
+    /// Stop drawing on the surface: the view's root is detached and the host's geometry
+    /// and input for it are ignored from here on. The surface itself is untouched; the
+    /// host may attach another view to it.
+    pub fn close(&self, cx: &mut App) {
+        self.window
+            .remove_surface(self.surface, self.generation, cx);
+    }
+}
+
+/// Draw on a host surface. `build` constructs a view in the plugin's window, exactly as a
+/// window's root view is built with `cx.open_window`; the view becomes a root of that
+/// window at the surface's slot (a node of its own, memoized like any mounted view), the
+/// resulting view object is shared and attached to the surface, and the host then drives
+/// its geometry and input.
 ///
-/// The window lives as long as the host keeps the surface: when the host drops it, the
-/// view is released and the window closes.
+/// The view lives as long as the host keeps the surface: when the host drops it, the
+/// view object is released and its root is detached. [`ViewHandle::close`] ends it
+/// early.
 pub fn open_view<V: Render + 'static>(
     surface: Ref<SurfaceApi>,
     cx: &mut App,
     build: impl FnOnce(&mut Window, &mut App) -> Entity<V>,
-) -> anyhow::Result<WindowHandle<V>> {
+) -> anyhow::Result<ViewHandle<V>> {
     let (_, platform) =
         runtime_handles().ok_or_else(|| anyhow::anyhow!("open_view before init"))?;
     let surface: Remote<SurfaceApi> = surface.connect();
     let surface_id = surface.reference().entity_id();
-    platform.set_pending_surface(surface.clone());
-    let handle = cx.open_window(
-        WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(Bounds {
-                origin: Point::default(),
-                size: size(px(1.), px(1.)),
-            })),
-            ..Default::default()
-        },
-        build,
-    )?;
-    let window = platform
-        .window(surface_id)
-        .ok_or_else(|| anyhow::anyhow!("open_window did not bind the pending surface"))?;
-    let view = cx.new(|cx| {
-        let platform = platform.clone();
+    let (window, handle) = ensure_window(&platform, cx)?;
+    let view = handle.update(cx, |_, window, cx| build(window, cx))?;
+    let generation = window.add_surface(surface.clone(), view.clone().into(), cx)?;
+    let guest_view = cx.new(|cx| {
         cx.on_release(move |view: &mut GuestView, cx| {
-            platform.forget_window(surface_id, &view.window);
-            view.handle
-                .update(cx, |_, window, _| window.remove_window())
-                .ok();
+            view.window
+                .remove_surface(view.surface, view.generation, cx);
         })
         .detach();
         GuestView {
-            window,
-            handle: handle.into(),
+            window: window.clone(),
+            surface: surface_id,
+            generation,
         }
     });
-    let view_ref = share(&view, cx);
+    let view_ref = share(&guest_view, cx);
     surface.attach(view_ref, cx);
-    Ok(handle)
+    Ok(ViewHandle {
+        view,
+        window,
+        handle,
+        surface: surface_id,
+        generation,
+    })
 }
 
 struct Component;

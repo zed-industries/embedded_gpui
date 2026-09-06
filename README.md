@@ -12,9 +12,10 @@ changes; nothing here is a supported API yet.
 
 ## What works today
 
-- A guest-side GPUI platform: windows, retained display lists, mouse and
-  keyboard input, timers/async, SVG and image rendering, text via host-side
-  shaping. The WIT protocol (`wit/plugin.wit`) is pure substrate — `init`,
+- A guest-side GPUI platform: one composition window per plugin in which every
+  host surface is a root of the frame (a memoized node-engine node, not a window),
+  per-surface display lists shipped only when a root changed, mouse and keyboard
+  input, timers/async, SVG and image rendering, text via host-side shaping. The WIT protocol (`wit/plugin.wit`) is pure substrate — `init`,
   `tick(inbound frames) -> turn`, and synchronous text shaping; nothing in it
   has UI meaning.
 - A host runtime: loads a component with wasmtime on a background worker,
@@ -86,8 +87,9 @@ div()
     .child(panel)
 ```
 
-On the guest, drawing on a surface is `open_view(surface, cx, |window, cx| ...)`: an
-ordinary GPUI window whose scenes go to that surface.
+On the guest, drawing on a surface is `open_view(surface, cx, |window, cx| ...)`: the
+view is built in the plugin's one window and attached as a root of it at the surface's
+slot; its scene goes to that surface whenever it changes.
 
 The WASI sandbox grants nothing but stdout/stderr by default; every additional
 authority is an explicit `PluginOptions::with_wasi` choice — and everything the
@@ -137,8 +139,9 @@ cargo test -p tests -- --test-threads 1   # protocol tests, and tests/js_plugin.
 2. `embedded_gpui/wit/plugin.wit` — the wire protocol, heavily commented.
 3. `example/plugin/` — what plugin code looks like.
 
-GPUI is consumed as a git dependency on the zed repository (the
-`gpui-embedded-in-gpui` branch until the small upstream hook it needs merges).
+GPUI is consumed from the zed repository: the node-engine branch
+(zed-industries/zed#63800) plus `Window::attach_root` / `take_root_scene`, the hook that
+lets a surface be a root of the guest's window (branch `gpui-multi-root-embedded`).
 
 ## License
 

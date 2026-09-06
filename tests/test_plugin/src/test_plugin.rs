@@ -10,8 +10,8 @@ use embedded_gpui::{
 };
 use embedded_gpui_util::Revocable;
 use gpui::{
-    App, Context, Entity, EventEmitter, MouseDownEvent, Task, WeakEntity, Window, div, prelude::*,
-    rgb,
+    App, Context, Entity, EventEmitter, MouseDownEvent, Task, WeakEntity, Window, canvas, div,
+    prelude::*, rgb,
 };
 use test_schema::{
     ChameleonApi, ChameleonState, CounterMilestone, FactoryApi, GatekeeperApi, ItemApi, ItemInfo,
@@ -180,20 +180,34 @@ struct ProbeView {
 }
 
 impl Render for ProbeView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let size = window.viewport_size();
-        self.geometry = Some(Geometry {
-            width: f32::from(size.width),
-            height: f32::from(size.height),
-            scale_factor: window.scale_factor(),
-        });
-        div().size_full().bg(rgb(0x336699)).on_mouse_down(
-            gpui::MouseButton::Left,
-            cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                this.clicks += 1;
-                cx.notify();
-            }),
-        )
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // A view is a root of the plugin's window, not a window: its slot's geometry is
+        // the bounds it is laid out in, measured here at prepaint.
+        let measured = cx.entity();
+        div()
+            .size_full()
+            .bg(rgb(0x336699))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    this.clicks += 1;
+                    cx.notify();
+                }),
+            )
+            .child(
+                canvas(
+                    move |bounds, window, cx| {
+                        let geometry = Geometry {
+                            width: f32::from(bounds.size.width),
+                            height: f32::from(bounds.size.height),
+                            scale_factor: window.scale_factor(),
+                        };
+                        measured.update(cx, |this, _| this.geometry = Some(geometry));
+                    },
+                    |_, _, _, _| {},
+                )
+                .size_full(),
+            )
     }
 }
 

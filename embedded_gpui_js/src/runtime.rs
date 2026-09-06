@@ -16,14 +16,13 @@ use anyhow::{Context as _, anyhow};
 use embedded_gpui::log;
 use embedded_gpui::surface::SurfaceApi;
 use embedded_gpui::{
-    Methods, Opaque, Payload, Plugin, Ref, Remote, Shared, WILDCARD_METHOD, open_view, registry,
-    share_root,
+    Methods, Opaque, Payload, Plugin, Ref, Remote, Shared, ViewHandle, WILDCARD_METHOD, open_view,
+    registry, share_root,
 };
 use futures::channel::oneshot;
 use gpui::{
-    AnyElement, AnyWindowHandle, App, AppContext as _, Context, Entity, InteractiveElement as _,
-    IntoElement, MouseButton, ParentElement as _, Render, Styled as _, Subscription, Task, Window,
-    div, px, rgb,
+    AnyElement, App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
+    MouseButton, ParentElement as _, Render, Styled as _, Subscription, Task, Window, div, px, rgb,
 };
 use rquickjs::{CatchResultExt as _, Ctx, Function, Persistent, Runtime, Value};
 use serde::Deserialize;
@@ -239,8 +238,8 @@ struct JsState {
     /// Remotes the script holds, kept connected for as long as the script is loaded.
     remotes: HashMap<u64, Remote<Opaque>>,
     subscriptions: Vec<Subscription>,
-    /// The script's open views: the window each one is the root of, and the entity.
-    views: HashMap<u32, (AnyWindowHandle, Entity<JsView>)>,
+    /// The script's open views.
+    views: HashMap<u32, ViewHandle<JsView>>,
     pending: HashMap<u64, oneshot::Sender<Result<Payload, String>>>,
     next_request: u64,
     next_view: u32,
@@ -295,10 +294,8 @@ impl JsState {
         let previous = STATE.with(|slot| slot.borrow_mut().take());
         let mut history = Vec::new();
         if let Some(previous) = previous {
-            for (handle, _) in previous.views.into_values() {
-                handle
-                    .update(cx, |_, window, _| window.remove_window())
-                    .ok();
+            for handle in previous.views.into_values() {
+                handle.close(cx);
             }
             for (_, sender) in previous.pending {
                 sender.send(Err("the script was reloaded".to_string())).ok();
@@ -403,13 +400,14 @@ fn apply_op(op: Op, cx: &mut App) {
             let root = view.clone();
             match open_view(surface, cx, move |_, _| root) {
                 Ok(handle) => JsState::with(|state| {
-                    state.views.insert(key, (handle.into(), view));
+                    state.views.insert(key, handle);
                 }),
                 Err(error) => log::error!("js_runtime: open_view failed: {error:#}"),
             }
         }
         Op::Render { key, tree } => {
-            let view = JsState::with(|state| state.views.get(&key).map(|(_, view)| view.clone()));
+            let view =
+                JsState::with(|state| state.views.get(&key).map(|handle| handle.entity().clone()));
             let Some(view) = view else {
                 log::warn!("js_runtime: render for unknown view {key}");
                 return;

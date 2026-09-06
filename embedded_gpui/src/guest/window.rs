@@ -1,21 +1,48 @@
+//! The guest's one window: a composition space in which every host surface is an
+//! attached root (`Window::attach_root`). Surfaces are laid out in a grid of fixed cells
+//! so that a surface's coordinates never depend on other surfaces (resizing one never
+//! moves another, and hit-testing separates them by position alone), and each root's
+//! scene is read back on its own (`Window::take_root_scene`) and shipped to its surface
+//! only when it changed.
+
 use crate::guest::objects;
 use crate::platform::PluginDisplay;
 use crate::surface::SurfaceApi;
 use crate::text_system::{PluginAtlas, PluginTextSystem, TileContent};
 use crate::wit;
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use embedded_gpui::Remote;
 use futures::channel::oneshot;
 use gpui::{
-    Bounds, Capslock, DispatchEventResult, GpuSpecs, Modifiers, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton,
-    PromptLevel, RequestFrameOptions, ScaledPixels, Scene, Size, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, point,
+    AnyView, AnyWindowHandle, App, AsyncApp, AttachedRootId, Bounds, Capslock, DispatchEventResult,
+    GpuSpecs, Modifiers, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+    PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
+    ScaledPixels, Scene, Size, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControlArea, point, px, size,
 };
 use raw_window_handle as rwh;
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Once};
+
+/// The side of one grid cell in logical pixels; the largest slot a surface can be.
+pub const CELL_SIZE: f32 = 8192.;
+const COLUMNS: usize = 32;
+const ROWS: usize = 32;
+
+/// The composition window's fixed size: the whole grid. Coordinates stay small enough
+/// for `f32` to keep subpixel precision everywhere in it.
+pub fn composition_size() -> Size<Pixels> {
+    size(px(COLUMNS as f32 * CELL_SIZE), px(ROWS as f32 * CELL_SIZE))
+}
+
+fn cell_origin(cell: usize) -> Point<Pixels> {
+    point(
+        px((cell % COLUMNS) as f32 * CELL_SIZE),
+        px((cell / COLUMNS) as f32 * CELL_SIZE),
+    )
+}
 
 type RequestFrameCallback = Box<dyn FnMut(RequestFrameOptions)>;
 type InputCallback = Box<dyn FnMut(PlatformInput) -> DispatchEventResult>;
@@ -28,55 +55,74 @@ struct Callbacks {
     resize: Option<ResizeCallback>,
 }
 
-/// Shared state for one plugin "window": the guest end of a host surface.
-pub struct PluginWindowState {
-    /// The host surface this window draws on; scenes are addressed to its object id.
+/// One host surface's place in the composition window.
+struct SurfaceRoot {
     surface: Remote<SurfaceApi>,
-    size: Cell<Size<Pixels>>,
+    view: AnyView,
+    cell: usize,
+    /// Distinguishes registrations: a surface reattached while its previous view's
+    /// release is still pending must not lose the new view to that release.
+    generation: u64,
+    /// The GPUI root, once the host has sent the slot's geometry. Until then the view is
+    /// not drawn, so its first frame is at the slot's real size.
+    attached: Option<AttachedRootId>,
+}
+
+/// Shared state for the guest's composition window: the platform's `PlatformWindow`
+/// and the exports reach it through one `Rc`.
+pub struct PluginWindowState {
     scale_factor: Cell<f32>,
     mouse_position: Cell<Point<Pixels>>,
     atlas: Arc<PluginAtlas>,
     callbacks: RefCell<Callbacks>,
     input_handler: RefCell<Option<PlatformInputHandler>>,
+    handle: Cell<Option<AnyWindowHandle>>,
+    /// Surfaces with a view, keyed by surface object id.
+    roots: RefCell<HashMap<u64, SurfaceRoot>>,
+    free_cells: RefCell<Vec<usize>>,
+    next_cell: Cell<usize>,
+    next_generation: Cell<u64>,
     /// Shared with the platform: the surface that most recently received input.
     last_input_surface: Rc<Cell<Option<u64>>>,
     /// Geometry and input the host delivered this turn. `ViewApi` handlers run inside
     /// the registry's `App` borrow, and GPUI's window callbacks re-enter the app, so the
     /// pump applies these once the borrow is released.
     pending: RefCell<Vec<WindowEvent>>,
-    /// Set by the first `resize` from the host. Until then the window has a nominal
-    /// size and is not rendered: the first frame is drawn at the slot's real size.
-    measured: Cell<bool>,
-    /// GPUI dropped its `PlatformWindow` (the window was removed): nothing may be
-    /// dispatched to this state again, and the platform forgets it on its next pump.
+    /// GPUI dropped its `PlatformWindow`: nothing may be dispatched to this state again.
     closed: Cell<bool>,
 }
 
-/// One host-driven window event, applied by the pump.
+/// One host-driven event, applied by the pump.
 pub enum WindowEvent {
-    Resize(Size<Pixels>, f32),
-    Input(PlatformInput),
+    Resize {
+        surface: u64,
+        size: Size<Pixels>,
+        scale_factor: f32,
+    },
+    Input {
+        surface: u64,
+        input: PlatformInput,
+    },
 }
 
 impl PluginWindowState {
-    /// A window opens at a nominal size; the host drives the real geometry through the
-    /// view's `resize` as soon as the surface is attached.
     pub fn new(
-        surface: Remote<SurfaceApi>,
         text_system: Arc<PluginTextSystem>,
         last_input_surface: Rc<Cell<Option<u64>>>,
     ) -> Self {
         Self {
-            surface,
-            size: Cell::new(gpui::size(gpui::px(1.), gpui::px(1.))),
             scale_factor: Cell::new(1.),
             mouse_position: Cell::new(Point::default()),
             atlas: Arc::new(PluginAtlas::new(text_system)),
             callbacks: RefCell::new(Callbacks::default()),
             input_handler: RefCell::new(None),
+            handle: Cell::new(None),
+            roots: RefCell::new(HashMap::new()),
+            free_cells: RefCell::new(Vec::new()),
+            next_cell: Cell::new(0),
+            next_generation: Cell::new(0),
             last_input_surface,
             pending: RefCell::new(Vec::new()),
-            measured: Cell::new(false),
             closed: Cell::new(false),
         }
     }
@@ -85,40 +131,128 @@ impl PluginWindowState {
         self.closed.get()
     }
 
+    pub fn set_handle(&self, handle: AnyWindowHandle) {
+        self.handle.set(Some(handle));
+    }
+
+    pub fn handle(&self) -> Option<AnyWindowHandle> {
+        self.handle.get()
+    }
+
+    /// Give `surface` a view to draw. Replaces a previous view of the same surface (a
+    /// reattach). Returns the registration's generation, which identifies it to
+    /// [`remove_surface`](Self::remove_surface).
+    pub fn add_surface(
+        &self,
+        surface: Remote<SurfaceApi>,
+        view: AnyView,
+        cx: &mut App,
+    ) -> Result<u64> {
+        let surface_id = surface.reference().entity_id();
+        let previous = self.roots.borrow_mut().remove(&surface_id);
+        let cell = match previous {
+            Some(previous) => {
+                self.detach(previous.attached, cx);
+                previous.cell
+            }
+            None => self.allocate_cell()?,
+        };
+        let generation = self.next_generation.get();
+        self.next_generation.set(generation + 1);
+        self.roots.borrow_mut().insert(
+            surface_id,
+            SurfaceRoot {
+                surface,
+                view,
+                cell,
+                generation,
+                attached: None,
+            },
+        );
+        Ok(generation)
+    }
+
+    /// Stop drawing on `surface`, if `generation` is still the registration drawing there.
+    pub fn remove_surface(&self, surface: u64, generation: u64, cx: &mut App) {
+        let removed = {
+            let mut roots = self.roots.borrow_mut();
+            if roots
+                .get(&surface)
+                .is_some_and(|root| root.generation == generation)
+            {
+                roots.remove(&surface)
+            } else {
+                None
+            }
+        };
+        if let Some(root) = removed {
+            self.detach(root.attached, cx);
+            self.free_cells.borrow_mut().push(root.cell);
+        }
+    }
+
+    /// The surface object behind a surface id, if a view is drawing on it.
+    pub fn surface_remote(&self, surface: u64) -> Option<Remote<SurfaceApi>> {
+        self.roots
+            .borrow()
+            .get(&surface)
+            .map(|root| root.surface.clone())
+    }
+
+    fn allocate_cell(&self) -> Result<usize> {
+        if let Some(cell) = self.free_cells.borrow_mut().pop() {
+            return Ok(cell);
+        }
+        let cell = self.next_cell.get();
+        if cell >= COLUMNS * ROWS {
+            return Err(anyhow!(
+                "embedded_gpui: at most {} surfaces can be open at once",
+                COLUMNS * ROWS
+            ));
+        }
+        self.next_cell.set(cell + 1);
+        Ok(cell)
+    }
+
+    fn detach(&self, attached: Option<AttachedRootId>, cx: &mut App) {
+        if let (Some(id), Some(handle)) = (attached, self.handle.get()) {
+            handle
+                .update(cx, |_, window, _| window.detach_root(id))
+                .ok();
+        }
+    }
+
     /// Queue a host-driven event for the next pump.
     pub fn push_event(&self, event: WindowEvent) {
         self.pending.borrow_mut().push(event);
     }
 
-    /// Apply the queued events, in order. Called outside any `App` borrow.
-    pub fn flush_events(&self) {
+    /// Apply the queued events, in order. Called outside any `App` borrow: GPUI's window
+    /// callbacks borrow the app themselves.
+    pub fn flush_events(&self, async_app: &mut AsyncApp) {
         let events = std::mem::take(&mut *self.pending.borrow_mut());
         if self.closed.get() {
             return;
         }
         for event in events {
             match event {
-                WindowEvent::Resize(size, scale_factor) => self.resized(size, scale_factor),
-                WindowEvent::Input(input) => self.dispatch_input(input),
+                WindowEvent::Resize {
+                    surface,
+                    size,
+                    scale_factor,
+                } => self.resized(surface, size, scale_factor, async_app),
+                WindowEvent::Input { surface, input } => self.dispatch_input(surface, input),
             }
         }
     }
 
-    pub fn surface(&self) -> &Remote<SurfaceApi> {
-        &self.surface
-    }
-
-    fn surface_id(&self) -> u64 {
-        self.surface.reference().entity_id()
-    }
-
-    /// Give GPUI a chance to redraw this window. GPUI's registered frame callback checks the
-    /// window's dirty bit itself, so calling this on a clean window is cheap.
+    /// Give GPUI a chance to redraw the window. GPUI's registered frame callback checks
+    /// the window's dirty bit itself, so calling this on a clean window is cheap.
     ///
     /// The callback is temporarily moved out so that it can freely re-enter this window's
     /// other methods without hitting the `callbacks` RefCell.
     pub fn pump_frame(&self) {
-        if !self.measured.get() || self.closed.get() {
+        if self.closed.get() {
             return;
         }
         let callback = self.callbacks.borrow_mut().request_frame.take();
@@ -131,18 +265,70 @@ impl PluginWindowState {
         }
     }
 
-    /// Dispatch a host-forwarded input event through GPUI's input pipeline.
+    /// Ship every root whose scene changed since it was last shipped, as that surface's
+    /// display list. Roots GPUI reused unchanged cost nothing here.
+    pub fn ship_scenes(&self, cx: &mut App) {
+        let Some(handle) = self.handle.get() else {
+            return;
+        };
+        if self.closed.get() {
+            return;
+        }
+        let scale_factor = self.scale_factor.get();
+        let roots = self.roots.borrow();
+        handle
+            .update(cx, |_, window, _| {
+                for (surface_id, root) in roots.iter() {
+                    let Some(attached) = root.attached else {
+                        continue;
+                    };
+                    if let Some(scene) = window.take_root_scene(attached) {
+                        let list = serialize_scene(
+                            &scene,
+                            scale_factor,
+                            cell_origin(root.cell),
+                            &self.atlas,
+                        );
+                        objects::push_scene(*surface_id, list);
+                    }
+                }
+            })
+            .ok();
+    }
+
+    /// Dispatch a host-forwarded input event through GPUI's input pipeline, translated
+    /// from the surface's slot to its cell in the composition window.
     ///
     /// Unhandled printable key-downs fall through to the focused input handler, the same way
     /// GPUI's Linux backends synthesize text input from key events (there is no OS IME on
     /// this side of the wasm boundary).
-    pub fn dispatch_input(&self, input: PlatformInput) {
-        self.last_input_surface.set(Some(self.surface_id()));
-        match &input {
-            PlatformInput::MouseDown(event) => self.mouse_position.set(event.position),
-            PlatformInput::MouseUp(event) => self.mouse_position.set(event.position),
-            PlatformInput::MouseMove(event) => self.mouse_position.set(event.position),
-            PlatformInput::ScrollWheel(event) => self.mouse_position.set(event.position),
+    pub fn dispatch_input(&self, surface: u64, mut input: PlatformInput) {
+        let Some(origin) = self
+            .roots
+            .borrow()
+            .get(&surface)
+            .map(|root| cell_origin(root.cell))
+        else {
+            return;
+        };
+        self.last_input_surface.set(Some(surface));
+        match &mut input {
+            PlatformInput::MouseDown(event) => {
+                event.position += origin;
+                self.mouse_position.set(event.position);
+            }
+            PlatformInput::MouseUp(event) => {
+                event.position += origin;
+                self.mouse_position.set(event.position);
+            }
+            PlatformInput::MouseMove(event) => {
+                event.position += origin;
+                self.mouse_position.set(event.position);
+            }
+            PlatformInput::ScrollWheel(event) => {
+                event.position += origin;
+                self.mouse_position.set(event.position);
+            }
             _ => {}
         }
         let callback = self.callbacks.borrow_mut().input.take();
@@ -164,24 +350,72 @@ impl PluginWindowState {
         }
     }
 
-    /// Apply a slot size or scale factor change coming from the host.
-    pub fn resized(&self, size: Size<Pixels>, scale_factor: f32) {
+    /// Apply a slot size or scale factor change coming from the host: the surface's root
+    /// is attached at its cell (the first time) or moved to the new size.
+    fn resized(
+        &self,
+        surface: u64,
+        size: Size<Pixels>,
+        scale_factor: f32,
+        async_app: &mut AsyncApp,
+    ) {
+        static OVERSIZED_WARNED: Once = Once::new();
         if size.width <= Pixels::ZERO || size.height <= Pixels::ZERO {
             return;
         }
-        self.measured.set(true);
-        self.size.set(size);
-        self.scale_factor.set(scale_factor);
-        let callback = self.callbacks.borrow_mut().resize.take();
-        if let Some(mut callback) = callback {
-            callback(size, scale_factor);
-            self.callbacks.borrow_mut().resize = Some(callback);
+        let mut size = size;
+        if size.width > px(CELL_SIZE) || size.height > px(CELL_SIZE) {
+            warn_once(
+                &OVERSIZED_WARNED,
+                "embedded_gpui: a surface larger than 8192px is clipped to that size",
+            );
+            size.width = size.width.min(px(CELL_SIZE));
+            size.height = size.height.min(px(CELL_SIZE));
+        }
+        if scale_factor != self.scale_factor.get() {
+            // One scale factor per plugin: every surface of it is assumed to be on the
+            // same display. GPUI re-lays the window out for the new factor.
+            self.scale_factor.set(scale_factor);
+            let callback = self.callbacks.borrow_mut().resize.take();
+            if let Some(mut callback) = callback {
+                callback(composition_size(), scale_factor);
+                self.callbacks.borrow_mut().resize = Some(callback);
+            }
+        }
+        let Some(handle) = self.handle.get() else {
+            return;
+        };
+        let Some((view, cell, attached)) = self
+            .roots
+            .borrow()
+            .get(&surface)
+            .map(|root| (root.view.clone(), root.cell, root.attached))
+        else {
+            return;
+        };
+        let bounds = Bounds {
+            origin: cell_origin(cell),
+            size,
+        };
+        let attached = async_app.update(|cx| {
+            handle
+                .update(cx, |_, window, _| match attached {
+                    Some(id) => {
+                        window.set_root_bounds(id, bounds);
+                        id
+                    }
+                    None => window.attach_root(view, bounds),
+                })
+                .ok()
+        });
+        if let Some(root) = self.roots.borrow_mut().get_mut(&surface) {
+            root.attached = attached.or(root.attached);
         }
     }
 }
 
 /// The `PlatformWindow` handed to GPUI. GPUI owns this box; the platform and the exports
-/// reach the same state through the `Rc` kept in `PluginPlatform::windows`.
+/// reach the same state through the `Rc` kept in `PluginPlatform`.
 pub struct PluginWindow {
     state: Rc<PluginWindowState>,
     display: Rc<PluginDisplay>,
@@ -195,7 +429,7 @@ impl PluginWindow {
     fn bounds_px(&self) -> Bounds<Pixels> {
         Bounds {
             origin: Point::default(),
-            size: self.state.size.get(),
+            size: composition_size(),
         }
     }
 }
@@ -211,7 +445,7 @@ impl Drop for PluginWindow {
 impl rwh::HasWindowHandle for PluginWindow {
     fn window_handle(&self) -> Result<rwh::WindowHandle<'_>, rwh::HandleError> {
         // A synthetic handle: nothing consumes it, but the trait requires one.
-        let raw = rwh::WebWindowHandle::new(self.state.surface_id() as u32);
+        let raw = rwh::WebWindowHandle::new(1);
         Ok(unsafe { rwh::WindowHandle::borrow_raw(rwh::RawWindowHandle::Web(raw)) })
     }
 }
@@ -237,11 +471,11 @@ impl PlatformWindow for PluginWindow {
     }
 
     fn content_size(&self) -> Size<Pixels> {
-        self.state.size.get()
+        composition_size()
     }
 
     fn resize(&mut self, _size: Size<Pixels>) {
-        // The host owns the slot geometry; guest-initiated resizes are meaningless.
+        // The composition window has a fixed size; the host owns every surface's geometry.
     }
 
     fn scale_factor(&self) -> f32 {
@@ -341,9 +575,9 @@ impl PlatformWindow for PluginWindow {
 
     fn on_appearance_changed(&self, _callback: Box<dyn FnMut()>) {}
 
-    fn draw(&self, scene: &Scene) {
-        let list = serialize_scene(scene, self.state.scale_factor.get(), &self.state.atlas);
-        objects::push_scene(self.state.surface_id(), list);
+    fn draw(&self, _scene: &Scene) {
+        // The composite scene is never presented as a whole: after each frame the pump
+        // reads every surface root's scene on its own (`ship_scenes`).
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
@@ -365,10 +599,47 @@ fn warn_once(warned: &'static Once, message: &'static str) {
     warned.call_once(|| log::warn!("{message}"));
 }
 
-/// Convert a painted GPUI scene into the wire display list. Everything crossing the boundary
-/// is in logical pixels (divided by the scale factor); glyph sprites are mapped back to the
-/// symbolic parameters remembered by the atlas so the host can rasterize them itself.
-fn serialize_scene(scene: &Scene, scale_factor: f32, atlas: &PluginAtlas) -> wit::DisplayList {
+/// The mapping from a root's scene (scaled pixels, composition-window coordinates) to the
+/// wire (logical pixels, relative to the surface's slot).
+#[derive(Clone, Copy)]
+struct Wire {
+    inverse_scale: f32,
+    origin: Point<f32>,
+}
+
+impl Wire {
+    fn point(&self, value: Point<ScaledPixels>) -> wit::Point {
+        wit::Point {
+            x: value.x.0 * self.inverse_scale - self.origin.x,
+            y: value.y.0 * self.inverse_scale - self.origin.y,
+        }
+    }
+
+    fn bounds(&self, value: Bounds<ScaledPixels>) -> wit::Bounds {
+        wit::Bounds {
+            origin: self.point(value.origin),
+            size: wit::Extent {
+                width: value.size.width.0 * self.inverse_scale,
+                height: value.size.height.0 * self.inverse_scale,
+            },
+        }
+    }
+
+    fn length(&self, value: ScaledPixels) -> f32 {
+        value.0 * self.inverse_scale
+    }
+}
+
+/// Convert one root's painted scene into the wire display list. Everything crossing the
+/// boundary is in logical pixels relative to the surface's slot (divided by the scale
+/// factor, minus the root's cell origin); glyph sprites are mapped back to the symbolic
+/// parameters remembered by the atlas so the host can rasterize them itself.
+fn serialize_scene(
+    scene: &Scene,
+    scale_factor: f32,
+    origin: Point<Pixels>,
+    atlas: &PluginAtlas,
+) -> wit::DisplayList {
     static GRADIENT_WARNED: Once = Once::new();
     static SURFACE_WARNED: Once = Once::new();
     static SUBPIXEL_WARNED: Once = Once::new();
@@ -376,7 +647,10 @@ fn serialize_scene(scene: &Scene, scale_factor: f32, atlas: &PluginAtlas) -> wit
     static UNKNOWN_TILE_WARNED: Once = Once::new();
     static TRANSFORM_WARNED: Once = Once::new();
 
-    let inverse_scale = 1.0 / scale_factor;
+    let wire = Wire {
+        inverse_scale: 1.0 / scale_factor,
+        origin: point(f32::from(origin.x), f32::from(origin.y)),
+    };
     let mut primitives = Vec::new();
 
     for quad in &scene.quads {
@@ -390,21 +664,21 @@ fn serialize_scene(scene: &Scene, scale_factor: f32, atlas: &PluginAtlas) -> wit
         primitives.push(wit::PlacedPrimitive {
             order: quad.order,
             prim: wit::Primitive::Quad(wit::Quad {
-                bounds: wire_bounds(quad.bounds, inverse_scale),
-                content_mask: wire_bounds(quad.content_mask.bounds, inverse_scale),
+                bounds: wire.bounds(quad.bounds),
+                content_mask: wire.bounds(quad.content_mask.bounds),
                 background: wire_hsla(background),
                 border_color: wire_hsla(quad.border_color),
                 corner_radii: wit::Corners {
-                    top_left: quad.corner_radii.top_left.0 * inverse_scale,
-                    top_right: quad.corner_radii.top_right.0 * inverse_scale,
-                    bottom_right: quad.corner_radii.bottom_right.0 * inverse_scale,
-                    bottom_left: quad.corner_radii.bottom_left.0 * inverse_scale,
+                    top_left: wire.length(quad.corner_radii.top_left),
+                    top_right: wire.length(quad.corner_radii.top_right),
+                    bottom_right: wire.length(quad.corner_radii.bottom_right),
+                    bottom_left: wire.length(quad.corner_radii.bottom_left),
                 },
                 border_widths: wit::Edges {
-                    top: quad.border_widths.top.0 * inverse_scale,
-                    right: quad.border_widths.right.0 * inverse_scale,
-                    bottom: quad.border_widths.bottom.0 * inverse_scale,
-                    left: quad.border_widths.left.0 * inverse_scale,
+                    top: wire.length(quad.border_widths.top),
+                    right: wire.length(quad.border_widths.right),
+                    bottom: wire.length(quad.border_widths.bottom),
+                    left: wire.length(quad.border_widths.left),
                 },
                 border_style: match quad.border_style {
                     gpui::BorderStyle::Solid => wit::BorderStyle::Solid,
@@ -423,25 +697,25 @@ fn serialize_scene(scene: &Scene, scale_factor: f32, atlas: &PluginAtlas) -> wit
             continue;
         }
         let offset_x =
-            (shadow.bounds.center().x.0 - shadow.element_bounds.center().x.0) * inverse_scale;
+            (shadow.bounds.center().x.0 - shadow.element_bounds.center().x.0) * wire.inverse_scale;
         let offset_y =
-            (shadow.bounds.center().y.0 - shadow.element_bounds.center().y.0) * inverse_scale;
+            (shadow.bounds.center().y.0 - shadow.element_bounds.center().y.0) * wire.inverse_scale;
         let spread = ((shadow.bounds.size.width.0 - shadow.element_bounds.size.width.0) / 2.0
             - shadow.blur_radius.0)
-            * inverse_scale;
+            * wire.inverse_scale;
         primitives.push(wit::PlacedPrimitive {
             order: shadow.order,
             prim: wit::Primitive::Shadow(wit::Shadow {
-                bounds: wire_bounds(shadow.element_bounds, inverse_scale),
-                content_mask: wire_bounds(shadow.content_mask.bounds, inverse_scale),
+                bounds: wire.bounds(shadow.element_bounds),
+                content_mask: wire.bounds(shadow.content_mask.bounds),
                 corner_radii: wit::Corners {
-                    top_left: shadow.element_corner_radii.top_left.0 * inverse_scale,
-                    top_right: shadow.element_corner_radii.top_right.0 * inverse_scale,
-                    bottom_right: shadow.element_corner_radii.bottom_right.0 * inverse_scale,
-                    bottom_left: shadow.element_corner_radii.bottom_left.0 * inverse_scale,
+                    top_left: wire.length(shadow.element_corner_radii.top_left),
+                    top_right: wire.length(shadow.element_corner_radii.top_right),
+                    bottom_right: wire.length(shadow.element_corner_radii.bottom_right),
+                    bottom_left: wire.length(shadow.element_corner_radii.bottom_left),
                 },
                 color: wire_hsla(shadow.color),
-                blur_radius: shadow.blur_radius.0 * inverse_scale,
+                blur_radius: wire.length(shadow.blur_radius),
                 spread_radius: spread,
                 offset: wit::Point {
                     x: offset_x,
@@ -455,12 +729,12 @@ fn serialize_scene(scene: &Scene, scale_factor: f32, atlas: &PluginAtlas) -> wit
         primitives.push(wit::PlacedPrimitive {
             order: underline.order,
             prim: wit::Primitive::Underline(wit::Underline {
-                origin: wire_point(underline.bounds.origin, inverse_scale),
-                width: underline.bounds.size.width.0 * inverse_scale,
-                content_mask: wire_bounds(underline.content_mask.bounds, inverse_scale),
+                origin: wire.point(underline.bounds.origin),
+                width: wire.length(underline.bounds.size.width),
+                content_mask: wire.bounds(underline.content_mask.bounds),
                 color: wire_hsla(underline.color),
-                thickness: underline.thickness.0 * inverse_scale,
-                wavy: underline.wavy != 0,
+                thickness: wire.length(underline.thickness),
+                wavy: underline.wavy == true.into(),
             }),
         });
     }
@@ -482,7 +756,7 @@ fn serialize_scene(scene: &Scene, scale_factor: f32, atlas: &PluginAtlas) -> wit
                         sprite.bounds,
                         sprite.content_mask.bounds,
                         sprite.color,
-                        inverse_scale,
+                        wire,
                     )),
                 });
             }
@@ -495,8 +769,8 @@ fn serialize_scene(scene: &Scene, scale_factor: f32, atlas: &PluginAtlas) -> wit
                         order: sprite.order,
                         prim: wit::Primitive::Image(wit::Image {
                             image_id: payload_id,
-                            bounds: wire_bounds(sprite.bounds, inverse_scale),
-                            content_mask: wire_bounds(sprite.content_mask.bounds, inverse_scale),
+                            bounds: wire.bounds(sprite.bounds),
+                            content_mask: wire.bounds(sprite.content_mask.bounds),
                             corner_radii: wit::Corners {
                                 top_left: 0.0,
                                 top_right: 0.0,
@@ -527,7 +801,7 @@ fn serialize_scene(scene: &Scene, scale_factor: f32, atlas: &PluginAtlas) -> wit
                         sprite.bounds,
                         sprite.content_mask.bounds,
                         gpui::white(),
-                        inverse_scale,
+                        wire,
                     )),
                 });
             }
@@ -537,15 +811,15 @@ fn serialize_scene(scene: &Scene, scale_factor: f32, atlas: &PluginAtlas) -> wit
                         order: sprite.order,
                         prim: wit::Primitive::Image(wit::Image {
                             image_id: payload_id,
-                            bounds: wire_bounds(sprite.bounds, inverse_scale),
-                            content_mask: wire_bounds(sprite.content_mask.bounds, inverse_scale),
+                            bounds: wire.bounds(sprite.bounds),
+                            content_mask: wire.bounds(sprite.content_mask.bounds),
                             corner_radii: wit::Corners {
-                                top_left: sprite.corner_radii.top_left.0 * inverse_scale,
-                                top_right: sprite.corner_radii.top_right.0 * inverse_scale,
-                                bottom_right: sprite.corner_radii.bottom_right.0 * inverse_scale,
-                                bottom_left: sprite.corner_radii.bottom_left.0 * inverse_scale,
+                                top_left: wire.length(sprite.corner_radii.top_left),
+                                top_right: wire.length(sprite.corner_radii.top_right),
+                                bottom_right: wire.length(sprite.corner_radii.bottom_right),
+                                bottom_left: wire.length(sprite.corner_radii.bottom_left),
                             },
-                            grayscale: sprite.grayscale,
+                            grayscale: sprite.grayscale == true.into(),
                             opacity: sprite.opacity,
                         }),
                     });
@@ -569,13 +843,13 @@ fn serialize_scene(scene: &Scene, scale_factor: f32, atlas: &PluginAtlas) -> wit
         primitives.push(wit::PlacedPrimitive {
             order: path.order,
             prim: wit::Primitive::Path(wit::Path {
-                content_mask: wire_bounds(path.content_mask.bounds, inverse_scale),
+                content_mask: wire.bounds(path.content_mask.bounds),
                 color: wire_hsla(color),
                 vertices: path
                     .vertices
                     .iter()
                     .map(|vertex| wit::PathVertex {
-                        xy: wire_point(vertex.xy_position, inverse_scale),
+                        xy: wire.point(vertex.xy_position),
                         st: wit::Point {
                             x: vertex.st_position.x,
                             y: vertex.st_position.y,
@@ -615,44 +889,26 @@ fn wire_glyph(
     bounds: Bounds<ScaledPixels>,
     content_mask: Bounds<ScaledPixels>,
     color: gpui::Hsla,
-    inverse_scale: f32,
+    wire: Wire,
 ) -> wit::Glyph {
-    let baseline = point(
-        (bounds.origin.x.0 - raster_origin.x.0 as f32
-            + params.subpixel_variant.x as f32 / gpui::SUBPIXEL_VARIANTS_X as f32)
-            * inverse_scale,
-        (bounds.origin.y.0 - raster_origin.y.0 as f32
-            + params.subpixel_variant.y as f32 / gpui::SUBPIXEL_VARIANTS_Y as f32)
-            * inverse_scale,
-    );
+    let baseline = wire.point(point(
+        ScaledPixels(
+            bounds.origin.x.0 - raster_origin.x.0 as f32
+                + params.subpixel_variant.x as f32 / gpui::SUBPIXEL_VARIANTS_X as f32,
+        ),
+        ScaledPixels(
+            bounds.origin.y.0 - raster_origin.y.0 as f32
+                + params.subpixel_variant.y as f32 / gpui::SUBPIXEL_VARIANTS_Y as f32,
+        ),
+    ));
     wit::Glyph {
         font_id: params.font_id.0 as u32,
         glyph_id: params.glyph_id.0,
-        origin: wit::Point {
-            x: baseline.x,
-            y: baseline.y,
-        },
+        origin: baseline,
         font_size: f32::from(params.font_size),
         color: wire_hsla(color),
-        content_mask: wire_bounds(content_mask, inverse_scale),
+        content_mask: wire.bounds(content_mask),
         is_emoji: params.is_emoji,
-    }
-}
-
-fn wire_point(value: Point<ScaledPixels>, inverse_scale: f32) -> wit::Point {
-    wit::Point {
-        x: value.x.0 * inverse_scale,
-        y: value.y.0 * inverse_scale,
-    }
-}
-
-fn wire_bounds(value: Bounds<ScaledPixels>, inverse_scale: f32) -> wit::Bounds {
-    wit::Bounds {
-        origin: wire_point(value.origin, inverse_scale),
-        size: wit::Extent {
-            width: value.size.width.0 * inverse_scale,
-            height: value.size.height.0 * inverse_scale,
-        },
     }
 }
 

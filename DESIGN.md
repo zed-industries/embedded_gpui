@@ -4,11 +4,12 @@ An experimental spike: run GPUI itself inside a Wasm component (`wasm32-wasip2`)
 its rendered output inside a native GPUI host application. This models a future "UI
 extensions" system for Zed and exists to hammer out the guest-side `gpui_plugin` platform.
 
-This repository is standalone: it consumes `gpui` and `gpui_platform` as git dependencies
-on the zed repository (currently the `gpui-embedded-in-gpui` branch, which carries the one
-upstream hook the guest runtime needs: `Application::run_embedded`, which returns an
-`ApplicationHandle` so an embedder whose `Platform::run` returns immediately can keep the
-app alive and re-enter it whenever the external run loop yields control).
+This repository is standalone: it consumes `gpui` and `gpui_platform` from the zed
+repository, on top of the node engine (zed-industries/zed#63800, which memoizes view
+output and makes a frame an ordered list of roots) plus one small addition the guest
+needs: `Window::attach_root` / `Window::take_root_scene`, which draw a view as an extra
+root of a window at fixed bounds and read that root's scene back on its own. (The other
+hook, `Application::run_embedded`, is already on `main`.)
 
 ## Layout
 
@@ -50,12 +51,12 @@ The spike proved the object model *works*; this pass made it the only one. Five 
 
 1. **Views are objects.** A slot is a host-homed `SurfaceApi` object; the thing drawing
    on it is a guest-homed `ViewApi` object. The host hands a `Ref<SurfaceApi>` to the
-   plugin through an ordinary typed method; the guest opens a window on it, shares a
-   view, and calls `surface.attach(view)`. Input, resize, and cursor are method calls on
-   those two objects. There are no view ids, no view names, and no directional
+   plugin through an ordinary typed method; the guest builds a view for it, shares a
+   view object, and calls `surface.attach(view)`. Input, resize, and cursor are method
+   calls on those two objects. There are no view ids, no view names, and no directional
    view/input functions in the WIT. A surface belongs to its owner (it is shared with
-   `keep_alive = false`): drop the entity and the guest's view is released and its
-   window closes.
+   `keep_alive = false`): drop the entity and the guest's view is released and its root
+   is detached.
 2. **Refs are enumerable.** Every call and response carries a `refs` table; payload
    bytes name refs by table index. Forwarders rewrite the table without parsing the
    payload, which is what makes transitive membranes (`Revocable` wrapping every ref
@@ -90,7 +91,7 @@ and a host that never loads scripts never compiles a line of it.
   plugin can use for assets) and shares its root; the runtime runs `/plugin/index.js`
   and forwards every method on its root to the script's `plugin.root`. The host
   addresses a JS plugin exactly as it addresses a Rust one and never learns which it
-  got. When `index.js` changes on disk the runtime tears the previous script's windows,
+  got. When `index.js` changes on disk the runtime tears the previous script's views,
   observers, and remotes down, starts a fresh context, and **replays every call the
   host made to the root** — so the views the host mounted come back without the host
   knowing anything happened. `load(source)` exists for tools and tests that push
@@ -105,7 +106,7 @@ and a host that never loads scripts never compiles a line of it.
   `App` — issues the calls, opens views, applies rendered trees — and later resolves
   the script's promises from the receipts. QuickJS's job queue is pumped after every
   entry into JS.
-- **UI is data.** `plugin.openView(surface)` opens a GPUI window on a host surface;
+- **UI is data.** `plugin.openView(surface)` opens a GPUI view on a host surface;
   `view.render(tree)` sets a tree of `div`/`text` nodes with a small flat style
   vocabulary; functions in the tree become handler ids the runtime invokes on input.
   Nothing JS-specific reaches the host: it sees a `ViewApi` object like any other.
@@ -146,17 +147,32 @@ the rule for it is the same as for every plugin: events and notifies, not animat
    order, preserving guest stacking (including guest-side deferred draws / overlays).
 7. **Input and geometry are method calls** on the guest-homed `ViewApi` object a
    surface has attached: `resize`, `mouse`, `key` (slot-relative logical coordinates).
-   The guest window's own dispatch does hit-testing and runs listeners; no callback
-   registry crosses the boundary. Cursor styles flow back as `set_cursor` on the
-   host-homed `SurfaceApi`. Because `ViewApi` handlers run inside the registry's `App`
-   borrow and GPUI's window callbacks re-enter the app, the view queues events on its
-   window and the pump applies them once the borrow is released — same turn, same order.
-8. **Scheduling**: the guest dispatcher queues runnables/timers locally. Every `tick`
-   drains due work, pumps each window's `request_frame` callback (GPUI decides whether
-   a window is dirty; a redraw ends in `PlatformWindow::draw(scene)`, which serializes
-   into the turn's `scenes`), and reports the earliest remaining timer as
-   `wake-after-ms`, which the host schedules. A window is not rendered until the host
-   has pushed its first geometry, so its first frame is at the slot's real size.
+   The guest translates them into its composition window (below) and lets GPUI's own
+   dispatch do hit-testing and run listeners; no callback registry crosses the boundary.
+   Cursor styles flow back as `set_cursor` on the host-homed `SurfaceApi`. Because
+   `ViewApi` handlers run inside the registry's `App` borrow and GPUI's window callbacks
+   re-enter the app, the view queues events on the window and the pump applies them
+   once the borrow is released — same turn, same order.
+8. **One window per plugin; a surface is a root of it.** The guest has a single
+   *composition window*, and every host surface is a root attached to it with
+   `Window::attach_root` — a node of the node engine like any mounted view, so it is
+   memoized, hit-tested, focused, and dispatched to by position, and hundreds of
+   surfaces are hundreds of nodes rather than hundreds of windows. Surfaces are laid out
+   in a grid of fixed cells (8192 px, 32×32) so a surface's coordinates never depend on
+   another's: resizing one never moves another, and hit-testing separates them by
+   position alone. After each frame the pump reads every root's scene on its own with
+   `Window::take_root_scene`, which answers only for roots whose node was redrawn, so an
+   idle surface ships nothing and a changed one ships exactly its own display list
+   (translated back to slot-relative coordinates). Window-level state now has one place
+   to land on the guest: focus is per window (matching the host's one-focus model), and
+   window-active or bounds mirroring from the host is a method on one object away. A
+   surface is not drawn until the host has pushed its first geometry, so its first frame
+   is at the slot's real size. One scale factor per plugin: the composition window takes
+   the factor the host's surfaces report and re-lays out if it changes.
+9. **Scheduling**: the guest dispatcher queues runnables/timers locally. Every `tick`
+   drains due work, pumps the window's `request_frame` callback (GPUI decides whether it
+   is dirty), ships the changed roots' scenes into the turn's `scenes`, and reports the
+   earliest remaining timer as `wake-after-ms`, which the host schedules.
 
 ## Status
 
@@ -167,8 +183,8 @@ per instance), SVGs (guest-rasterized alpha masks, tint baked per color), keyboa
 (host focus → forwarded keystrokes → guest focus dispatch, with unhandled printable keys
 falling through to the focused `EntityInputHandler`, Linux-backend style), hover styles,
 mouse input, cursor styles, and shared object state across two plugin surfaces backed by
-one guest App. The release component (all of gpui + taffy, no fonts, no glyph
-rasterizers) is ~6 MB unoptimized for size.
+one guest App and one guest window. The release component (all of gpui + taffy, no
+fonts, no glyph rasterizers) is ~6 MB unoptimized for size.
 
 Run it:
 

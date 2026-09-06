@@ -12,24 +12,23 @@ use gpui::{
     PlatformWindow, Point, Task, ThermalState, WindowAppearance, WindowParams, px, size,
 };
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
-/// The GPUI [`Platform`] implementation for Wasm plugin guests. There is no real display or
-/// window here: each "window" draws on a host surface object, and all rendering, text
-/// shaping, and scheduling is delegated across the boundary.
+/// The GPUI [`Platform`] implementation for Wasm plugin guests. There is no real display
+/// here, and one window: the composition window every host surface is a root of (see
+/// [`window`](crate::guest::window)). Rendering, text shaping, and scheduling are
+/// delegated across the boundary.
 pub struct PluginPlatform {
     dispatcher: Arc<PluginDispatcher>,
     background_executor: BackgroundExecutor,
     foreground_executor: ForegroundExecutor,
     text_system: Arc<PluginTextSystem>,
     display: Rc<PluginDisplay>,
-    /// Open windows, keyed by the object id of the surface each draws on.
-    windows: RefCell<HashMap<u64, Rc<PluginWindowState>>>,
-    /// The surface the next `open_window` binds to; set by `open_view` right before.
-    pending_surface: RefCell<Option<Remote<SurfaceApi>>>,
+    /// The composition window, once opened.
+    window: RefCell<Option<Rc<PluginWindowState>>>,
     /// The surface that most recently received input: where cursor changes apply.
     last_input_surface: Rc<Cell<Option<u64>>>,
     /// A cursor style GPUI set since the last pump; flushed to `last_input_surface`.
@@ -47,8 +46,7 @@ impl PluginPlatform {
             foreground_executor,
             text_system: Arc::new(PluginTextSystem::new()),
             display: Rc::new(PluginDisplay::new()),
-            windows: RefCell::new(HashMap::new()),
-            pending_surface: RefCell::new(None),
+            window: RefCell::new(None),
             last_input_surface: Rc::default(),
             pending_cursor: Cell::new(None),
         }
@@ -58,41 +56,22 @@ impl PluginPlatform {
         &self.dispatcher
     }
 
-    /// Bind the next `open_window` call to `surface`. See [`open_view`](crate::open_view).
-    pub fn set_pending_surface(&self, surface: Remote<SurfaceApi>) {
-        *self.pending_surface.borrow_mut() = Some(surface);
-    }
-
-    pub fn window(&self, surface: u64) -> Option<Rc<PluginWindowState>> {
-        self.windows.borrow().get(&surface).cloned()
-    }
-
-    /// Forget `window` if it is still the one drawing on `surface`; a newer window may
-    /// have taken the surface over (a reattach), in which case it is left alone. The
-    /// GPUI window itself is closed by the caller.
-    pub fn forget_window(&self, surface: u64, window: &Rc<PluginWindowState>) {
-        let mut windows = self.windows.borrow_mut();
-        if windows
-            .get(&surface)
-            .is_some_and(|current| Rc::ptr_eq(current, window))
-        {
-            windows.remove(&surface);
+    /// The composition window, if it is open. A state whose GPUI window has been
+    /// removed is forgotten here.
+    pub fn window(&self) -> Option<Rc<PluginWindowState>> {
+        let mut window = self.window.borrow_mut();
+        if window.as_ref().is_some_and(|window| window.is_closed()) {
+            *window = None;
         }
-    }
-
-    /// The live windows; states whose GPUI window has been removed are forgotten here.
-    pub fn window_states(&self) -> Vec<Rc<PluginWindowState>> {
-        let mut windows = self.windows.borrow_mut();
-        windows.retain(|_, window| !window.is_closed());
-        windows.values().cloned().collect()
+        window.clone()
     }
 
     /// The cursor change GPUI requested since the last pump, and the surface it is for.
     pub fn take_pending_cursor(&self) -> Option<(Remote<SurfaceApi>, Cursor)> {
         let cursor = self.pending_cursor.take()?;
         let surface = self.last_input_surface.get()?;
-        let window = self.window(surface)?;
-        Some((window.surface().clone(), cursor))
+        let remote = self.window()?.surface_remote(surface)?;
+        Some((remote, cursor))
     }
 }
 
@@ -117,7 +96,7 @@ impl Platform for PluginPlatform {
 
     fn quit(&self) {}
 
-    fn restart(&self, _binary_path: Option<PathBuf>) {}
+    fn restart(&self, _binary_path: Option<PathBuf>, _args: Vec<OsString>) {}
 
     fn activate(&self, _ignoring_other_apps: bool) {}
 
@@ -144,17 +123,16 @@ impl Platform for PluginPlatform {
         _handle: AnyWindowHandle,
         _params: WindowParams,
     ) -> Result<Box<dyn PlatformWindow>> {
-        let surface =
-            self.pending_surface.borrow_mut().take().ok_or_else(|| {
-                anyhow!("plugin windows are opened with embedded_gpui::open_view")
-            })?;
-        let surface_id = surface.reference().entity_id();
+        if self.window().is_some() {
+            return Err(anyhow!(
+                "a plugin has one window; views are opened with embedded_gpui::open_view"
+            ));
+        }
         let state = Rc::new(PluginWindowState::new(
-            surface,
             self.text_system.clone(),
             self.last_input_surface.clone(),
         ));
-        self.windows.borrow_mut().insert(surface_id, state.clone());
+        *self.window.borrow_mut() = Some(state.clone());
         Ok(Box::new(PluginWindow::new(state, self.display.clone())))
     }
 
@@ -201,7 +179,7 @@ impl Platform for PluginPlatform {
 
     fn open_with_system(&self, _path: &Path) {}
 
-    fn on_quit(&self, _callback: Box<dyn FnMut()>) {}
+    fn on_quit(&self, _callback: Box<dyn FnMut() -> bool>) {}
 
     fn on_reopen(&self, _callback: Box<dyn FnMut()>) {}
 

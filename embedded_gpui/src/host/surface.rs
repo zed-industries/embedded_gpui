@@ -346,7 +346,7 @@ fn paint_primitive(
             let grayscale = image.grayscale;
             window.with_content_mask(Some(ContentMask { bounds: mask }), |window| {
                 if let Err(error) =
-                    window.paint_image(bounds, corner_radii, render_image, 0, grayscale)
+                    window.paint_image(bounds, bounds, corner_radii, render_image, 0, grayscale)
                 {
                     log::warn!("embedded_gpui: failed to paint image: {error:#}");
                 }

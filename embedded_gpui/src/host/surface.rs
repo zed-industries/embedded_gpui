@@ -53,6 +53,10 @@ pub struct Surface {
     queries: Option<Rc<InputQueries>>,
     /// Why the plugin behind the view stopped, shown in place of the scene.
     stopped: Option<String>,
+    /// Set by a mouse-down that is about to focus the surface, so the focus-in that
+    /// follows is not mistaken for keyboard traversal entering it.
+    focus_by_pointer: bool,
+    focus_in: Option<gpui::Subscription>,
 }
 
 impl Surface {
@@ -64,9 +68,23 @@ impl Surface {
             cursor: None,
             geometry: None,
             last_origin: Point::default(),
-            focus_handle: cx.focus_handle(),
+            // A tab stop of the host's, so the host's own traversal reaches the surface.
+            focus_handle: cx.focus_handle().tab_stop(true),
             queries: None,
             stopped: None,
+            focus_by_pointer: false,
+            focus_in: None,
+        }
+    }
+
+    /// Keyboard focus reached the surface (by traversal, not by a click): tell the view
+    /// to focus its first stop, or its last if the traversal was backward (Shift held).
+    fn focus_gained(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.focus_by_pointer) {
+            return;
+        }
+        if let Some(view) = &self.view {
+            view.focus_entered(window.modifiers().shift, cx);
         }
     }
 
@@ -123,7 +141,10 @@ impl Surface {
     fn wire_mouse<E: StatefulInteractiveElement>(&self, element: E, cx: &mut Context<Self>) -> E {
         element
             .on_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                window.focus(&this.focus_handle, cx);
+                if !this.focus_handle.is_focused(window) {
+                    this.focus_by_pointer = true;
+                    window.focus(&this.focus_handle, cx);
+                }
                 this.forward_mouse(PlatformInput::MouseDown(event.clone()), cx);
             }))
             .on_mouse_up(
@@ -370,6 +391,13 @@ impl Render for Surface {
                     prepaint_entity.update(cx, |this, cx| {
                         this.last_origin = bounds.origin;
                         this.measured(bounds, window, cx);
+                        if this.focus_in.is_none() {
+                            let handle = this.focus_handle.clone();
+                            this.focus_in =
+                                Some(cx.on_focus_in(&handle, window, |this, window, cx| {
+                                    this.focus_gained(window, cx)
+                                }));
+                        }
                     });
                     bounds
                 },

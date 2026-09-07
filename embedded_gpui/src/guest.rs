@@ -223,6 +223,13 @@ impl ViewApi for GuestView {
             input: event.to_platform_input(),
         });
     }
+
+    fn focus_entered(&mut self, backward: bool, _cx: &mut Context<Self>) {
+        self.platform.push_event(SurfaceEvent::FocusEntered {
+            surface: self.surface,
+            backward,
+        });
+    }
 }
 
 /// Draw `view` on a host surface. The view object is shared and attached to the surface;

@@ -173,7 +173,7 @@ impl TestPlugin for Root {
             text: String::new(),
             selection: 0..0,
             marked: None,
-            focus_handle: cx.focus_handle(),
+            focus_handle: cx.focus_handle().tab_stop(true),
         });
         weak_probe
             .update(cx, |probe, _| probe.view = Some(view.downgrade()))

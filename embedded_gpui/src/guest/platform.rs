@@ -45,8 +45,19 @@ struct Placement {
 
 /// One host-driven event for a surface's view, applied by the pump.
 pub enum SurfaceEvent {
-    Resize { surface: u64, geometry: Geometry },
-    Input { surface: u64, input: PlatformInput },
+    Resize {
+        surface: u64,
+        geometry: Geometry,
+    },
+    Input {
+        surface: u64,
+        input: PlatformInput,
+    },
+    /// The host's Tab traversal entered the surface: focus its first (or last) stop.
+    FocusEntered {
+        surface: u64,
+        backward: bool,
+    },
 }
 
 /// The root view of a guest window. Nothing is drawn at the window level; every visible
@@ -205,17 +216,51 @@ impl PluginPlatform {
         match query {
             wit::InputQuery::KeyDown(key_down) => {
                 self.last_input_surface.set(Some(surface));
+                let key_down_keystroke = keystroke_from_wire(key_down.keystroke);
                 let input = PlatformInput::KeyDown(gpui::KeyDownEvent {
-                    keystroke: keystroke_from_wire(key_down.keystroke),
+                    keystroke: key_down_keystroke.clone(),
                     is_held: key_down.is_held,
                     prefer_character_input: false,
                 });
-                match window.dispatch_input(input) {
-                    Some(result) => {
-                        wit::InputAnswer::Handled(!result.propagate || result.default_prevented)
-                    }
-                    None => wit::InputAnswer::None,
+                let handled = match window.dispatch_input(input) {
+                    Some(result) => !result.propagate || result.default_prevented,
+                    None => return wit::InputAnswer::None,
+                };
+                if handled {
+                    return wit::InputAnswer::Handled(true);
                 }
+                // Tab traversal, when the view left the key alone: move within the
+                // window's tab order, or, at its edge, let go of focus and hand the key
+                // back so the host's traversal continues past the surface.
+                let keystroke = &key_down_keystroke;
+                let plain_tab = keystroke.key == "tab"
+                    && !keystroke.modifiers.control
+                    && !keystroke.modifiers.alt
+                    && !keystroke.modifiers.platform;
+                if !plain_tab {
+                    return wit::InputAnswer::Handled(false);
+                }
+                let backward = keystroke.modifiers.shift;
+                let Some(handle) = window.handle() else {
+                    return wit::InputAnswer::Handled(false);
+                };
+                async_app.update(|cx| {
+                    handle
+                        .update(cx, |_, window, cx| {
+                            if window.focus_at_tab_edge(backward) {
+                                window.blur(cx);
+                                wit::InputAnswer::Handled(false)
+                            } else {
+                                if backward {
+                                    window.focus_prev(cx);
+                                } else {
+                                    window.focus_next(cx);
+                                }
+                                wit::InputAnswer::Handled(true)
+                            }
+                        })
+                        .unwrap_or(wit::InputAnswer::Handled(false))
+                })
             }
             // Two answers need the window itself, not just the handler.
             wit::InputQuery::TextInputConfiguration | wit::InputQuery::AcceptsTextInput => {
@@ -442,6 +487,9 @@ impl PluginPlatform {
                     }
                 }
                 SurfaceEvent::Input { surface, input } => self.dispatch_input(surface, input),
+                SurfaceEvent::FocusEntered { surface, backward } => {
+                    self.focus_entered(surface, backward, async_app)
+                }
             }
         }
     }
@@ -498,6 +546,36 @@ impl PluginPlatform {
             });
         }
         Ok(())
+    }
+
+    /// Focus the first (or last) tab stop of the window the surface is in, from nothing:
+    /// entering a region by keyboard starts at its edge, as it does in the host.
+    fn focus_entered(&self, surface: u64, backward: bool, async_app: &mut AsyncApp) {
+        let Some(handle) = self.window_of(surface).and_then(|window| window.handle()) else {
+            return;
+        };
+        self.last_input_surface.set(Some(surface));
+        async_app.update(|cx| {
+            handle
+                .update(cx, |_, window, cx| {
+                    window.blur(cx);
+                    if backward {
+                        window.focus_prev(cx);
+                    } else {
+                        window.focus_next(cx);
+                    }
+                })
+                .ok();
+        });
+    }
+
+    fn window_of(&self, surface: u64) -> Option<Rc<PluginWindowState>> {
+        let placed = self
+            .views
+            .borrow()
+            .get(&surface)
+            .and_then(|view| view.placed)?;
+        self.window(placed.window)
     }
 
     /// Dispatch a host-forwarded input event (slot-relative) into the window the surface

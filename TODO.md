@@ -27,6 +27,10 @@ Views are `SurfaceApi`/`ViewApi` objects; see `DESIGN.md`. What remains:
   sub-components.
 - [x] **Display-list limits** and a stopped state shown on every surface (DESIGN
   invariant 13).
+- [x] **Focus traversal** across the boundary (DESIGN invariant 14). Open: a host that
+  does not do Tab traversal itself (GPUI core has no default binding) leaves the key
+  unhandled and the surface focused, so the next Tab re-enters the view at its first
+  stop — harmless, but a host that wants traversal binds Tab as the demo does.
 - [ ] **Moving a surface between host windows** moves its root between mirrors; focus
   inside it is lost on the way. Fine for a drag between windows; worth a test.
 - [ ] **Host-side retained replay**: the host `Surface` still replays its display list

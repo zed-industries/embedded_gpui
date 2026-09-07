@@ -376,6 +376,20 @@ impl Render for DemoView {
             .p_4()
             .bg(rgb(0x1e1e1e))
             .text_color(rgb(0xffffff))
+            // Tab traversal for the whole demo window. A plugin surface is a tab stop
+            // like any other, and a Tab the plugin leaves alone at the edge of its own
+            // tab order arrives here, so focus moves on past the surface.
+            .on_key_down(|event: &gpui::KeyDownEvent, window, cx| {
+                let keystroke = &event.keystroke;
+                if keystroke.key == "tab" && !keystroke.modifiers.platform {
+                    if keystroke.modifiers.shift {
+                        window.focus_prev(cx);
+                    } else {
+                        window.focus_next(cx);
+                    }
+                    cx.stop_propagation();
+                }
+            })
             .child(
                 div()
                     .flex()

@@ -42,6 +42,13 @@ pub trait ViewApi {
     fn mouse(&mut self, event: MouseEvent, cx: &mut gpui::Context<Self>);
 
     fn key(&mut self, event: KeyEvent, cx: &mut gpui::Context<Self>);
+
+    /// Keyboard focus moved into the surface from outside (the host's Tab traversal
+    /// reached it): focus the view's first tab stop, or its last when `backward`. The
+    /// other direction needs no method: a Tab the view does not consume at the edge of
+    /// its tab order comes back unhandled from the key-down query, and the host's own
+    /// traversal continues past the surface.
+    fn focus_entered(&mut self, backward: bool, cx: &mut gpui::Context<Self>);
 }
 
 /// Where a surface's slot is: its bounds in a host window, and that window. The guest

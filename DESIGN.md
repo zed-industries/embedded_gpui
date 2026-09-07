@@ -220,6 +220,16 @@ the rule for it is the same as for every plugin: events and notifies, not animat
    plugin over a cap stops, like one that trapped: in-flight calls fail, its worker and
    store are dropped, `PluginHost::stopped` says why, and every `Surface` it drew on
    shows the reason in place of its scene.
+14. **Focus traversal crosses the boundary in both directions.** A host `Surface` is a
+   tab stop of the host's. Leaving: a Tab the view does not consume is handled by the
+   guest platform as traversal within the view's window, except at the edge of its tab
+   order (`Window::focus_at_tab_edge`), where the guest lets go of focus and answers the
+   key-down query `handled: false`, so the host's own traversal continues past the
+   surface. Entering: when the host's traversal focuses a surface (a focus-in that no
+   click caused), the host calls `ViewApi::focus_entered(backward)` and the guest
+   focuses the view's first stop, or its last. No new output type was needed: the key
+   precedence answer already says "not mine", and entering is one more method on the
+   view.
 9. **Scheduling**: the guest dispatcher queues runnables/timers locally. Every `tick`
    drains due work, pumps the window's `request_frame` callback (GPUI decides whether it
    is dirty), ships the changed roots' scenes into the turn's `scenes`, and reports the

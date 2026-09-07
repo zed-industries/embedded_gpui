@@ -926,6 +926,112 @@ async fn test_clipboard_is_an_object_the_host_hands_out(cx: &mut TestAppContext)
     assert_eq!(on_host.as_deref(), Some("from the guest"));
 }
 
+/// Tab traversal crosses the boundary in both directions: a Tab the view leaves alone at
+/// the edge of its tab order comes back unhandled (and the guest lets go of focus), so
+/// the host's traversal continues; entering by keyboard focuses the view's first stop.
+#[gpui::test]
+async fn test_focus_traversal_leaves_and_enters_a_surface(cx: &mut TestAppContext) {
+    let host = setup(cx);
+    let surface = cx.new(Surface::new);
+    let root = cx.update(|cx| host.root::<TestPlugin>(cx));
+    let probe = cx.update(|cx| root.mount(host.share(&surface, cx), cx));
+    settle(cx);
+    let probe = probe.await.expect("mount");
+    let view = surface
+        .read_with(cx, |surface, _| surface.view().cloned())
+        .expect("the guest attached a view");
+    cx.update(|cx| {
+        view.resize(
+            Geometry {
+                x: 0.,
+                y: 0.,
+                width: 200.,
+                height: 100.,
+                window: HostWindow {
+                    id: 1,
+                    width: 640.,
+                    height: 480.,
+                    scale_factor: 1.,
+                    active: true,
+                    appearance: Appearance::Dark,
+                },
+            },
+            cx,
+        )
+    });
+    settle(cx);
+    cx.update(|cx| probe.focus(cx));
+    settle(cx);
+    let queries = host
+        .read_with(cx, |host, _| host.registry().extension::<InputQueries>())
+        .expect("query channel");
+    let view_id = view.reference().entity_id();
+    let key = |key: &str, shift: bool| {
+        InputQuery::KeyDown(KeyDownQuery {
+            keystroke: WireKeystroke {
+                modifiers: WireModifiers {
+                    control: false,
+                    alt: false,
+                    shift,
+                    platform: false,
+                    function: false,
+                },
+                key: key.into(),
+                key_char: None,
+            },
+            is_held: false,
+        })
+    };
+    let ask = |cx: &mut TestAppContext, query| {
+        let pending = queries.send(view_id, query);
+        settle(cx);
+        pending.try_take().expect("the guest answered")
+    };
+    let handled_keys = |cx: &mut TestAppContext| {
+        let handled = cx.update(|cx| probe.handled_keys(cx));
+        settle(cx);
+        handled
+    };
+
+    // Focused, the view's root handles "enter".
+    assert!(matches!(
+        ask(cx, key("enter", false)),
+        InputAnswer::Handled(true)
+    ));
+    assert_eq!(handled_keys(cx).await.expect("count"), 1);
+    // The probe is the only tab stop, so Tab is at the edge: it comes back unhandled and
+    // the guest lets go of focus, which is why the next "enter" is not handled.
+    assert!(matches!(
+        ask(cx, key("tab", false)),
+        InputAnswer::Handled(false)
+    ));
+    assert!(matches!(
+        ask(cx, key("enter", false)),
+        InputAnswer::Handled(false)
+    ));
+    assert_eq!(handled_keys(cx).await.expect("count"), 1);
+    // The host's traversal comes back in: the view's first stop is focused again.
+    cx.update(|cx| view.focus_entered(false, cx));
+    settle(cx);
+    assert!(matches!(
+        ask(cx, key("enter", false)),
+        InputAnswer::Handled(true)
+    ));
+    assert_eq!(handled_keys(cx).await.expect("count"), 2);
+    // Backward works the same way, from the other edge.
+    assert!(matches!(
+        ask(cx, key("tab", true)),
+        InputAnswer::Handled(false)
+    ));
+    cx.update(|cx| view.focus_entered(true, cx));
+    settle(cx);
+    assert!(matches!(
+        ask(cx, key("enter", false)),
+        InputAnswer::Handled(true)
+    ));
+    assert_eq!(handled_keys(cx).await.expect("count"), 3);
+}
+
 #[gpui::test]
 async fn test_reattaching_a_surface_replaces_its_view(cx: &mut TestAppContext) {
     let host = setup(cx);

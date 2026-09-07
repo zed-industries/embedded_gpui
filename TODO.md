@@ -13,16 +13,15 @@ Views are `SurfaceApi`/`ViewApi` objects; see `DESIGN.md`. What remains:
   a node-engine node), and only roots whose node was redrawn ship a display list
   (`Window::take_root_scene`). Scale factor is per window, as it should be.
 - [x] **Overlays**: deferred draws, tooltips, drag previews and prompts ship as a
-  second display list per surface and are painted above the host window, with an
-  occluding hitbox forwarding input. Open: a size cap; and the hitbox is the
-  primitives' union bounds, so a transparent margin around a popover eats clicks.
+  second display list per surface and are painted above the host window, with the
+  guest's hit regions as input regions. Open: a size cap.
 - [x] **Window state mirroring**: `HostWindow` carries id, viewport, scale factor,
   active state and appearance; the mirror reports them to GPUI as a platform would.
   Modifiers and hover come from the events themselves.
-- [ ] **IME / marked text** stays open (see Platform completeness): composition needs
-  synchronous answers from the focused input handler, which the turn model cannot give
-  mid-call. A mirrored input-handler snapshot (selection, marked range, text around the
-  caret) shipped with each frame would let the host answer from cache.
+- [x] **IME / marked text and key precedence**: a synchronous `input-query` export
+  (see DESIGN invariant 11). Open: `text_length_utf16`/`set_selected_text_range` and
+  the text-input configuration are not relayed yet; and the wait is on the UI thread,
+  so a plugin mid-turn delays a keystroke by up to the turn budget.
 - [ ] **Moving a surface between host windows** moves its root between mirrors; focus
   inside it is lost on the way. Fine for a drag between windows; worth a test.
 - [ ] **Host-side retained replay**: the host `Surface` still replays its display list
@@ -111,9 +110,8 @@ Views are `SurfaceApi`/`ViewApi` objects; see `DESIGN.md`. What remains:
 - [x] **Resource limits**: per-turn epoch deadline and memory cap (`PluginOptions`);
   a trapped plugin stops and in-flight calls fail. Still open: a display-list size
   cap at scene submission, and a UI for the host to show a stopped plugin.
-- [ ] **IME / marked text**: guests currently synthesize printable keys through
-  `replace_text_in_range` (Linux-backend style). Dead keys and CJK composition
-  need the host to proxy its `PlatformInputHandler` into the guest.
+- [x] **IME / marked text**: the host's `Surface` is an `EntityInputHandler` whose
+  answers come from the guest over the synchronous `input-query` export.
 - [ ] **Rendering completeness**: gradient backgrounds (solid fallback today),
   video `Surface` primitives, sprite transformation matrices, inset shadows.
 - [ ] **Atlas hygiene**: image/SVG payloads are cached per instance and never

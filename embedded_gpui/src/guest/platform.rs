@@ -3,6 +3,7 @@ use crate::guest::objects;
 use crate::surface::{Cursor, Geometry, HostWindow, SurfaceApi};
 use crate::text_system::PluginTextSystem;
 use crate::window::{PluginWindow, PluginWindowState, serialize_scene};
+use crate::wit;
 use anyhow::{Result, anyhow};
 use embedded_gpui::Remote;
 use futures::channel::oneshot;
@@ -73,6 +74,9 @@ pub struct PluginPlatform {
     pending_window: Cell<Option<HostWindow>>,
     /// Views with a surface, keyed by surface object id.
     views: RefCell<HashMap<u64, SurfaceView>>,
+    /// The surface each shared view object (`ViewApi` id) draws on: how a query
+    /// addressed to a view finds its window.
+    view_objects: RefCell<HashMap<u64, u64>>,
     next_generation: Cell<u64>,
     /// Geometry and input the host delivered this turn. `ViewApi` handlers run inside
     /// the registry's `App` borrow, and GPUI's window callbacks re-enter the app, so the
@@ -98,6 +102,7 @@ impl PluginPlatform {
             windows: RefCell::new(HashMap::new()),
             pending_window: Cell::new(None),
             views: RefCell::new(HashMap::new()),
+            view_objects: RefCell::new(HashMap::new()),
             next_generation: Cell::new(0),
             pending_events: RefCell::new(Vec::new()),
             last_input_surface: Cell::new(None),
@@ -130,6 +135,123 @@ impl PluginPlatform {
             },
         );
         generation
+    }
+
+    /// Record that the shared view object `view` draws on `surface`.
+    pub fn bind_view_object(&self, view: u64, surface: u64) {
+        self.view_objects.borrow_mut().insert(view, surface);
+    }
+
+    pub fn unbind_view_object(&self, view: u64) {
+        self.view_objects.borrow_mut().remove(&view);
+    }
+
+    /// Answer a synchronous text-input query addressed to the view object `view`: a
+    /// key-down dispatched through its window (answering whether the guest consumed it),
+    /// or a question for the window's focused text field. Runs between turns, outside
+    /// any `App` borrow.
+    pub fn input_query(&self, view: u64, query: wit::InputQuery) -> wit::InputAnswer {
+        let Some(surface) = self.view_objects.borrow().get(&view).copied() else {
+            return wit::InputAnswer::None;
+        };
+        let Some(placed) = self
+            .views
+            .borrow()
+            .get(&surface)
+            .and_then(|view| view.placed)
+        else {
+            return wit::InputAnswer::None;
+        };
+        let Some(window) = self.window(placed.window) else {
+            return wit::InputAnswer::None;
+        };
+        let origin = placed.origin;
+        match query {
+            wit::InputQuery::KeyDown(key_down) => {
+                self.last_input_surface.set(Some(surface));
+                let input = PlatformInput::KeyDown(gpui::KeyDownEvent {
+                    keystroke: keystroke_from_wire(key_down.keystroke),
+                    is_held: key_down.is_held,
+                    prefer_character_input: false,
+                });
+                match window.dispatch_input(input) {
+                    Some(result) => {
+                        wit::InputAnswer::Handled(!result.propagate || result.default_prevented)
+                    }
+                    None => wit::InputAnswer::None,
+                }
+            }
+            query => window
+                .with_input_handler(|handler| match query {
+                    wit::InputQuery::KeyDown(_) => wit::InputAnswer::None,
+                    wit::InputQuery::SelectedTextRange(ignore_disabled_input) => handler
+                        .selected_text_range(ignore_disabled_input)
+                        .map_or(wit::InputAnswer::None, |selection| {
+                            wit::InputAnswer::Selection(wit::Utf16Selection {
+                                range: wire_range(selection.range),
+                                reversed: selection.reversed,
+                            })
+                        }),
+                    wit::InputQuery::MarkedTextRange => handler
+                        .marked_text_range()
+                        .map_or(wit::InputAnswer::None, |range| {
+                            wit::InputAnswer::Range(wire_range(range))
+                        }),
+                    wit::InputQuery::TextForRange(range) => {
+                        let mut adjusted = None;
+                        handler
+                            .text_for_range(range_from_wire(range), &mut adjusted)
+                            .map_or(wit::InputAnswer::None, |text| {
+                                wit::InputAnswer::Text(wit::TextForRange {
+                                    text,
+                                    adjusted: adjusted.map(wire_range),
+                                })
+                            })
+                    }
+                    wit::InputQuery::ReplaceTextInRange(replace) => {
+                        handler.replace_text_in_range(
+                            replace.range.map(range_from_wire),
+                            &replace.text,
+                        );
+                        wit::InputAnswer::Done
+                    }
+                    wit::InputQuery::ReplaceAndMarkTextInRange(replace) => {
+                        handler.replace_and_mark_text_in_range(
+                            replace.range.map(range_from_wire),
+                            &replace.text,
+                            replace.new_selected_range.map(range_from_wire),
+                        );
+                        wit::InputAnswer::Done
+                    }
+                    wit::InputQuery::UnmarkText => {
+                        handler.unmark_text();
+                        wit::InputAnswer::Done
+                    }
+                    wit::InputQuery::BoundsForRange(range) => handler
+                        .bounds_for_range(range_from_wire(range))
+                        .map_or(wit::InputAnswer::None, |bounds| {
+                            wit::InputAnswer::Bounds(wit::Bounds {
+                                origin: wit::Point {
+                                    x: f32::from(bounds.origin.x - origin.x),
+                                    y: f32::from(bounds.origin.y - origin.y),
+                                },
+                                size: wit::Extent {
+                                    width: f32::from(bounds.size.width),
+                                    height: f32::from(bounds.size.height),
+                                },
+                            })
+                        }),
+                    wit::InputQuery::CharacterIndexForPoint(point) => handler
+                        .character_index_for_point(gpui::point(
+                            px(point.x) + origin.x,
+                            px(point.y) + origin.y,
+                        ))
+                        .map_or(wit::InputAnswer::None, |index| {
+                            wit::InputAnswer::Index(index as u32)
+                        }),
+                })
+                .unwrap_or(wit::InputAnswer::None),
+        }
     }
 
     /// Stop drawing on `surface`, if `generation` is still the registration drawing there.
@@ -354,7 +476,25 @@ impl PluginPlatform {
                         if let Some(scene) =
                             gpui_window.take_root_overlay_scene(placed.root, include_unowned)
                         {
-                            let list = serialize_scene(&scene, scale_factor, placed.origin, &atlas);
+                            let mut list =
+                                serialize_scene(&scene, scale_factor, placed.origin, &atlas);
+                            list.hit_regions = gpui_window
+                                .root_overlay_hit_regions(placed.root, include_unowned)
+                                .into_iter()
+                                .map(|(bounds, behavior)| wit::HitRegion {
+                                    bounds: wit::Bounds {
+                                        origin: wit::Point {
+                                            x: f32::from(bounds.origin.x - placed.origin.x),
+                                            y: f32::from(bounds.origin.y - placed.origin.y),
+                                        },
+                                        size: wit::Extent {
+                                            width: f32::from(bounds.size.width),
+                                            height: f32::from(bounds.size.height),
+                                        },
+                                    },
+                                    block_mouse: behavior != gpui::HitboxBehavior::Normal,
+                                })
+                                .collect();
                             objects::push_overlay(*surface, list);
                         }
                     }
@@ -592,4 +732,29 @@ impl PlatformDisplay for PluginDisplay {
             size: size(px(8192.), px(8192.)),
         }
     }
+}
+
+fn keystroke_from_wire(keystroke: wit::Keystroke) -> gpui::Keystroke {
+    gpui::Keystroke {
+        modifiers: gpui::Modifiers {
+            control: keystroke.modifiers.control,
+            alt: keystroke.modifiers.alt,
+            shift: keystroke.modifiers.shift,
+            platform: keystroke.modifiers.platform,
+            function: keystroke.modifiers.function,
+        },
+        key: keystroke.key,
+        key_char: keystroke.key_char,
+    }
+}
+
+fn wire_range(range: std::ops::Range<usize>) -> wit::TextRange {
+    wit::TextRange {
+        start: range.start as u32,
+        end: range.end as u32,
+    }
+}
+
+fn range_from_wire(range: wit::TextRange) -> std::ops::Range<usize> {
+    range.start as usize..range.end as usize
 }

@@ -18,6 +18,10 @@ use embedded_gpui::surface::{
     ViewApiCaller as _,
 };
 use embedded_gpui::{
+    InputAnswer, InputQueries, InputQuery, KeyDownQuery, ReplaceAndMarkText, ReplaceText,
+    TextForRange, TextRange, Utf16Selection, WireKeystroke, WireModifiers,
+};
+use embedded_gpui::{
     Interface, Payload, PluginHost, PluginHostHandle as _, PluginInstance, PluginOptions, Ref,
     Remote, Surface, TypeSchema, decode, encode, shared,
 };
@@ -660,6 +664,119 @@ async fn test_views_are_objects(cx: &mut TestAppContext) {
     let alive = cx.update(|cx| probe.view_alive(cx));
     settle(cx);
     assert!(!alive.await.expect("alive"), "the view should be gone");
+}
+
+/// Text input is the one synchronous path into the guest: the host's IME asks the
+/// focused field questions mid-call, and key precedence must be known before the
+/// host's dispatch continues. Queries go to the worker like everything else; the test
+/// drives the worker between sending and reading, where a real host would block.
+#[gpui::test]
+async fn test_input_queries_reach_the_focused_field(cx: &mut TestAppContext) {
+    let host = setup(cx);
+    let surface = cx.new(Surface::new);
+    let root = cx.update(|cx| host.root::<TestPlugin>(cx));
+    let probe = cx.update(|cx| root.mount(host.share(&surface, cx), cx));
+    settle(cx);
+    let probe = probe.await.expect("mount");
+    let view = surface
+        .read_with(cx, |surface, _| surface.view().cloned())
+        .expect("the guest attached a view");
+    cx.update(|cx| {
+        view.resize(
+            Geometry {
+                x: 10.,
+                y: 20.,
+                width: 200.,
+                height: 100.,
+                window: HostWindow {
+                    id: 1,
+                    width: 640.,
+                    height: 480.,
+                    scale_factor: 1.,
+                    active: true,
+                    appearance: Appearance::Dark,
+                },
+            },
+            cx,
+        )
+    });
+    settle(cx);
+    cx.update(|cx| probe.focus(cx));
+    settle(cx);
+
+    let queries = host
+        .read_with(cx, |host, _| host.registry().extension::<InputQueries>())
+        .expect("the host installs its query channel");
+    let view_id = view.reference().entity_id();
+    let ask = |cx: &mut TestAppContext, query| {
+        let pending = queries.send(view_id, query);
+        settle(cx);
+        pending.try_take().expect("the guest answered")
+    };
+
+    // The IME types through the surface as through a text field.
+    assert!(matches!(
+        ask(
+            cx,
+            InputQuery::ReplaceTextInRange(ReplaceText {
+                range: None,
+                text: "héllo".into()
+            })
+        ),
+        InputAnswer::Done
+    ));
+    let selection = ask(cx, InputQuery::SelectedTextRange(false));
+    assert!(matches!(
+        selection,
+        InputAnswer::Selection(Utf16Selection {
+            range: TextRange { start: 5, end: 5 },
+            ..
+        })
+    ));
+    let text = ask(cx, InputQuery::TextForRange(TextRange { start: 1, end: 5 }));
+    assert!(matches!(text, InputAnswer::Text(TextForRange { ref text, .. }) if text == "éllo"));
+    ask(
+        cx,
+        InputQuery::ReplaceAndMarkTextInRange(ReplaceAndMarkText {
+            range: Some(TextRange { start: 0, end: 5 }),
+            text: "ni".into(),
+            new_selected_range: None,
+        }),
+    );
+    assert!(matches!(
+        ask(cx, InputQuery::MarkedTextRange),
+        InputAnswer::Range(TextRange { start: 0, end: 2 })
+    ));
+    let seen = cx.update(|cx| probe.text(cx));
+    settle(cx);
+    assert_eq!(seen.await.expect("text"), "ni");
+    // Bounds come back slot-relative.
+    assert!(
+        matches!(ask(cx, InputQuery::BoundsForRange(TextRange { start: 0, end: 1 })), InputAnswer::Bounds(bounds) if bounds.origin.x == 0. && bounds.origin.y == 0.)
+    );
+
+    // Key precedence: the guest says whether it consumed the key.
+    let key = |key: &str| {
+        InputQuery::KeyDown(KeyDownQuery {
+            keystroke: WireKeystroke {
+                modifiers: WireModifiers {
+                    control: false,
+                    alt: false,
+                    shift: false,
+                    platform: false,
+                    function: false,
+                },
+                key: key.into(),
+                key_char: None,
+            },
+            is_held: false,
+        })
+    };
+    assert!(matches!(ask(cx, key("enter")), InputAnswer::Handled(true)));
+    assert!(matches!(ask(cx, key("x")), InputAnswer::Handled(false)));
+    let handled = cx.update(|cx| probe.handled_keys(cx));
+    settle(cx);
+    assert_eq!(handled.await.expect("handled keys"), 1);
 }
 
 #[gpui::test]

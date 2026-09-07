@@ -153,6 +153,9 @@ struct Inner {
     /// Projections whose last `Remote` dropped; drained into `release` frames.
     releases: Rc<RefCell<Vec<u64>>>,
     state: RefCell<State>,
+    /// Side channels the boundary installs beside the object model (the host's
+    /// synchronous input queries), found by type. The registry never reads them.
+    extensions: RefCell<HashMap<std::any::TypeId, Rc<dyn std::any::Any>>>,
 }
 
 /// A handle to one end's object registry. Clones share the registry; the boundary layer
@@ -197,8 +200,24 @@ impl Objects {
                 sink,
                 releases: Rc::default(),
                 state: RefCell::new(State::default()),
+                extensions: RefCell::new(HashMap::new()),
             }),
         }
+    }
+
+    /// Install a side channel reachable from every ref and remote of this registry.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub fn set_extension<T: 'static>(&self, value: Rc<T>) {
+        self.inner
+            .extensions
+            .borrow_mut()
+            .insert(std::any::TypeId::of::<T>(), value);
+    }
+
+    pub fn extension<T: 'static>(&self) -> Option<Rc<T>> {
+        let extensions = self.inner.extensions.borrow();
+        let value = extensions.get(&std::any::TypeId::of::<T>())?.clone();
+        value.downcast::<T>().ok()
     }
 
     /// Install `entity` as this end's root object (address 0). The other end reaches it

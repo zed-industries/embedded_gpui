@@ -551,6 +551,14 @@ impl Registry {
         }
     }
 
+    /// A side channel the boundary installed beside the object model, found by type
+    /// (the host installs its synchronous input queries this way). The object model
+    /// itself never uses these; they exist for the two things that cannot wait for a
+    /// turn.
+    pub fn extension<T: 'static>(&self) -> Option<std::rc::Rc<T>> {
+        self.0.upgrade()?.extension::<T>()
+    }
+
     /// Resolve an object id in this registry. Prefer [`Ref::connect`]; this is for
     /// forwarders that hold ids out of a ref table rather than typed refs.
     pub fn connect<S: Interface>(&self, id: u64) -> Remote<S> {

@@ -168,6 +168,8 @@ struct GuestView {
     platform: Rc<PluginPlatform>,
     surface: u64,
     generation: u64,
+    /// This view object's id, once shared; queries are addressed to it.
+    object: u64,
 }
 
 #[crate::shared]
@@ -216,15 +218,20 @@ pub fn open_view<V: Render + 'static>(
     let guest_view = cx.new(|cx| {
         cx.on_release(move |view: &mut GuestView, cx| {
             view.platform.remove_view(view.surface, view.generation, cx);
+            view.platform.unbind_view_object(view.object);
         })
         .detach();
         GuestView {
             platform: platform.clone(),
             surface: surface_id,
             generation,
+            object: 0,
         }
     });
     let view_ref = share(&guest_view, cx);
+    let object = view_ref.entity_id();
+    guest_view.update(cx, |view, _| view.object = object);
+    platform.bind_view_object(object, surface_id);
     surface.attach(view_ref, cx);
     Ok(())
 }
@@ -240,6 +247,13 @@ impl wit::Guest for Component {
         async_app.update(|cx| objects::deliver(inbound, cx));
         let wake_after_ms = pump(&platform, &mut async_app);
         objects::take_turn(wake_after_ms)
+    }
+
+    fn input_query(view: u64, query: wit::InputQuery) -> wit::InputAnswer {
+        let Some((_, platform)) = runtime_handles() else {
+            return wit::InputAnswer::None;
+        };
+        platform.input_query(view, query)
     }
 }
 

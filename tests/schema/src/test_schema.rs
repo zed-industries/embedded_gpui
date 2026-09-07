@@ -55,6 +55,12 @@ pub trait ViewProbeApi {
     fn last_geometry(&mut self, cx: &mut gpui::Context<Self>) -> Option<SeenGeometry>;
     /// Mouse-down events the view's root element received.
     fn clicks(&mut self, cx: &mut gpui::Context<Self>) -> u32;
+    /// Focus the view's text field, so the host's input queries reach it.
+    fn focus(&mut self, cx: &mut gpui::Context<Self>);
+    /// The text field's contents.
+    fn text(&mut self, cx: &mut gpui::Context<Self>) -> String;
+    /// Key-downs the view's root element handled (every "enter").
+    fn handled_keys(&mut self, cx: &mut gpui::Context<Self>) -> u32;
     /// Whether the window's root view still exists (it dies when the host drops the
     /// surface and the view is released).
     fn view_alive(&mut self, cx: &mut gpui::Context<Self>) -> bool;

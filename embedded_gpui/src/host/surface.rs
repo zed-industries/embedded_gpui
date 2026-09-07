@@ -3,21 +3,29 @@
 //! the guest (DESIGN.md invariant 1), and drives the attached `ViewApi` with resize and
 //! input as ordinary method calls.
 
+use std::ops::Range;
+use std::rc::Rc;
+
 use gpui::{
-    App, Bounds, BoxShadow, ContentMask, Context, Corners, Edges, FocusHandle, InteractiveElement,
-    IntoElement, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseButton, MouseDownEvent,
-    MouseExitEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, PlatformInput, Point, Render,
-    ScrollWheelEvent, UnderlineStyle, Window, canvas, deferred, div, point, prelude::*, px, size,
+    App, Bounds, BoxShadow, ContentMask, Context, Corners, Edges, ElementInputHandler,
+    EntityInputHandler, FocusHandle, IntoElement, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent,
+    MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels,
+    PlatformInput, Point, Render, ScrollWheelEvent, UTF16Selection, UnderlineStyle, Window, canvas,
+    deferred, div, point, prelude::*, px,
 };
 
+use crate::host::{
+    InputAnswer, InputQueries, InputQuery, KeyDownQuery, ReplaceAndMarkText, ReplaceText,
+    TextRange, WireKeystroke, WireModifiers,
+};
 use crate::surface::{
     Appearance, Cursor, Geometry, HostWindow, KeyEvent, MouseEvent, SurfaceApi, ViewApi,
     ViewApiCaller as _,
 };
+use crate::{PluginImages, Ref, Remote, bindings};
 
 /// Overlays are deferred above everything the host defers itself.
 const OVERLAY_PRIORITY: usize = 1 << 20;
-use crate::{PluginImages, Ref, Remote, bindings};
 
 /// A place pixels go: one slot in the host's element tree, as a GPUI entity.
 ///
@@ -33,12 +41,15 @@ pub struct Surface {
     view: Option<Remote<ViewApi>>,
     display_list: Option<(bindings::DisplayList, PluginImages)>,
     /// What the view drew outside its slot (popovers, tooltips, drag previews), painted
-    /// above the whole host window, with the slot-relative bounds it covers.
-    overlay: Option<(bindings::DisplayList, PluginImages, Bounds<Pixels>)>,
+    /// above the whole host window.
+    overlay: Option<(bindings::DisplayList, PluginImages)>,
     cursor: Option<gpui::CursorStyle>,
     geometry: Option<Geometry>,
     last_origin: Point<Pixels>,
     focus_handle: FocusHandle,
+    /// The synchronous channel into the plugin the view lives in: key precedence and
+    /// the IME's questions go through it (see [`InputQueries`]).
+    queries: Option<Rc<InputQueries>>,
 }
 
 impl Surface {
@@ -51,6 +62,18 @@ impl Surface {
             geometry: None,
             last_origin: Point::default(),
             focus_handle: cx.focus_handle(),
+            queries: None,
+        }
+    }
+
+    /// Ask the plugin something the host cannot wait a turn for. `None` when there is no
+    /// view, no channel, no focused text field on the guest, or no answer in time.
+    fn query(&self, query: InputQuery) -> Option<InputAnswer> {
+        let view = self.view.as_ref()?.reference().entity_id();
+        let answer = self.queries.as_ref()?.query(view, query)?;
+        match answer {
+            InputAnswer::None => None,
+            answer => Some(answer),
         }
     }
 
@@ -80,7 +103,7 @@ impl Surface {
         images: PluginImages,
         cx: &mut Context<Self>,
     ) {
-        self.overlay = list_bounds(&list).map(|bounds| (list, images, bounds));
+        self.overlay = (!list.primitives.is_empty()).then_some((list, images));
         cx.notify();
     }
 
@@ -156,6 +179,29 @@ impl Surface {
         }
     }
 
+    /// Key-downs are the one input that needs an answer: whether the guest consumed the
+    /// key decides whether the host platform turns it into text (through the IME path,
+    /// which lands in [`EntityInputHandler::replace_text_in_range`] below).
+    fn key_down(&self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let query = InputQuery::KeyDown(KeyDownQuery {
+            keystroke: WireKeystroke {
+                modifiers: WireModifiers {
+                    control: event.keystroke.modifiers.control,
+                    alt: event.keystroke.modifiers.alt,
+                    shift: event.keystroke.modifiers.shift,
+                    platform: event.keystroke.modifiers.platform,
+                    function: event.keystroke.modifiers.function,
+                },
+                key: event.keystroke.key.clone(),
+                key_char: event.keystroke.key_char.clone(),
+            },
+            is_held: event.is_held,
+        });
+        if let Some(InputAnswer::Handled(true)) = self.query(query) {
+            cx.stop_propagation();
+        }
+    }
+
     /// Record the slot's measured geometry — its bounds and the window it is in — and
     /// push it to the view if any of it changed.
     fn measured(&mut self, bounds: Bounds<Pixels>, window: &Window, cx: &mut Context<Self>) {
@@ -188,6 +234,7 @@ impl Surface {
 impl SurfaceApi for Surface {
     fn attach(&mut self, view: Ref<ViewApi>, cx: &mut Context<Self>) {
         let view = view.connect();
+        self.queries = view.registry().extension::<InputQueries>();
         // The view renders at the slot's real size from its first frame: the geometry
         // the slot was last measured at goes out before any input can.
         if let Some(geometry) = self.geometry {
@@ -209,7 +256,19 @@ impl Render for Surface {
         let prepaint_entity = cx.entity();
         let paint_entity = cx.entity();
         let overlay_entity = cx.entity();
-        let overlay_bounds = self.overlay.as_ref().map(|(_, _, bounds)| *bounds);
+        let focus_handle = self.focus_handle.clone();
+        let overlay_regions: Option<Vec<(Bounds<Pixels>, bool)>> =
+            self.overlay.as_ref().map(|(list, _)| {
+                list.hit_regions
+                    .iter()
+                    .map(|region| {
+                        (
+                            to_bounds(&region.bounds, Point::default()),
+                            region.block_mouse,
+                        )
+                    })
+                    .collect()
+            });
 
         let slot = div()
             .size_full()
@@ -217,7 +276,7 @@ impl Render for Surface {
             .track_focus(&self.focus_handle)
             .when_some(self.cursor, |this, cursor| this.cursor(cursor))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
-                this.forward_key(PlatformInput::KeyDown(event.clone()), cx);
+                this.key_down(event, cx);
             }))
             .on_key_up(cx.listener(|this, event: &KeyUpEvent, _window, cx| {
                 this.forward_key(PlatformInput::KeyUp(event.clone()), cx);
@@ -229,21 +288,22 @@ impl Render for Surface {
             ));
         let slot = self.wire_mouse(slot, cx);
 
-        let overlay = overlay_bounds.map(|bounds| {
-            let overlay = div()
-                .id(("embedded-overlay", cx.entity_id()))
+        let overlay = overlay_regions.map(|regions| {
+            // The overlay paints from a zero-sized anchor at the slot's origin, and one
+            // input region per guest hitbox sits where the overlay's elements are:
+            // clicks reach the view there and pass through to the host elsewhere.
+            let mut anchor = div()
                 .absolute()
-                .left(bounds.origin.x)
-                .top(bounds.origin.y)
-                .w(bounds.size.width)
-                .h(bounds.size.height)
-                .occlude()
+                .left(px(0.))
+                .top(px(0.))
+                .w(px(0.))
+                .h(px(0.))
                 .child(
                     canvas(
                         |_, _, _| (),
                         move |_: Bounds<Pixels>, _: (), window: &mut Window, cx: &mut App| {
                             let surface = overlay_entity.read(cx);
-                            if let Some((list, images, _)) = surface.overlay.as_ref() {
+                            if let Some((list, images)) = surface.overlay.as_ref() {
                                 let images = images.borrow();
                                 let clip = Bounds {
                                     origin: Point::default(),
@@ -253,9 +313,24 @@ impl Render for Surface {
                             }
                         },
                     )
-                    .size_full(),
+                    .absolute()
+                    .left(px(0.))
+                    .top(px(0.))
+                    .w(px(1.))
+                    .h(px(1.)),
                 );
-            deferred(self.wire_mouse(overlay, cx)).with_priority(OVERLAY_PRIORITY)
+            for (index, (bounds, block_mouse)) in regions.into_iter().enumerate() {
+                let region = div()
+                    .id(("embedded-overlay-region", index))
+                    .absolute()
+                    .left(bounds.origin.x)
+                    .top(bounds.origin.y)
+                    .w(bounds.size.width)
+                    .h(bounds.size.height)
+                    .when(block_mouse, |this| this.occlude());
+                anchor = anchor.child(self.wire_mouse(region, cx));
+            }
+            deferred(anchor).with_priority(OVERLAY_PRIORITY)
         });
 
         slot.child(
@@ -271,6 +346,13 @@ impl Render for Surface {
                       _: Bounds<Pixels>,
                       window: &mut Window,
                       cx: &mut App| {
+                    // The IME talks to this surface as it would to a text field; the
+                    // answers come from the guest's focused field over the query channel.
+                    window.handle_input(
+                        &focus_handle,
+                        ElementInputHandler::new(bounds, paint_entity.clone()),
+                        cx,
+                    );
                     let surface = paint_entity.read(cx);
                     if let Some((list, images)) = surface.display_list.as_ref() {
                         let images = images.borrow();
@@ -284,44 +366,123 @@ impl Render for Surface {
     }
 }
 
-/// The slot-relative bounds an overlay display list covers: where the host puts the
-/// hitbox that routes input over it to the view.
-fn list_bounds(list: &bindings::DisplayList) -> Option<Bounds<Pixels>> {
-    let mut union: Option<Bounds<Pixels>> = None;
-    let mut include = |bounds: Bounds<Pixels>| {
-        union = Some(match union {
-            Some(union) => union.union(&bounds),
-            None => bounds,
-        });
-    };
-    for placed in &list.primitives {
-        match &placed.prim {
-            bindings::Primitive::Quad(quad) => include(to_bounds(&quad.bounds, Point::default())),
-            bindings::Primitive::Shadow(shadow) => {
-                include(to_bounds(&shadow.bounds, Point::default()))
+fn wire_range(range: Range<usize>) -> TextRange {
+    TextRange {
+        start: range.start as u32,
+        end: range.end as u32,
+    }
+}
+
+fn range_from_wire(range: TextRange) -> Range<usize> {
+    range.start as usize..range.end as usize
+}
+
+/// The host's IME sees a surface as a text field; every question is relayed to the
+/// guest's focused field synchronously (see [`InputQueries`]).
+impl EntityInputHandler for Surface {
+    fn text_for_range(
+        &mut self,
+        range: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        match self.query(InputQuery::TextForRange(wire_range(range)))? {
+            InputAnswer::Text(answer) => {
+                *adjusted_range = answer.adjusted.map(range_from_wire);
+                Some(answer.text)
             }
-            bindings::Primitive::Image(image) => {
-                include(to_bounds(&image.bounds, Point::default()))
-            }
-            bindings::Primitive::Underline(underline) => include(Bounds {
-                origin: to_point(&underline.origin, Point::default()),
-                size: size(px(underline.width), px(underline.thickness)),
-            }),
-            bindings::Primitive::Glyph(glyph) => include(Bounds {
-                origin: point(px(glyph.origin.x), px(glyph.origin.y - glyph.font_size)),
-                size: size(px(glyph.font_size), px(glyph.font_size * 1.5)),
-            }),
-            bindings::Primitive::Path(path) => {
-                for vertex in &path.vertices {
-                    include(Bounds {
-                        origin: to_point(&vertex.xy, Point::default()),
-                        size: size(px(0.), px(0.)),
-                    });
-                }
-            }
+            _ => None,
         }
     }
-    union
+
+    fn selected_text_range(
+        &mut self,
+        ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        match self.query(InputQuery::SelectedTextRange(ignore_disabled_input))? {
+            InputAnswer::Selection(selection) => Some(UTF16Selection {
+                range: range_from_wire(selection.range),
+                reversed: selection.reversed,
+            }),
+            _ => None,
+        }
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        match self.query(InputQuery::MarkedTextRange)? {
+            InputAnswer::Range(range) => Some(range_from_wire(range)),
+            _ => None,
+        }
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.query(InputQuery::UnmarkText);
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        self.query(InputQuery::ReplaceTextInRange(ReplaceText {
+            range: range.map(wire_range),
+            text: text.to_string(),
+        }));
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range: Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        self.query(InputQuery::ReplaceAndMarkTextInRange(ReplaceAndMarkText {
+            range: range.map(wire_range),
+            text: new_text.to_string(),
+            new_selected_range: new_selected_range.map(wire_range),
+        }));
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        _element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        match self.query(InputQuery::BoundsForRange(wire_range(range_utf16)))? {
+            InputAnswer::Bounds(bounds) => Some(to_bounds(&bounds, self.last_origin)),
+            _ => None,
+        }
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let local = point - self.last_origin;
+        let query = InputQuery::CharacterIndexForPoint(bindings::Point {
+            x: f32::from(local.x),
+            y: f32::from(local.y),
+        });
+        match self.query(query)? {
+            InputAnswer::Index(index) => Some(index as usize),
+            _ => None,
+        }
+    }
 }
 
 /// Replay a guest display list into the host window. Coordinates on the wire are logical

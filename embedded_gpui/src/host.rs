@@ -33,6 +33,11 @@ use bindings::{Plugin, PluginImports};
 
 mod surface;
 
+pub use bindings::{
+    InputAnswer, InputQuery, KeyDown as KeyDownQuery, Keystroke as WireKeystroke,
+    Modifiers as WireModifiers, ReplaceAndMarkText, ReplaceText, TextForRange, TextRange,
+    Utf16Selection,
+};
 pub use surface::Surface;
 
 /// The data carried on the wasmtime `Store`: the WASI sandbox and the text system the
@@ -262,6 +267,7 @@ pub struct PluginInstance {
     bindings: Plugin,
     /// Epoch ticks a single guest turn may take before it traps.
     turn_deadline_ticks: u64,
+    turn_budget: Duration,
     /// Stops the epoch ticker thread when the instance drops.
     ticker_alive: Arc<AtomicBool>,
 }
@@ -405,6 +411,7 @@ impl PluginInstance {
             store,
             bindings,
             turn_deadline_ticks,
+            turn_budget: options.turn_budget,
             ticker_alive,
         })
     }
@@ -420,6 +427,12 @@ impl PluginInstance {
     pub fn tick(&mut self, inbound: Vec<bindings::Frame>) -> Result<bindings::Turn> {
         self.store.set_epoch_deadline(self.turn_deadline_ticks);
         self.bindings.call_tick(&mut self.store, &inbound)
+    }
+
+    /// A synchronous text-input query, between turns, under the turn budget.
+    pub fn input_query(&mut self, view: u64, query: &InputQuery) -> Result<InputAnswer> {
+        self.store.set_epoch_deadline(self.turn_deadline_ticks);
+        self.bindings.call_input_query(&mut self.store, view, query)
     }
 }
 
@@ -484,6 +497,80 @@ pub type PluginImages = Rc<RefCell<HashMap<u64, Arc<gpui::RenderImage>>>>;
 enum PluginRequest {
     Init,
     Tick(Vec<bindings::Frame>),
+    /// A synchronous query the UI thread is waiting on (see [`InputQueries`]).
+    Query {
+        view: u64,
+        query: InputQuery,
+        reply: std::sync::mpsc::SyncSender<Result<InputAnswer, String>>,
+    },
+}
+
+/// The host's synchronous channel into a plugin: the one place the UI thread calls the
+/// guest and waits. An IME asks the focused text field questions mid-call, and key
+/// precedence (did the guest consume this keystroke, or should it become text) must be
+/// known before the host's own dispatch continues; neither can wait for a turn. The
+/// wait is bounded by the turn budget: a guest that does not answer in time is treated
+/// as having no text field, and a stopped guest answers nothing.
+///
+/// Installed as the plugin registry's extension, so a [`Surface`] finds it through the
+/// view object it holds (`view.registry().extension::<InputQueries>()`).
+pub struct InputQueries {
+    requests: mpsc::UnboundedSender<PluginRequest>,
+    timeout: Duration,
+}
+
+/// The answer to a query sent with [`InputQueries::send`], arriving on the worker's
+/// schedule.
+pub struct PendingAnswer(std::sync::mpsc::Receiver<Result<InputAnswer, String>>);
+
+impl PendingAnswer {
+    /// The answer, if it has arrived.
+    pub fn try_take(&self) -> Option<InputAnswer> {
+        Self::unwrap(self.0.try_recv().ok())
+    }
+
+    fn wait(&self, timeout: Duration) -> Option<InputAnswer> {
+        Self::unwrap(self.0.recv_timeout(timeout).ok())
+    }
+
+    fn unwrap(result: Option<Result<InputAnswer, String>>) -> Option<InputAnswer> {
+        match result {
+            Some(Ok(answer)) => Some(answer),
+            Some(Err(error)) => {
+                log::error!("embedded_gpui: input query failed: {error}");
+                None
+            }
+            None => None,
+        }
+    }
+}
+
+impl InputQueries {
+    /// Queue a query without waiting; the guest is ticked right after, so whatever the
+    /// query changed gets rendered.
+    pub fn send(&self, view: u64, query: InputQuery) -> PendingAnswer {
+        let (reply, answer) = std::sync::mpsc::sync_channel(1);
+        if self
+            .requests
+            .unbounded_send(PluginRequest::Query { view, query, reply })
+            .is_ok()
+        {
+            self.requests
+                .unbounded_send(PluginRequest::Tick(Vec::new()))
+                .ok();
+        }
+        PendingAnswer(answer)
+    }
+
+    /// Send a query and wait for its answer, at most the turn budget.
+    pub fn query(&self, view: u64, query: InputQuery) -> Option<InputAnswer> {
+        let pending = self.send(view, query);
+        let answer = pending.wait(self.timeout);
+        if answer.is_none() {
+            log::warn!("embedded_gpui: input query unanswered within the turn budget");
+        }
+        answer
+    }
 }
 
 /// A GPUI entity that owns a plugin's wasmtime store (on a worker) and mediates between
@@ -508,24 +595,49 @@ impl PluginHost {
     /// worker, strictly one at a time, and their output is applied back on the
     /// foreground in the same order.
     pub fn new(mut instance: PluginInstance, cx: &mut Context<Self>) -> Self {
+        let turn_budget = instance.turn_budget;
         let (requests, mut request_rx) = mpsc::unbounded::<PluginRequest>();
         let (turns_tx, mut turns_rx) = mpsc::unbounded::<Result<bindings::Turn, String>>();
 
         let worker = cx.background_spawn(async move {
             while let Some(request) = request_rx.next().await {
+                let mut deferred = Vec::new();
                 let turn = match request {
                     PluginRequest::Init => instance.init(),
                     PluginRequest::Tick(mut inbound) => {
                         // Everything already queued rides the same turn: one boundary
                         // crossing per burst, and the FIFO is preserved by construction.
                         // `Init` is always the first request, so nothing else can be
-                        // queued behind a tick.
-                        while let Ok(PluginRequest::Tick(more)) = request_rx.try_recv() {
-                            inbound.extend(more);
+                        // queued behind a tick. A query queued behind the ticks runs
+                        // after them, in order.
+                        loop {
+                            match request_rx.try_recv() {
+                                Ok(PluginRequest::Tick(more)) => inbound.extend(more),
+                                Ok(other) => {
+                                    deferred.push(other);
+                                    break;
+                                }
+                                Err(_) => break,
+                            }
                         }
                         instance.tick(inbound)
                     }
+                    PluginRequest::Query { view, query, reply } => {
+                        let answer = instance
+                            .input_query(view, &query)
+                            .map_err(|error| format!("{error:#}"));
+                        reply.send(answer).ok();
+                        continue;
+                    }
                 };
+                for request in deferred {
+                    if let PluginRequest::Query { view, query, reply } = request {
+                        let answer = instance
+                            .input_query(view, &query)
+                            .map_err(|error| format!("{error:#}"));
+                        reply.send(answer).ok();
+                    }
+                }
                 match turn {
                     Ok(turn) => {
                         if turns_tx.unbounded_send(Ok(turn)).is_err() {
@@ -551,6 +663,10 @@ impl PluginHost {
             if sink.unbounded_send(request).is_err() {
                 log::error!("embedded_gpui: plugin worker is gone; dropping frame");
             }
+        }));
+        objects.set_extension(Rc::new(InputQueries {
+            requests: requests.clone(),
+            timeout: turn_budget,
         }));
 
         // Object traffic is applied straight to the registry, *outside* any update of

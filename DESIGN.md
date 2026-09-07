@@ -153,8 +153,8 @@ the rule for it is the same as for every plugin: events and notifies, not animat
    the last event it saw. The guest translates them into the window mirror (below) and
    lets GPUI's own dispatch do hit-testing and run listeners; no callback registry
    crosses the boundary. Cursor styles flow back as `set_cursor` on the host-homed
-   `SurfaceApi`. Still one-way: IME composition (marked text) needs synchronous answers
-   from the guest and is not proxied. Because
+   `SurfaceApi`. Key-downs and IME composition need answers and take the synchronous
+   path (invariant 11). Because
    `ViewApi` handlers run inside the registry's `App` borrow and GPUI's window callbacks
    re-enter the app, the view queues events on the window and the pump applies them
    once the borrow is released — same turn, same order.
@@ -182,13 +182,29 @@ the rule for it is the same as for every plugin: events and notifies, not animat
    surface the pointer is in, the roots that belong to no surface (tooltips, drag
    previews, prompts) — is read back with `Window::take_root_overlay_scene` and shipped
    as a second display list for that surface (`turn.overlays`). The host paints it as a
-   deferred draw above its whole window, unclipped, positioned relative to the slot, and
-   puts an occluding hitbox over the primitives' union bounds that forwards input to the
-   same view, so a plugin's popover can extend past its slot and still be clicked. This
-   is deliberately powerful: a plugin can draw anywhere in the host window. The host is
-   the policy point if that ever needs attenuating (an `Attenuated<ViewApi>` cannot do
-   it; overlays are output, not calls), and a display-list size cap is the obvious
-   first limit.
+   deferred draw above its whole window, unclipped, positioned relative to the slot. The
+   overlay's display list also carries the guest's **hit regions** — the hitboxes its
+   elements recorded, with whether they occlude — and the host puts one input region
+   per hitbox in front of its tree, forwarding to the same view: a popover is clickable
+   exactly where its elements are, and a tooltip (no hitboxes) lets clicks through.
+   This is deliberately powerful: a plugin can draw anywhere in the host window. The
+   host is the policy point if that ever needs attenuating (an `Attenuated<ViewApi>`
+   cannot do it; overlays are output, not calls), and a display-list size cap is the
+   obvious first limit.
+11. **Text input is the one synchronous path into the guest.** An IME asks the focused
+   field questions mid-call, and key precedence — did the guest consume this keystroke,
+   or should the platform turn it into text — must be known before the host's dispatch
+   continues. Neither can wait for a turn, so `input-query` is a synchronous export:
+   the host's `Surface` implements `EntityInputHandler` and relays every question to the
+   guest's focused field through `InputQueries` (installed as the plugin registry's
+   extension), waiting at most the turn budget; key-downs go the same way and answer
+   `handled`. The guest no longer synthesizes text from unhandled keys — the host
+   platform (or its IME) does, and it lands in the guest field through the same
+   channel, exactly as it does for a native text field. Queries go through the worker's
+   FIFO like everything else, so they observe every frame queued before them; a guest
+   that does not answer within the budget is treated as having no text field. This is
+   the substrate's fast path, as text shaping is in the other direction; everything else
+   about input stays in the object model.
 9. **Scheduling**: the guest dispatcher queues runnables/timers locally. Every `tick`
    drains due work, pumps the window's `request_frame` callback (GPUI decides whether it
    is dirty), ships the changed roots' scenes into the turn's `scenes`, and reports the

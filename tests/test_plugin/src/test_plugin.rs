@@ -10,9 +10,11 @@ use embedded_gpui::{
 };
 use embedded_gpui_util::Revocable;
 use gpui::{
-    App, Context, Entity, EventEmitter, MouseDownEvent, Task, WeakEntity, Window, canvas, div,
-    prelude::*, rgb,
+    App, AppContext as _, Bounds, Context, ElementInputHandler, Entity, EntityInputHandler,
+    EventEmitter, FocusHandle, KeyDownEvent, MouseDownEvent, Pixels, Task, UTF16Selection,
+    WeakEntity, Window, canvas, div, prelude::*, rgb,
 };
+use std::ops::Range;
 use test_schema::{SeenGeometry, 
     ChameleonApi, ChameleonState, CounterMilestone, FactoryApi, GatekeeperApi, ItemApi, ItemInfo,
     TestCounterApi, TestHost, TestHostCaller as _, TestPlugin, VaultApi, ViewProbeApi,
@@ -154,9 +156,14 @@ impl TestPlugin for Root {
     fn mount(&mut self, surface: Ref<SurfaceApi>, cx: &mut Context<Self>) -> Ref<ViewProbeApi> {
         let probe = cx.new(|_| ViewProbe { view: None });
         let weak_probe = probe.downgrade();
-        let view = cx.new(|_| ProbeView {
+        let view = cx.new(|cx| ProbeView {
             geometry: None,
             clicks: 0,
+            handled_keys: 0,
+            text: String::new(),
+            selection: 0..0,
+            marked: None,
+            focus_handle: cx.focus_handle(),
         });
         weak_probe
             .update(cx, |probe, _| probe.view = Some(view.downgrade()))
@@ -174,6 +181,102 @@ impl TestPlugin for Root {
 struct ProbeView {
     geometry: Option<SeenGeometry>,
     clicks: u32,
+    handled_keys: u32,
+    /// A minimal text field, so the host's synchronous input queries have something to
+    /// talk to.
+    text: String,
+    selection: Range<usize>,
+    marked: Option<Range<usize>>,
+    focus_handle: FocusHandle,
+}
+
+impl EntityInputHandler for ProbeView {
+    fn text_for_range(
+        &mut self,
+        range: Range<usize>,
+        _adjusted: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let chars: Vec<u16> = self.text.encode_utf16().collect();
+        let end = range.end.min(chars.len());
+        String::from_utf16(&chars[range.start.min(end)..end]).ok()
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        Some(UTF16Selection {
+            range: self.selection.clone(),
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(&self, _window: &mut Window, _cx: &mut Context<Self>) -> Option<Range<usize>> {
+        self.marked.clone()
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.marked = None;
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let range = range.or_else(|| self.marked.clone()).unwrap_or(self.selection.clone());
+        let mut chars: Vec<u16> = self.text.encode_utf16().collect();
+        let end = range.end.min(chars.len());
+        let start = range.start.min(end);
+        chars.splice(start..end, text.encode_utf16());
+        self.text = String::from_utf16_lossy(&chars);
+        let caret = start + text.encode_utf16().count();
+        self.selection = caret..caret;
+        self.marked = None;
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        new_text: &str,
+        _new_selected_range: Option<Range<usize>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let start = range
+            .clone()
+            .or_else(|| self.marked.clone())
+            .unwrap_or(self.selection.clone())
+            .start;
+        self.replace_text_in_range(range, new_text, window, cx);
+        self.marked = Some(start..start + new_text.encode_utf16().count());
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range: Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        Some(element_bounds)
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: gpui::Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        Some(self.text.encode_utf16().count())
+    }
 }
 
 impl Render for ProbeView {
@@ -181,9 +284,12 @@ impl Render for ProbeView {
         // A view is a root of the plugin's window, not a window: its slot's geometry is
         // the bounds it is laid out in, measured here at prepaint.
         let measured = cx.entity();
+        let handler = cx.entity();
+        let focus_handle = self.focus_handle.clone();
         div()
             .size_full()
             .bg(rgb(0x336699))
+            .track_focus(&self.focus_handle)
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(|this, _: &MouseDownEvent, _, cx| {
@@ -191,6 +297,13 @@ impl Render for ProbeView {
                     cx.notify();
                 }),
             )
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if event.keystroke.key == "enter" {
+                    this.handled_keys += 1;
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
             .child(
                 canvas(
                     move |bounds, window, cx| {
@@ -207,7 +320,13 @@ impl Render for ProbeView {
                         };
                         measured.update(cx, |this, _| this.geometry = Some(geometry));
                     },
-                    |_, _, _, _| {},
+                    move |bounds, _, window, cx| {
+                        window.handle_input(
+                            &focus_handle,
+                            ElementInputHandler::new(bounds, handler.clone()),
+                            cx,
+                        );
+                    },
                 )
                 .size_full(),
             )
@@ -224,6 +343,36 @@ impl ViewProbeApi for ViewProbe {
     fn last_geometry(&mut self, cx: &mut Context<Self>) -> Option<SeenGeometry> {
         let view = self.view.as_ref()?.upgrade()?;
         view.read(cx).geometry
+    }
+
+    fn focus(&mut self, cx: &mut Context<Self>) {
+        let Some(view) = self.view.as_ref().and_then(|view| view.upgrade()) else {
+            return;
+        };
+        let focus_handle = view.read(cx).focus_handle.clone();
+        // A view is a root of the guest window mirroring its host window; the plugin
+        // reaches that window like any other.
+        for window in cx.windows() {
+            window
+                .update(cx, |_, window, cx| window.focus(&focus_handle, cx))
+                .ok();
+        }
+    }
+
+    fn text(&mut self, cx: &mut Context<Self>) -> String {
+        self.view
+            .as_ref()
+            .and_then(|view| view.upgrade())
+            .map(|view| view.read(cx).text.clone())
+            .unwrap_or_default()
+    }
+
+    fn handled_keys(&mut self, cx: &mut Context<Self>) -> u32 {
+        self.view
+            .as_ref()
+            .and_then(|view| view.upgrade())
+            .map(|view| view.read(cx).handled_keys)
+            .unwrap_or(0)
     }
 
     fn clicks(&mut self, cx: &mut Context<Self>) -> u32 {

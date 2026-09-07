@@ -153,9 +153,21 @@ world plugin {
         bytes: list<u8>,
     }
 
+    /// Where an overlay accepts input: one of the guest's hitboxes, slot-relative.
+    record hit-region {
+        bounds: bounds,
+        /// Whether the region hides what is under it from the mouse (a popover) or
+        /// merely wants events (a hover style inside one).
+        block-mouse: bool,
+    }
+
     record display-list {
         primitives: list<placed-primitive>,
         new-images: list<image-payload>,
+        /// For an overlay: where its elements accept input, so the host routes exactly
+        /// those places to the view and lets clicks through everywhere else (a tooltip
+        /// has none). Empty for a surface's own scene, whose slot is its region.
+        hit-regions: list<hit-region>,
     }
 
     // ------------------------------------------------------------------
@@ -313,6 +325,98 @@ world plugin {
     }
 
     // ------------------------------------------------------------------
+    // Text input (host -> guest, synchronous)
+    //
+    // The one place the host calls into the guest and waits for the answer. An IME
+    // asks the focused text field questions mid-call (what is selected, what text is
+    // in a range, where is it), and key precedence -- did the focused element handle
+    // this keystroke, or should the platform turn it into text -- must be known before
+    // the host's own dispatch continues. Neither can wait for a turn, so they are a
+    // query the guest must answer within the turn budget: the substrate's fast path,
+    // as text shaping is in the other direction. Queries are addressed to the view
+    // object (a `ViewApi` id) whose window and focus they concern.
+    // ------------------------------------------------------------------
+
+    record modifiers {
+        control: bool,
+        alt: bool,
+        shift: bool,
+        platform: bool,
+        function: bool,
+    }
+
+    record keystroke {
+        modifiers: modifiers,
+        key: string,
+        key-char: option<string>,
+    }
+
+    record key-down {
+        keystroke: keystroke,
+        is-held: bool,
+    }
+
+    /// A range of UTF-16 offsets into the focused field's text.
+    record text-range {
+        start: u32,
+        end: u32,
+    }
+
+    record utf16-selection {
+        range: text-range,
+        /// Whether the head of the selection is at its start.
+        reversed: bool,
+    }
+
+    record replace-text {
+        /// Absent: the current selection (or marked range).
+        range: option<text-range>,
+        text: string,
+    }
+
+    record replace-and-mark-text {
+        range: option<text-range>,
+        text: string,
+        new-selected-range: option<text-range>,
+    }
+
+    record text-for-range {
+        text: string,
+        /// The range actually returned, when the field adjusted the request.
+        adjusted: option<text-range>,
+    }
+
+    variant input-query {
+        /// A key went down while the surface had focus. `handled` comes back true when
+        /// the guest's dispatch consumed it, so the host must not turn it into text.
+        key-down(key-down),
+        /// The argument is `ignore-disabled-input`.
+        selected-text-range(bool),
+        marked-text-range,
+        text-for-range(text-range),
+        replace-text-in-range(replace-text),
+        replace-and-mark-text-in-range(replace-and-mark-text),
+        unmark-text,
+        bounds-for-range(text-range),
+        /// Slot-relative logical pixels.
+        character-index-for-point(point),
+    }
+
+    variant input-answer {
+        /// No focused text field (or no such view): the host treats the query as
+        /// unanswerable, as a platform does for a window without an input handler.
+        none,
+        handled(bool),
+        selection(utf16-selection),
+        range(text-range),
+        text(text-for-range),
+        /// Slot-relative logical pixels.
+        bounds(bounds),
+        index(u32),
+        done,
+    }
+
+    // ------------------------------------------------------------------
     // Turns
     //
     // The whole runtime protocol is two exports. The host never blocks on the guest and
@@ -353,4 +457,9 @@ world plugin {
     /// One guest turn: deliver `inbound` to the registry in order, run due timers and
     /// queued runnables, let dirty windows redraw, and return everything that produced.
     export tick: func(inbound: list<frame>) -> turn;
+
+    /// Answer a text-input query for `view` (see "Text input"). Runs between turns,
+    /// under the turn budget; must not produce frames or scenes of its own (whatever it
+    /// changed is rendered by the tick the host schedules right after).
+    export input-query: func(view: u64, query: input-query) -> input-answer;
 }

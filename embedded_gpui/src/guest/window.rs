@@ -155,14 +155,12 @@ impl PluginWindowState {
     }
 
     /// Dispatch an input event, already in this window's coordinates, through GPUI's
-    /// input pipeline.
-    ///
-    /// Unhandled printable key-downs fall through to the focused input handler, the same way
-    /// GPUI's Linux backends synthesize text input from key events (there is no OS IME on
-    /// this side of the wasm boundary).
-    pub fn dispatch_input(&self, input: PlatformInput) {
+    /// input pipeline. Text is not synthesized from unhandled keys here: the host's
+    /// platform does that (or its IME does), and it lands in the focused field through
+    /// [`with_input_handler`](Self::with_input_handler).
+    pub fn dispatch_input(&self, input: PlatformInput) -> Option<DispatchEventResult> {
         if self.closed.get() {
-            return;
+            return None;
         }
         match &input {
             PlatformInput::MouseDown(event) => {
@@ -196,22 +194,27 @@ impl PluginWindowState {
             _ => {}
         }
         let callback = self.callbacks.borrow_mut().input.take();
-        let Some(mut callback) = callback else {
-            return;
-        };
-        let result = callback(input.clone());
+        let mut callback = callback?;
+        let result = callback(input);
         self.callbacks.borrow_mut().input = Some(callback);
+        Some(result)
+    }
 
-        if let PlatformInput::KeyDown(event) = input
-            && result.propagate
-            && !result.default_prevented
-            && event.keystroke.modifiers.is_subset_of(&Modifiers::shift())
-            && let Some(key_char) = &event.keystroke.key_char
-            && let Some(mut input_handler) = self.input_handler.take()
-        {
-            input_handler.replace_text_in_range(None, key_char);
-            self.input_handler.replace(Some(input_handler));
+    /// Run `f` with the focused element's input handler, if GPUI installed one (a
+    /// focused text field). Called outside any `App` borrow: the handler borrows the app.
+    pub fn with_input_handler<R>(
+        &self,
+        f: impl FnOnce(&mut PlatformInputHandler) -> R,
+    ) -> Option<R> {
+        if self.closed.get() {
+            return None;
         }
+        let mut handler = self.input_handler.take()?;
+        let result = f(&mut handler);
+        if self.input_handler.borrow().is_none() {
+            self.input_handler.replace(Some(handler));
+        }
+        Some(result)
     }
 }
 
@@ -681,6 +684,7 @@ pub fn serialize_scene(
     wit::DisplayList {
         primitives,
         new_images: atlas.take_pending_payloads(),
+        hit_regions: Vec::new(),
     }
 }
 

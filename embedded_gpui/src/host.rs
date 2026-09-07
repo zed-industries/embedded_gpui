@@ -268,8 +268,6 @@ pub struct PluginInstance {
     bindings: Plugin,
     /// Epoch ticks a single guest turn may take before it traps.
     turn_deadline_ticks: u64,
-    /// Epoch ticks an input query may take before it traps.
-    query_deadline_ticks: u64,
     input_query_budget: Duration,
     limits: DisplayListLimits,
     /// Stops the epoch ticker thread when the instance drops.
@@ -309,8 +307,10 @@ pub struct PluginOptions {
     /// either way, since turns run on a worker. Default: one second.
     pub turn_budget: Duration,
     /// The most the host UI thread waits for an input query (a keystroke's precedence,
-    /// an IME question), and the most the guest may take answering one before it traps.
-    /// Default: 50 milliseconds.
+    /// an IME question). A text query is microseconds of work; a guest that takes
+    /// longer than this answers to nobody, and the host carries on as if the surface had
+    /// no text field. The call itself still runs under the turn budget. Default: five
+    /// milliseconds, well inside one frame.
     pub input_query_budget: Duration,
     pub limits: DisplayListLimits,
     /// The most linear memory the guest may grow to. Default: 512 MiB.
@@ -324,7 +324,7 @@ impl PluginOptions {
             configure_wasi: None,
             plugin_dir: None,
             turn_budget: Duration::from_secs(1),
-            input_query_budget: Duration::from_millis(50),
+            input_query_budget: Duration::from_millis(5),
             limits: DisplayListLimits::default(),
             memory_limit: 512 << 20,
         }
@@ -432,7 +432,6 @@ impl PluginInstance {
             store,
             bindings,
             turn_deadline_ticks,
-            query_deadline_ticks: budget_ticks(options.input_query_budget),
             input_query_budget: options.input_query_budget,
             limits: options.limits,
             ticker_alive,
@@ -452,18 +451,12 @@ impl PluginInstance {
         self.bindings.call_tick(&mut self.store, &inbound)
     }
 
-    /// A synchronous text-input query, between turns, under the query budget.
+    /// A synchronous text-input query, between turns. The turn budget bounds the call
+    /// itself; the query budget is only how long the host waits for the answer.
     pub fn input_query(&mut self, view: u64, query: &InputQuery) -> Result<InputAnswer> {
-        self.store.set_epoch_deadline(self.query_deadline_ticks);
+        self.store.set_epoch_deadline(self.turn_deadline_ticks);
         self.bindings.call_input_query(&mut self.store, view, query)
     }
-}
-
-/// How many epoch ticks a budget spans, rounded up, at least one.
-fn budget_ticks(budget: Duration) -> u64 {
-    (budget.as_millis() as u64)
-        .div_ceil(EPOCH_TICK.as_millis() as u64)
-        .max(1)
 }
 
 /// Caps on what a plugin may ship in one display list. A list over a cap stops the
@@ -581,8 +574,8 @@ enum PluginRequest {
 /// guest and waits. An IME asks the focused text field questions mid-call, and key
 /// precedence (did the guest consume this keystroke, or should it become text) must be
 /// known before the host's own dispatch continues; neither can wait for a turn. The
-/// wait is bounded by the turn budget: a guest that does not answer in time is treated
-/// as having no text field, and a stopped guest answers nothing.
+/// wait is bounded by the query budget (milliseconds): a guest that does not answer in
+/// time is treated as having no text field, and a stopped guest answers nothing.
 ///
 /// Installed as the plugin registry's extension, so a [`Surface`] finds it through the
 /// view object it holds (`view.registry().extension::<InputQueries>()`).

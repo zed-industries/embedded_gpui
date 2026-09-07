@@ -197,7 +197,7 @@ the rule for it is the same as for every plugin: events and notifies, not animat
    continues. Neither can wait for a turn, so `input-query` is a synchronous export:
    the host's `Surface` implements `EntityInputHandler` and relays every question to the
    guest's focused field through `InputQueries` (installed as the plugin registry's
-   extension), waiting at most the turn budget; key-downs go the same way and answer
+   extension), waiting at most the query budget; key-downs go the same way and answer
    `handled`. The guest no longer synthesizes text from unhandled keys — the host
    platform (or its IME) does, and it lands in the guest field through the same
    channel, exactly as it does for a native text field. Queries go through the worker's
@@ -205,7 +205,9 @@ the rule for it is the same as for every plugin: events and notifies, not animat
    that does not answer within the budget is treated as having no text field. This is
    the substrate's fast path, as text shaping is in the other direction; everything else
    about input stays in the object model. The wait has its own budget
-   (`PluginOptions::input_query_budget`, 50 ms by default), separate from the turn budget.
+   (`PluginOptions::input_query_budget`, 5 ms by default): a text query is microseconds
+   of work, so a guest that misses it answers to nobody, and the host never skips a frame
+   to find out. The call itself still runs under the turn budget.
 12. **The clipboard is an object.** Every `PluginHost` homes a `Clipboard` entity
    implementing `ClipboardApi` (`read`, `write`, and a `ClipboardChanged` event); a host
    grants the clipboard by handing its ref out through its root schema, withholds it by

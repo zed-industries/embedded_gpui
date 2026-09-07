@@ -9,7 +9,7 @@ use anyhow::{Result, anyhow};
 use embedded_gpui::Remote;
 use futures::channel::oneshot;
 use gpui::{
-    Action, AnyView, AnyWindowHandle, App, AppContext as _, AsyncApp, AttachedRootId,
+    Action, AnyView, AnyWindowHandle, App, AppContext as _, AsyncApp, AttachedRoot,
     BackgroundExecutor, Bounds, ClipboardItem, CursorStyle, DummyKeyboardMapper, Empty,
     ForegroundExecutor, IntoElement, Keymap, Menu, MenuItem, PathPromptOptions, Pixels, Platform,
     PlatformDisplay, PlatformInput, PlatformKeyboardLayout, PlatformKeyboardMapper,
@@ -36,11 +36,13 @@ struct SurfaceView {
     placed: Option<Placement>,
 }
 
-#[derive(Clone, Copy)]
 struct Placement {
     window: u64,
-    root: AttachedRootId,
+    root: AttachedRoot,
     origin: Point<Pixels>,
+    /// The overlay the view's own subtree last shipped, kept so it can be sent again
+    /// unchanged when the window's unowned overlay joins or leaves it.
+    owned_overlay: Option<wit::DisplayList>,
 }
 
 /// One host-driven event for a surface's view, applied by the pump.
@@ -201,18 +203,18 @@ impl PluginPlatform {
         let Some(surface) = self.view_objects.borrow().get(&view).copied() else {
             return wit::InputAnswer::None;
         };
-        let Some(placed) = self
+        let Some((window_id, origin)) = self
             .views
             .borrow()
             .get(&surface)
-            .and_then(|view| view.placed)
+            .and_then(|view| view.placed.as_ref())
+            .map(|placed| (placed.window, placed.origin))
         else {
             return wit::InputAnswer::None;
         };
-        let Some(window) = self.window(placed.window) else {
+        let Some(window) = self.window(window_id) else {
             return wit::InputAnswer::None;
         };
-        let origin = placed.origin;
         match query {
             wit::InputQuery::KeyDown(key_down) => {
                 self.last_input_surface.set(Some(surface));
@@ -405,12 +407,12 @@ impl PluginPlatform {
             return;
         };
         if let Some(handle) = window.handle() {
-            handle
-                .update(cx, |_, window, _| window.detach_root(placed.root))
-                .ok();
+            let root = placed.root;
+            handle.update(cx, |_, window, _| root.detach(window)).ok();
         }
         let still_used = self.views.borrow().values().any(|view| {
             view.placed
+                .as_ref()
                 .is_some_and(|other| other.window == placed.window)
         });
         if !still_used {
@@ -501,12 +503,12 @@ impl PluginPlatform {
         if geometry.width <= 0. || geometry.height <= 0. {
             return Ok(());
         }
-        let Some((view, placed)) = self
-            .views
-            .borrow()
-            .get(&surface)
-            .map(|view| (view.view.clone(), view.placed))
-        else {
+        let Some((view, placed)) = self.views.borrow().get(&surface).map(|view| {
+            (
+                view.view.clone(),
+                view.placed.as_ref().map(|placed| placed.window),
+            )
+        }) else {
             return Ok(());
         };
         let window = self.ensure_window(geometry.window, async_app)?;
@@ -515,34 +517,44 @@ impl PluginPlatform {
             origin: point(px(geometry.x), px(geometry.y)),
             size: size(px(geometry.width), px(geometry.height)),
         };
-        let root = match placed {
-            Some(placed) if placed.window == geometry.window.id => {
+        if placed.is_some_and(|window_id| window_id == geometry.window.id) {
+            // Same window: move the root.
+            let mut views = self.views.borrow_mut();
+            let Some(placed) = views
+                .get_mut(&surface)
+                .and_then(|view| view.placed.as_mut())
+            else {
+                return Ok(());
+            };
+            placed.origin = bounds.origin;
+            if let Some(handle) = window.handle() {
+                let root = &placed.root;
                 async_app.update(|cx| {
-                    window.handle().map(|handle| {
-                        handle
-                            .update(cx, |_, window, _| {
-                                window.set_root_bounds(placed.root, bounds)
-                            })
-                            .ok()
-                    });
+                    handle
+                        .update(cx, |_, window, _| root.set_bounds(window, bounds))
+                        .ok();
                 });
-                placed.root
             }
-            other => {
-                async_app.update(|cx| self.unplace(other, cx));
-                let handle = window
-                    .handle()
-                    .ok_or_else(|| anyhow!("guest window has no handle"))?;
-                async_app.update(|cx| {
-                    handle.update(cx, |_, window, _| window.attach_root(view, bounds))
-                })?
-            }
-        };
+            return Ok(());
+        }
+        // A new placement, or a move to another host window's mirror.
+        let previous = self
+            .views
+            .borrow_mut()
+            .get_mut(&surface)
+            .and_then(|view| view.placed.take());
+        async_app.update(|cx| self.unplace(previous, cx));
+        let handle = window
+            .handle()
+            .ok_or_else(|| anyhow!("guest window has no handle"))?;
+        let root = async_app
+            .update(|cx| handle.update(cx, |_, window, _| window.attach_root(view, bounds)))?;
         if let Some(entry) = self.views.borrow_mut().get_mut(&surface) {
             entry.placed = Some(Placement {
                 window: geometry.window.id,
                 root,
                 origin: bounds.origin,
+                owned_overlay: None,
             });
         }
         Ok(())
@@ -570,90 +582,124 @@ impl PluginPlatform {
     }
 
     fn window_of(&self, surface: u64) -> Option<Rc<PluginWindowState>> {
-        let placed = self
+        let window = self
             .views
             .borrow()
             .get(&surface)
-            .and_then(|view| view.placed)?;
-        self.window(placed.window)
+            .and_then(|view| view.placed.as_ref())
+            .map(|placed| placed.window)?;
+        self.window(window)
     }
 
     /// Dispatch a host-forwarded input event (slot-relative) into the window the surface
     /// is placed in, at the slot's origin.
     fn dispatch_input(&self, surface: u64, mut input: PlatformInput) {
-        let Some(placed) = self
+        let Some((window_id, origin)) = self
             .views
             .borrow()
             .get(&surface)
-            .and_then(|view| view.placed)
+            .and_then(|view| view.placed.as_ref())
+            .map(|placed| (placed.window, placed.origin))
         else {
             return;
         };
-        let Some(window) = self.window(placed.window) else {
+        let Some(window) = self.window(window_id) else {
             return;
         };
         self.last_input_surface.set(Some(surface));
         match &mut input {
-            PlatformInput::MouseDown(event) => event.position += placed.origin,
-            PlatformInput::MouseUp(event) => event.position += placed.origin,
-            PlatformInput::MouseMove(event) => event.position += placed.origin,
-            PlatformInput::ScrollWheel(event) => event.position += placed.origin,
-            PlatformInput::MouseExited(event) => event.position += placed.origin,
+            PlatformInput::MouseDown(event) => event.position += origin,
+            PlatformInput::MouseUp(event) => event.position += origin,
+            PlatformInput::MouseMove(event) => event.position += origin,
+            PlatformInput::ScrollWheel(event) => event.position += origin,
+            PlatformInput::MouseExited(event) => event.position += origin,
             _ => {}
         }
         window.dispatch_input(input);
     }
 
     /// Ship every root whose scene changed since it was last shipped, as its surface's
-    /// display list. Roots GPUI reused unchanged cost nothing here.
+    /// display list, and every overlay that changed. Roots GPUI reused unchanged cost
+    /// nothing here.
+    ///
+    /// A surface's overlay is what its own subtree deferred plus, for the surface the
+    /// pointer is in, the window's unowned overlays (tooltips, the drag preview,
+    /// prompts), since that is where those appear. The unowned part moves with the
+    /// pointer: when it leaves one surface for another, both surfaces' overlays are sent
+    /// again.
     pub fn ship_scenes(&self, cx: &mut App) {
-        let views = self.views.borrow();
+        let mut views = self.views.borrow_mut();
         for window in self.windows() {
             let Some(handle) = window.handle() else {
                 continue;
             };
             let scale_factor = window.scale_factor();
             let atlas = window.atlas().clone();
+            let carrier = self.last_input_surface.get().filter(|surface| {
+                views
+                    .get(surface)
+                    .and_then(|view| view.placed.as_ref())
+                    .is_some_and(|placed| placed.window == window.host_id())
+            });
+            let previous_carrier = window.unowned_carrier.replace(carrier);
             handle
                 .update(cx, |_, gpui_window, _| {
-                    for (surface, view) in views.iter() {
-                        let Some(placed) = view.placed else {
+                    let unowned_changed = gpui_window.take_unowned_overlay_scene();
+                    if let Some(scene) = unowned_changed {
+                        let regions = gpui_window.unowned_overlay_hit_regions();
+                        *window.unowned_overlay.borrow_mut() = Some((scene, regions));
+                        window.mark_unowned_changed();
+                    }
+                    let unowned_changed = unowned_changed_flag(&window, carrier, previous_carrier);
+                    for (surface, view) in views.iter_mut() {
+                        let Some(placed) = view.placed.as_mut() else {
                             continue;
                         };
                         if placed.window != window.host_id() {
                             continue;
                         }
-                        if let Some(scene) = gpui_window.take_root_scene(placed.root) {
+                        if let Some(scene) = placed.root.take_scene(gpui_window) {
                             let list = serialize_scene(&scene, scale_factor, placed.origin, &atlas);
                             objects::push_scene(*surface, list);
                         }
-                        // Tooltips, drag previews and prompts belong to no root; they go
-                        // with the surface the pointer is in, which is where they appear.
-                        let include_unowned = self.last_input_surface.get() == Some(*surface);
-                        if let Some(scene) =
-                            gpui_window.take_root_overlay_scene(placed.root, include_unowned)
-                        {
-                            let mut list =
-                                serialize_scene(&scene, scale_factor, placed.origin, &atlas);
-                            list.hit_regions = gpui_window
-                                .root_overlay_hit_regions(placed.root, include_unowned)
-                                .into_iter()
-                                .map(|(bounds, behavior)| wit::HitRegion {
-                                    bounds: wit::Bounds {
-                                        origin: wit::Point {
-                                            x: f32::from(bounds.origin.x - placed.origin.x),
-                                            y: f32::from(bounds.origin.y - placed.origin.y),
-                                        },
-                                        size: wit::Extent {
-                                            width: f32::from(bounds.size.width),
-                                            height: f32::from(bounds.size.height),
-                                        },
-                                    },
-                                    block_mouse: behavior != gpui::HitboxBehavior::Normal,
-                                })
-                                .collect();
-                            objects::push_overlay(*surface, list);
+                        let owned_changed = match placed.root.take_overlay_scene(gpui_window) {
+                            Some(scene) => {
+                                let mut list =
+                                    serialize_scene(&scene, scale_factor, placed.origin, &atlas);
+                                list.hit_regions = wire_regions(
+                                    placed.root.overlay_hit_regions(gpui_window),
+                                    placed.origin,
+                                );
+                                placed.owned_overlay = Some(list);
+                                true
+                            }
+                            None => false,
+                        };
+                        let is_carrier = carrier == Some(*surface);
+                        let was_carrier = previous_carrier == Some(*surface);
+                        let carrier_changed = is_carrier != was_carrier;
+                        if !(owned_changed || carrier_changed || (is_carrier && unowned_changed)) {
+                            continue;
                         }
+                        let Some(owned) = placed.owned_overlay.as_mut() else {
+                            continue;
+                        };
+                        let mut list = wit::DisplayList {
+                            primitives: owned.primitives.clone(),
+                            new_images: std::mem::take(&mut owned.new_images),
+                            hit_regions: owned.hit_regions.clone(),
+                        };
+                        if is_carrier
+                            && let Some((scene, regions)) = window.unowned_overlay.borrow().as_ref()
+                        {
+                            let mut unowned =
+                                serialize_scene(scene, scale_factor, placed.origin, &atlas);
+                            list.primitives.append(&mut unowned.primitives);
+                            list.new_images.append(&mut unowned.new_images);
+                            list.hit_regions
+                                .extend(wire_regions(regions.clone(), placed.origin));
+                        }
+                        objects::push_overlay(*surface, list);
                     }
                 })
                 .ok();
@@ -943,4 +989,33 @@ fn configuration_to_wire(
             gpui::TextInputAction::Send => wit::TextInputAction::Send,
         },
     }
+}
+
+/// Whether the unowned overlay a carrier surface ships needs sending again: its scene
+/// changed this frame, or the carrier moved.
+fn unowned_changed_flag(
+    window: &PluginWindowState,
+    carrier: Option<u64>,
+    previous_carrier: Option<u64>,
+) -> bool {
+    window.take_unowned_changed() || carrier != previous_carrier
+}
+
+fn wire_regions(regions: Vec<gpui::HitRegion>, origin: Point<Pixels>) -> Vec<wit::HitRegion> {
+    regions
+        .into_iter()
+        .map(|region| wit::HitRegion {
+            bounds: wit::Bounds {
+                origin: wit::Point {
+                    x: f32::from(region.bounds.origin.x - origin.x),
+                    y: f32::from(region.bounds.origin.y - origin.y),
+                },
+                size: wit::Extent {
+                    width: f32::from(region.bounds.size.width),
+                    height: f32::from(region.bounds.size.height),
+                },
+            },
+            block_mouse: region.behavior != gpui::HitboxBehavior::Normal,
+        })
+        .collect()
 }

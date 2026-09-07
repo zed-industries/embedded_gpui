@@ -564,6 +564,7 @@ impl Objects {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn install<S, T>(
         &self,
         entity: &Entity<T>,

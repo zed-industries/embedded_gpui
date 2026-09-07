@@ -11,7 +11,7 @@ Views are `SurfaceApi`/`ViewApi` objects; see `DESIGN.md`. What remains:
 - [x] **Data-shaped surfaces at scale**: guest windows mirror host windows; every
   surface is a root attached to its window at its real origin (`Window::attach_root`,
   a node-engine node), and only roots whose node was redrawn ship a display list
-  (`Window::take_root_scene`). Scale factor is per window, as it should be.
+  (`AttachedRoot::take_scene`). Scale factor is per window, as it should be.
 - [x] **Overlays**: deferred draws, tooltips, drag previews and prompts ship as a
   second display list per surface and are painted above the host window, with the
   guest's hit regions as input regions. Open: a size cap.
@@ -178,6 +178,6 @@ Views are `SurfaceApi`/`ViewApi` objects; see `DESIGN.md`. What remains:
 - [ ] **Packaging**: shipping components through the extension registry;
   versioning the WIT protocol.
 - [ ] **Upstreaming**: `run_embedded`/`ApplicationHandle` landed on `main`.
-  `Window::attach_root`/`take_root_scene` (branch `gpui-multi-root-embedded`, on top of
+  `Window::attach_root` and the `AttachedRoot` handle (branch `gpui-multi-root-embedded-rebased`, on top of
   the node engine, zed-industries/zed#63800) wants a PR once the node engine merges; the
   gpui dependency moves to `main` after that.

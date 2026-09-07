@@ -51,6 +51,12 @@ pub struct PluginWindowState {
     callbacks: RefCell<Callbacks>,
     input_handler: RefCell<Option<PlatformInputHandler>>,
     handle: Cell<Option<AnyWindowHandle>>,
+    /// The window's unowned overlays (tooltips, the drag preview, prompts) as last
+    /// read, with their hit regions, and whether they changed since last shipped.
+    pub unowned_overlay: RefCell<Option<(Scene, Vec<gpui::HitRegion>)>>,
+    unowned_changed: Cell<bool>,
+    /// The surface currently carrying the unowned overlays: the one the pointer is in.
+    pub unowned_carrier: Cell<Option<u64>>,
     /// GPUI dropped its `PlatformWindow`: nothing may be dispatched to this state again.
     closed: Cell<bool>,
 }
@@ -66,8 +72,20 @@ impl PluginWindowState {
             callbacks: RefCell::new(Callbacks::default()),
             input_handler: RefCell::new(None),
             handle: Cell::new(None),
+            unowned_overlay: RefCell::new(None),
+            unowned_changed: Cell::new(false),
+            unowned_carrier: Cell::new(None),
             closed: Cell::new(false),
         }
+    }
+
+    /// Note that the unowned overlay was re-read; cleared by the next `take`.
+    pub fn mark_unowned_changed(&self) {
+        self.unowned_changed.set(true);
+    }
+
+    pub fn take_unowned_changed(&self) -> bool {
+        self.unowned_changed.replace(false)
     }
 
     pub fn is_closed(&self) -> bool {

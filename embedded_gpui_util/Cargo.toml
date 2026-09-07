@@ -15,5 +15,5 @@ path = "src/embedded_gpui_util.rs"
 [dependencies]
 anyhow = "1.0"
 embedded_gpui = { path = "../embedded_gpui" }
-gpui = { git = "https://github.com/zed-industries/zed.git", branch = "gpui-multi-root-embedded", default-features = false }
+gpui = { git = "https://github.com/zed-industries/zed.git", branch = "gpui-multi-root-embedded-rebased", default-features = false }
 log = "0.4"

@@ -10,9 +10,9 @@ A plugin is a GPUI `App` inside a wasm component whose windows mirror the host's
 guest window per host window a surface is in, with its size and scale factor. Every host
 **surface** is a root attached to its window at the slot's real origin
 (`Window::attach_root`, added on top of the node engine as branch
-`gpui-multi-root-embedded`): a node of its own, memoized, hit-tested and dispatched to
+`gpui-multi-root-embedded-rebased`): a node of its own, memoized, hit-tested and dispatched to
 like any mounted view. After a frame the guest reads each root's scene back
-(`Window::take_root_scene`), which answers only for roots whose node was redrawn, and
+(`AttachedRoot::take_scene`), which answers only for roots whose node was redrawn, and
 ships that as the surface's display list; the host replays the list into its own frame.
 Items 1, 2 and 5 below are therefore done on the guest side; 3, 4 and 6 remain.
 
@@ -33,8 +33,8 @@ design envelope, instead of hundreds of windows.
 **Specifically:** a public way to (a) mark a node as a "fragment root" and (b) read its
 recorded scene fragment and geometry after a frame, by node identity. The PR's "store
 scene fragments with child-node references" is exactly the data; it needs an
-outside-the-frame reader. *This is `Window::attach_root(view, bounds) -> AttachedRootId`
-and `Window::take_root_scene(id) -> Option<Scene>`: the root is drawn beside the window's
+outside-the-frame reader. *This is `Window::attach_root(view, bounds) -> AttachedRoot`,
+returning an `AttachedRoot` handle whose `take_scene` reads the recording back: the root is drawn beside the window's
 root view, and its node's recording (plus the deferred draws its subtree attached) is
 replayed into a scene of its own.*
 
@@ -50,7 +50,7 @@ views — the top "known risk" in `DESIGN.md` — stops being a risk.
 **Specifically:** a frame-level report of which fragment roots changed this frame (the
 retained-frame statistics almost have this), and a guarantee that an unchanged fragment
 root's child-node references remain valid, so a host-side splice can keep them. *Done for
-whole roots: `take_root_scene` compares the node's output generation and answers only
+whole roots: `AttachedRoot::take_scene` compares the node's output generation and answers only
 when the root was redrawn. Finer than a root (one dirty leaf shipping alone) waits on the
 engine's fine-grained caching.*
 

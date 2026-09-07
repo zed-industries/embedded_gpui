@@ -7,7 +7,7 @@ extensions" system for Zed and exists to hammer out the guest-side `gpui_plugin`
 This repository is standalone: it consumes `gpui` and `gpui_platform` from the zed
 repository, on top of the node engine (zed-industries/zed#63800, which memoizes view
 output and makes a frame an ordered list of roots) plus one small addition the guest
-needs: `Window::attach_root` / `Window::take_root_scene`, which draw a view as an extra
+needs: `Window::attach_root`, which draws a view as an extra
 root of a window at fixed bounds and read that root's scene back on its own. (The other
 hook, `Application::run_embedded`, is already on `main`.)
 
@@ -171,7 +171,7 @@ the rule for it is the same as for every plugin: events and notifies, not animat
    cannot interact unless the host overlaps their slots. A surface that moves to another
    host window moves its root to that window's mirror; a mirror with no roots left
    closes. After each frame the pump reads every root's scene on its own with
-   `Window::take_root_scene`, which answers only for roots whose node was redrawn, so an
+   `AttachedRoot::take_scene`, which answers only for roots whose node was redrawn, so an
    idle surface ships nothing and a changed one ships exactly its own display list
    (translated back to slot-relative coordinates). A view is not drawn until the host
    has said where it is, so its first frame is at the slot's real size. `HostWindow`
@@ -180,7 +180,7 @@ the rule for it is the same as for every plugin: events and notifies, not animat
 10. **Overlays ship separately and paint above the host.** What a view draws outside
    its own subtree — the deferred draws it attached (popovers, menus) and, for the
    surface the pointer is in, the roots that belong to no surface (tooltips, drag
-   previews, prompts) — is read back with `Window::take_root_overlay_scene` and shipped
+   previews, prompts) — is read back with `AttachedRoot::take_overlay_scene` (and `Window::take_unowned_overlay_scene` for what no root owns) and shipped
    as a second display list for that surface (`turn.overlays`). The host paints it as a
    deferred draw above its whole window, unclipped, positioned relative to the slot. The
    overlay's display list also carries the guest's **hit regions** — the hitboxes its

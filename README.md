@@ -145,8 +145,8 @@ cargo test -p tests -- --test-threads 1   # protocol tests, and tests/js_plugin.
 3. `example/plugin/` — what plugin code looks like.
 
 GPUI is consumed from the zed repository: the node-engine branch
-(zed-industries/zed#63800) plus `Window::attach_root` / `take_root_scene`, the hook that
-lets a surface be a root of the guest's window (branch `gpui-multi-root-embedded`).
+(zed-industries/zed#63800) plus `Window::attach_root` and its `AttachedRoot` handle, the hook that
+lets a surface be a root of the guest's window (branch `gpui-multi-root-embedded-rebased`).
 
 ## License
 

@@ -522,16 +522,16 @@ fn expand_interface(
             ref_response,
             ..
         } = method;
-        let receipt_of = match ref_response {
-            Some(inner) => quote!(embedded_gpui::Remote<#inner>),
-            None => quote!(#response),
+        let returns = match ref_response {
+            Some(inner) => quote!(embedded_gpui::Promised<#inner>),
+            None => quote!(embedded_gpui::Receipt<#response>),
         };
         quote! {
             fn #ident(
                 &self,
                 #(#field_names: #field_types,)*
                 cx: &mut embedded_gpui::gpui::App,
-            ) -> embedded_gpui::Receipt<#receipt_of>;
+            ) -> #returns;
         }
     });
     let caller_implementations = methods.iter().map(|method| {
@@ -545,14 +545,16 @@ fn expand_interface(
             ..
         } = method;
         match ref_response {
-            // A ref-returning method resolves with a live, connected Remote: object
-            // allocation across the boundary, handle in, handle out.
+            // A ref-returning method is object allocation across the boundary, handle
+            // in, handle out — and the handle is usable before the answer comes back:
+            // `Promised` derefs to a remote for the promised id, and resolves to the
+            // actual one.
             Some(inner) => quote! {
                 fn #ident(
                     &self,
                     #(#field_names: #field_types,)*
                     cx: &mut embedded_gpui::gpui::App,
-                ) -> embedded_gpui::Receipt<embedded_gpui::Remote<#inner>> {
+                ) -> embedded_gpui::Promised<#inner> {
                     self.call_connecting(#message_ident { #(#field_names,)* }, cx)
                 }
             },
@@ -629,8 +631,9 @@ fn expand_interface(
     let caller_doc = format!(
         "Typed calls to a shared `{spec_ident}` entity: implemented for \
          `Remote<{spec_ident}>`, one method per interface method, each returning a \
-         `Receipt`. Methods declared to return `Ref<T>` resolve with a connected \
-         `Remote<T>` instead: allocation over there, handle over here."
+         `Receipt`. Methods declared to return `Ref<T>` return a `Promised<T>` instead: \
+         a `Remote<T>` usable at once (calls through it queue behind this one), that \
+         resolves with the actual ref — allocation over there, handle over here."
     );
 
     Ok(quote! {

@@ -525,6 +525,22 @@ entity):
   verify that a key obtained *through* the membrane dies with it. Refs homed on the
   wrapper's own end pass through unwrapped (loopback connects are not supported).
 
+### Promise pipelining
+
+A ref-returning method does not make its caller wait for the ref. The caller mints the
+id the returned object will have (random, like every id), sends it in the call as
+`promised`, and gets a `Promised<T>` back: a `Remote<T>` for that id, usable at once,
+that also `.await`s to the response. Calls through the promised remote go out in the
+same FIFO, behind the allocating call, so the home sees them after it. When the home
+answers, it installs the returned object under the promised id as well (a second share
+of the same entity, with its own observers and lifetime) and delivers whatever arrived
+for the id meanwhile, in order; if the allocating call failed, everything sent through
+the promise fails with that error, until the caller releases the id. Nothing is looked
+up twice and there are no promise tables: this is CapTP's `answer-pos` reached from the
+random-ids direction. A membrane needs no cooperation — the promise resolves at each
+hop's registry — and the JS runtime, which calls by name without return types, simply
+does not pipeline.
+
 ### Async handlers
 
 A handler can return work instead of a value: an `async fn` in the schema (or a raw

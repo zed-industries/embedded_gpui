@@ -291,6 +291,13 @@ world plugin {
         payload: list<u8>,
         /// The refs the payload mentions, by index.
         refs: list<u64>,
+        /// For a call whose response is a ref: an id the caller minted for the object
+        /// that ref will name (promise pipelining). The home installs the returned
+        /// object under this id as well, and frames addressed to it that arrive before
+        /// the response wait, in order, until it exists; if the call fails, they fail
+        /// with its error. FIFO delivery is what makes this sound: everything sent to
+        /// the promised id was sent after the call that allocates it.
+        promised: option<u64>,
     }
 
     /// The answer to a `call` that carried a `request` id.

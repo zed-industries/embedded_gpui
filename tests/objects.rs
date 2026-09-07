@@ -1032,6 +1032,80 @@ async fn test_focus_traversal_leaves_and_enters_a_surface(cx: &mut TestAppContex
     assert_eq!(handled_keys(cx).await.expect("count"), 3);
 }
 
+/// Promise pipelining: a ref-returning method hands back a remote for an id the caller
+/// minted, usable before the response arrives. Calls through it queue FIFO behind the
+/// allocating call; the home installs the returned object under the promised id when
+/// it answers. A failed allocation fails everything sent through the promise.
+#[gpui::test]
+async fn test_promise_pipelining_uses_a_ref_before_it_arrives(cx: &mut TestAppContext) {
+    let host = setup(cx);
+    let root = cx.update(|cx| host.root::<TestPlugin>(cx));
+
+    // Allocate, use, and read back in one synchronous breath: no round trip between.
+    let (count, promised) = cx.update(|cx| {
+        let counter = root.counter(cx);
+        counter.increment(3, cx);
+        counter.increment(4, cx);
+        let count = counter.count(cx);
+        (count, counter)
+    });
+    settle(cx);
+    assert_eq!(count.await.expect("count"), 7);
+
+    // The response resolves to the same entity under the home's own id; the promised
+    // remote stays valid alongside it, and the root's cached ref (the same object
+    // returned again) promises just as well.
+    let resolved = promised.await.expect("resolved");
+    let again = cx.update(|cx| root.counter(cx));
+    let (via_resolved, via_again) = cx.update(|cx| (resolved.count(cx), again.count(cx)));
+    settle(cx);
+    assert_eq!(via_resolved.await.expect("count"), 7);
+    assert_eq!(via_again.await.expect("count"), 7);
+    drop(again);
+    drop(resolved);
+    cx.update(|cx| host.update(cx, |host, cx| host.pump(cx)));
+    settle(cx);
+
+    // Events and notifies reach observers of the promised id too.
+    let counter = cx.update(|cx| root.counter(cx));
+    let milestones = Rc::new(std::cell::Cell::new(0u32));
+    let _subscription = cx.update(|cx| {
+        let milestones = milestones.clone();
+        counter.subscribe(cx, move |_: &CounterMilestone, _| {
+            milestones.set(milestones.get() + 1)
+        })
+    });
+    let bumped = cx.update(|cx| counter.increment(3, cx));
+    settle(cx);
+    assert_eq!(bumped.await.expect("increment"), 10);
+    assert_eq!(milestones.get(), 1, "the tenth click is a milestone");
+
+    // A failed allocation: through a revoked membrane, `key()` fails, so the key promised
+    // for it fails the same way for every call sent through it.
+    let vault = new_vault(&host, cx);
+    let vault_ref = cx.update(|cx| host.share(&vault, cx));
+    let gatekeeper = gatekeeper(&host, cx).await;
+    let guarded = cx.update(|cx| gatekeeper.guard(vault_ref, cx));
+    let unlocked = cx.update(|cx| guarded.key(cx).unlock(cx));
+    settle(cx);
+    assert_eq!(
+        unlocked.await.expect("unlock through the promise"),
+        "opened"
+    );
+    let revoked = cx.update(|cx| guarded.call_raw("revoke", encode(&()).expect("encode unit"), cx));
+    settle(cx);
+    revoked.await.expect("revoke");
+    let unlocked = cx.update(|cx| guarded.key(cx).unlock(cx));
+    settle(cx);
+    let error = unlocked
+        .await
+        .expect_err("the key promised by a revoked membrane");
+    assert!(
+        error.to_string().contains("capability revoked"),
+        "unexpected error: {error}"
+    );
+}
+
 #[gpui::test]
 async fn test_reattaching_a_surface_replaces_its_view(cx: &mut TestAppContext) {
     let host = setup(cx);

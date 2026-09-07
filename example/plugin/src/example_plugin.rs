@@ -221,8 +221,9 @@ struct Wave {
 }
 
 struct ButtonView {
-    /// The host counter, discovered through the host root's `counter()` method; `None`
-    /// until that call's receipt resolves (real distributed behavior, not a hack).
+    /// The host counter, discovered through the host root's `counter()` method. Usable
+    /// from the first frame: the call promises the object's id, so the mirror below
+    /// subscribes and reads through it before the host has even answered.
     counter: Option<Remote<CounterApi>>,
     /// A local, observable cache of the host counter's value: snapshots as a library.
     clicks: Option<Entity<Mirror<u32>>>,
@@ -230,28 +231,19 @@ struct ButtonView {
 
 impl ButtonView {
     fn new(host: Remote<DemoHost>, cx: &mut Context<Self>) -> Self {
-        let receipt = host.counter(cx);
-        cx.spawn(async move |this, cx| {
-            let counter = match receipt.await {
-                Ok(counter) => counter,
-                Err(error) => {
-                    eprintln!("[example_plugin] counter discovery failed: {error:#}");
-                    return;
-                }
-            };
-            this.update(cx, |view, cx| {
-                let clicks = Mirror::new(counter.clone(), Clicks {}, cx);
-                cx.observe(&clicks, |_, _, cx| cx.notify()).detach();
-                view.counter = Some(counter);
-                view.clicks = Some(clicks);
-                cx.notify();
-            })
-            .ok();
+        let promised = host.counter(cx);
+        let counter = promised.remote();
+        let clicks = Mirror::new(counter.clone(), Clicks {}, cx);
+        cx.observe(&clicks, |_, _, cx| cx.notify()).detach();
+        cx.spawn(async move |_, _| {
+            if let Err(error) = promised.await {
+                eprintln!("[example_plugin] counter discovery failed: {error:#}");
+            }
         })
         .detach();
         Self {
-            counter: None,
-            clicks: None,
+            counter: Some(counter),
+            clicks: Some(clicks),
         }
     }
 }

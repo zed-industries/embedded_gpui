@@ -37,6 +37,10 @@ pub(crate) struct Call {
     pub request: Option<u64>,
     pub method: String,
     pub payload: Payload,
+    /// For a call whose response is a ref: the id the caller minted for the object that
+    /// ref will name, so it can address the object before the response arrives (promise
+    /// pipelining). The home installs the returned object under this id too.
+    pub promised: Option<u64>,
 }
 
 /// The answer to a [`Call`] that carried a `request` id.
@@ -80,8 +84,15 @@ struct HomeEntry {
     entity: HomeEntity,
     /// The notify observation plus any typed-event forwarders wired at share time.
     _subscriptions: Vec<Subscription>,
+    /// Wires the same notify and event forwarders under another id, so the entry can be
+    /// installed again for a promised id. `None` for observer objects.
+    resubscribe: Option<Resubscribe>,
 }
 
+type Resubscribe = Rc<dyn Fn(&Objects, u64, &mut App) -> Vec<Subscription>>;
+type EventsFactory = Rc<dyn Fn(crate::EventSink, &mut App) -> Vec<Subscription>>;
+
+#[derive(Clone)]
 enum HomeEntity {
     None,
     Strong(AnyEntity),
@@ -142,6 +153,12 @@ struct State {
     projections: HashMap<u64, Projection>,
     next_request_id: u64,
     pending_responses: HashMap<u64, ResponseSender>,
+    /// Promised ids whose allocating call has not answered yet, with the frames that
+    /// arrived for them meanwhile, delivered in order once the object exists.
+    pending_promises: HashMap<u64, Vec<Frame>>,
+    /// Promised ids whose allocating call failed: every call through them fails with
+    /// that reason until the caller releases the id.
+    failed_promises: HashMap<u64, String>,
     /// Frames addressed to this end's root before `share_root` ran. The other end's
     /// bootstrap may lawfully race ours, so root traffic queues instead of failing;
     /// `share_root` drains it in order.
@@ -236,7 +253,23 @@ impl Objects {
         let mut methods = Methods::new(entity.downgrade());
         T::methods(&mut methods);
         let events = T::events(entity, self.event_sink(entity_id), cx);
-        self.install::<S, T>(entity, methods, events, entity_id, T::keep_alive(), cx);
+        let events_factory: EventsFactory = {
+            // Weak: a home entry must not keep its entity alive past release.
+            let entity = entity.downgrade();
+            Rc::new(move |sink, cx| match entity.upgrade() {
+                Some(entity) => T::events(&entity, sink, cx),
+                None => Vec::new(),
+            })
+        };
+        self.install::<S, T>(
+            entity,
+            methods,
+            events,
+            Some(events_factory),
+            entity_id,
+            T::keep_alive(),
+            cx,
+        );
         let queued = std::mem::take(&mut self.inner.state.borrow_mut().pending_root_frames);
         for frame in queued {
             self.deliver(frame, cx);
@@ -255,7 +288,23 @@ impl Objects {
         T::methods(&mut methods);
         let entity_id = self.reserve_local_id();
         let events = T::events(entity, self.event_sink(entity_id), cx);
-        self.install::<S, T>(entity, methods, events, entity_id, T::keep_alive(), cx);
+        let events_factory: EventsFactory = {
+            // Weak: a home entry must not keep its entity alive past release.
+            let entity = entity.downgrade();
+            Rc::new(move |sink, cx| match entity.upgrade() {
+                Some(entity) => T::events(&entity, sink, cx),
+                None => Vec::new(),
+            })
+        };
+        self.install::<S, T>(
+            entity,
+            methods,
+            events,
+            Some(events_factory),
+            entity_id,
+            T::keep_alive(),
+            cx,
+        );
         Ref::new(entity_id, self.downgrade())
     }
 
@@ -275,7 +324,7 @@ impl Objects {
         let mut methods = Methods::new(entity.downgrade());
         register(&mut methods);
         let entity_id = self.reserve_local_id();
-        self.install::<S, T>(entity, methods, Vec::new(), entity_id, true, cx);
+        self.install::<S, T>(entity, methods, Vec::new(), None, entity_id, true, cx);
         Ref::new(entity_id, self.downgrade())
     }
 
@@ -427,9 +476,27 @@ impl Objects {
                 observers: Vec::new(),
                 entity: HomeEntity::None,
                 _subscriptions: Vec::new(),
+                resubscribe: None,
             },
         );
         entity_id
+    }
+
+    /// A call whose response is a ref, with the id for that ref minted here and now:
+    /// the returned remote addresses the object before the response arrives, and calls
+    /// through it queue FIFO behind the allocating call, so nothing waits a round trip
+    /// (promise pipelining). `response` still resolves with the actual ref.
+    pub(crate) fn promise_call<S: Interface>(
+        &self,
+        entity_id: u64,
+        method: &str,
+        payload: Payload,
+        response: ResponseSender,
+    ) -> Remote<S> {
+        let promised = self.reserve_local_id();
+        let remote = self.connect_id::<S>(promised);
+        self.send(entity_id, method, payload, Some(response), Some(promised));
+        remote
     }
 
     pub(crate) fn send(
@@ -438,6 +505,7 @@ impl Objects {
         method: &str,
         payload: Payload,
         response: Option<ResponseSender>,
+        promised: Option<u64>,
     ) {
         let call = {
             let mut state = self.inner.state.borrow_mut();
@@ -457,6 +525,7 @@ impl Objects {
                 request,
                 method: method.to_string(),
                 payload,
+                promised,
             }
         };
         (self.inner.sink)(Frame::Call(call));
@@ -500,6 +569,7 @@ impl Objects {
         entity: &Entity<T>,
         methods: Methods<S, T>,
         event_forwarders: Vec<Subscription>,
+        events_factory: Option<EventsFactory>,
         entity_id: u64,
         keep_alive: bool,
         cx: &mut App,
@@ -507,17 +577,26 @@ impl Objects {
         S: Interface,
         T: 'static,
     {
-        let objects = self.downgrade();
-        let mut subscriptions = vec![cx.observe(entity, move |_, _| {
-            if let Some(objects) = objects.upgrade() {
-                objects.notify_observers(entity_id, NOTIFY_EVENT, Payload::empty());
-            }
-        })];
+        let mut subscriptions = vec![self.observe_notify(entity, entity_id, cx)];
         subscriptions.extend(event_forwarders);
-        let entity = if keep_alive {
+        let home_entity = if keep_alive {
             HomeEntity::Strong(entity.clone().into_any())
         } else {
             HomeEntity::Weak(entity.downgrade().into())
+        };
+        let resubscribe: Resubscribe = {
+            // Weak: a home entry must not keep its entity alive past release.
+            let entity = entity.downgrade();
+            Rc::new(move |objects: &Objects, id: u64, cx: &mut App| {
+                let Some(entity) = entity.upgrade() else {
+                    return Vec::new();
+                };
+                let mut subscriptions = vec![objects.observe_notify(&entity, id, cx)];
+                if let Some(factory) = &events_factory {
+                    subscriptions.extend(factory(objects.event_sink(id), cx));
+                }
+                subscriptions
+            })
         };
         self.inner.state.borrow_mut().homes.insert(
             entity_id,
@@ -525,10 +604,116 @@ impl Objects {
                 type_name: crate::interface_name::<S>(),
                 handler: methods.into_handler(),
                 observers: Vec::new(),
-                entity,
+                entity: home_entity,
                 _subscriptions: subscriptions,
+                resubscribe: Some(resubscribe),
             },
         );
+    }
+
+    /// The observation that turns the entity's `cx.notify` into notifies for the
+    /// observers of `entity_id`.
+    fn observe_notify<T: 'static>(
+        &self,
+        entity: &Entity<T>,
+        entity_id: u64,
+        cx: &mut App,
+    ) -> Subscription {
+        let objects = self.downgrade();
+        cx.observe(entity, move |_, _| {
+            if let Some(objects) = objects.upgrade() {
+                objects.notify_observers(entity_id, NOTIFY_EVENT, Payload::empty());
+            }
+        })
+    }
+
+    /// Install the object homed at `from` under `to` as well: a second share of the same
+    /// entity, with its own observers and lifetime. How a promised id becomes real.
+    fn install_alias(&self, from: u64, to: u64, cx: &mut App) -> bool {
+        let source = {
+            let state = self.inner.state.borrow();
+            let Some(home) = state.homes.get(&from) else {
+                return false;
+            };
+            (
+                home.type_name,
+                home.handler.clone(),
+                home.entity.clone(),
+                home.resubscribe.clone(),
+            )
+        };
+        let (type_name, handler, entity, resubscribe) = source;
+        let subscriptions = resubscribe
+            .as_ref()
+            .map(|resubscribe| resubscribe(self, to, cx))
+            .unwrap_or_default();
+        self.inner.state.borrow_mut().homes.insert(
+            to,
+            HomeEntry {
+                type_name,
+                handler,
+                observers: Vec::new(),
+                entity,
+                _subscriptions: subscriptions,
+                resubscribe,
+            },
+        );
+        true
+    }
+
+    /// The allocating call of promise `promised` answered: install the returned object
+    /// under the promised id (or remember the failure), then deliver whatever arrived
+    /// for it meanwhile, in order.
+    fn resolve_promise(&self, promised: u64, outcome: &Result<Payload, String>, cx: &mut App) {
+        let result = match outcome {
+            Ok(payload) => match payload.refs.first() {
+                Some(actual) if self.install_alias(*actual, promised, cx) => Ok(()),
+                Some(actual) => Err(format!("promised object {actual} is not homed here")),
+                None => Err("the call returned no ref to promise".to_string()),
+            },
+            Err(error) => Err(error.clone()),
+        };
+        let queued = {
+            let mut state = self.inner.state.borrow_mut();
+            let queued = state.pending_promises.remove(&promised).unwrap_or_default();
+            if let Err(error) = &result {
+                state.failed_promises.insert(promised, error.clone());
+            }
+            queued
+        };
+        for frame in queued {
+            self.deliver(frame, cx);
+        }
+    }
+
+    /// Where a frame addressed to a promised id stands: queued (the promise is pending),
+    /// answered with the allocation's failure, or neither (a real object).
+    fn intercept_promised(&self, frame: Frame) -> Option<Frame> {
+        let target = match &frame {
+            Frame::Call(call) => call.target,
+            Frame::Subscribe { target, .. } | Frame::Release { target } => *target,
+            Frame::Response(_) => return Some(frame),
+        };
+        let failure = {
+            let mut state = self.inner.state.borrow_mut();
+            if let Some(queue) = state.pending_promises.get_mut(&target) {
+                queue.push(frame);
+                return None;
+            }
+            match &frame {
+                Frame::Release { .. } => state.failed_promises.remove(&target),
+                _ => state.failed_promises.get(&target).cloned(),
+            }
+        };
+        match failure {
+            None => Some(frame),
+            Some(reason) => {
+                if let Frame::Call(call) = frame {
+                    self.respond(call.request, Err(reason));
+                }
+                None
+            }
+        }
     }
 
     /// Send one notify or typed event from a local home to every observer object the
@@ -548,6 +733,7 @@ impl Objects {
                 request: None,
                 method: method.to_string(),
                 payload: payload.clone(),
+                promised: None,
             }));
         }
     }
@@ -556,6 +742,9 @@ impl Objects {
     /// dispatch a call to its home. Responses to calls (for frames carrying a request
     /// id) flow back through the sink, after any sends the handler itself made.
     pub fn deliver(&self, frame: Frame, cx: &mut App) {
+        let Some(frame) = self.intercept_promised(frame) else {
+            return;
+        };
         let call = match frame {
             Frame::Response(response) => {
                 self.deliver_response(response);
@@ -591,6 +780,7 @@ impl Objects {
                         request: None,
                         method: NOTIFY_EVENT.to_string(),
                         payload: Payload::empty(),
+                        promised: None,
                     }));
                 }
                 return;
@@ -622,7 +812,12 @@ impl Objects {
             // Straight to the object's one handler; how it interprets the name (a
             // `Methods` table, a wildcard, anything) is its business, never the
             // registry's.
-            home.handler.clone()
+            let handler = home.handler.clone();
+            if let Some(promised) = call.promised {
+                // Frames for the promised object wait here until it exists.
+                state.pending_promises.entry(promised).or_default();
+            }
+            handler
         };
         // Refs in the payload resolve against this registry.
         let payload = call.payload.bound(self.downgrade());
@@ -633,12 +828,16 @@ impl Objects {
                 // its task resolves.
                 let objects = self.clone();
                 let request = call.request;
-                cx.spawn(async move |_| {
+                let promised = call.promised;
+                cx.spawn(async move |cx| {
                     let outcome = task.await.map_err(|error| format!("{error:#}"));
                     if let Err(error) = &outcome {
                         log::error!("embedded_gpui: method call failed: {error}");
                     }
-                    objects.respond(request, outcome);
+                    objects.respond(request, outcome.clone());
+                    if let Some(promised) = promised {
+                        cx.update(|cx| objects.resolve_promise(promised, &outcome, cx));
+                    }
                 })
                 .detach();
                 return;
@@ -647,7 +846,10 @@ impl Objects {
         if let Err(error) = &outcome {
             log::error!("embedded_gpui: method call failed: {error}");
         }
-        self.respond(call.request, outcome);
+        self.respond(call.request, outcome.clone());
+        if let Some(promised) = call.promised {
+            self.resolve_promise(promised, &outcome, cx);
+        }
     }
 
     fn respond(&self, request: Option<u64>, outcome: Result<Payload, String>) {

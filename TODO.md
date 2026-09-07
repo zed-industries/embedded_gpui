@@ -48,15 +48,10 @@ Views are `SurfaceApi`/`ViewApi` objects; see `DESIGN.md`. What remains:
 
 ## Object model follow-ups (from the root-object pass)
 
-- [ ] **Promise pipelining**: a ref returned by a method call round-trips before
-  you can call through it (the demo's views render a brief "connecting" state;
-  the receipts already resolve to connected `Remote`s, so only the latency is
-  left). Random ids open the cleanest design: *caller-allocated ids*, where the
-  calling end mints the id for the object a method will return and sends it in
-  the request — the returned `Remote` is usable immediately, sends FIFO behind
-  the allocating call, and no promise tables exist. Needs home-side binding of
-  the pre-minted id. (This is CapTP's `answer-pos` mechanism reached from the
-  random-ids direction; see the prior-art section in DESIGN.md.)
+- [x] **Promise pipelining**: caller-allocated ids (see "Promise pipelining" in
+  DESIGN.md). Open: a promised id is one more id per allocation until share dedup
+  collapses it with the actual one; and a router between plugins would have to learn
+  promised ids as they are minted.
 - [ ] **Share dedup**: sharing the same entity twice mints two independent ids.
   Dedup wants a per-entity identity map (and interacts with release: both refs
   share one strong hold).

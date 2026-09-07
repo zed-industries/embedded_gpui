@@ -597,6 +597,51 @@ impl Registry {
 /// it can outlive the boundary it came from (calls then resolve their receipts with
 /// errors).
 ///
+/// The result of a ref-returning method: a remote you can use *now*, before the
+/// response has come back, plus the response itself.
+///
+/// The caller minted the object's id and sent it with the call, so calls through the
+/// remote queue FIFO behind the allocating call and reach the object as soon as it
+/// exists — no round trip in between (promise pipelining, CapTP-style, reached from the
+/// random-ids direction: no promise tables, just an id known early). It derefs to the
+/// [`Remote`]; `.await` resolves once the home has answered, with a remote for the
+/// actual ref (the same entity, under the id the home minted) or the call's error. If
+/// the allocating call fails, every call through the promised remote fails with that
+/// error.
+pub struct Promised<S: Interface> {
+    remote: Remote<S>,
+    receipt: Receipt<Remote<S>>,
+}
+
+impl<S: Interface> Promised<S> {
+    /// The remote for the promised object, usable immediately.
+    pub fn remote(&self) -> Remote<S> {
+        self.remote.clone()
+    }
+
+    /// The response: the remote for the actual ref, once the home has answered.
+    pub fn resolved(self) -> Receipt<Remote<S>> {
+        self.receipt
+    }
+}
+
+impl<S: Interface> std::ops::Deref for Promised<S> {
+    type Target = Remote<S>;
+
+    fn deref(&self) -> &Remote<S> {
+        &self.remote
+    }
+}
+
+impl<S: Interface> std::future::IntoFuture for Promised<S> {
+    type Output = anyhow::Result<Remote<S>>;
+    type IntoFuture = Receipt<Remote<S>>;
+
+    fn into_future(self) -> Receipt<Remote<S>> {
+        self.receipt
+    }
+}
+
 /// Reads are calls: state lives at the home, and anything you want to look at is a
 /// method returning it (cache it locally with `embedded_gpui_util::Mirror` if you need
 /// synchronous reads for rendering).
@@ -659,7 +704,7 @@ impl<S: Interface> Remote<S> {
         match self.objects.upgrade() {
             // Dropping `sender` resolves the receipt with an error.
             None => log::warn!("embedded_gpui: call after the boundary was torn down"),
-            Some(objects) => objects.send(self.entity_id, method, payload, Some(sender)),
+            Some(objects) => objects.send(self.entity_id, method, payload, Some(sender), None),
         }
         receipt
     }
@@ -698,21 +743,33 @@ impl<S: Interface> Remote<S> {
     /// with a live [`Remote`] already connected to it: object allocation across the
     /// boundary, one call from handle to handle. The schema's generated caller uses
     /// this for every `Ref`-returning method.
-    pub fn call_connecting<M, S2>(&self, message: M, _cx: &mut gpui::App) -> Receipt<Remote<S2>>
+    pub fn call_connecting<M, S2>(&self, message: M, _cx: &mut gpui::App) -> Promised<S2>
     where
         M: Message<Spec = S, Response = Ref<S2>>,
         S2: Interface,
     {
-        match encode(&message) {
-            Ok(payload) => self.request(M::METHOD, payload).connected(),
-            Err(error) => {
+        let (sender, receipt) = Receipt::channel();
+        let remote = match (encode(&message), self.objects.upgrade()) {
+            (Ok(payload), Some(objects)) => {
+                objects.promise_call::<S2>(self.entity_id, M::METHOD, payload, sender)
+            }
+            (Err(error), _) => {
                 log::error!(
                     "embedded_gpui: failed to encode {}::{}: {error:#}",
                     interface_name::<S>(),
                     M::METHOD
                 );
-                Receipt::dropped()
+                // Dropping `sender` fails the receipt; the remote addresses nothing.
+                Remote::from_parts(self.objects.clone(), u64::MAX, None)
             }
+            (Ok(_), None) => {
+                log::warn!("embedded_gpui: call after the boundary was torn down");
+                Remote::from_parts(self.objects.clone(), u64::MAX, None)
+            }
+        };
+        Promised {
+            remote,
+            receipt: receipt.connected(),
         }
     }
 

@@ -30,6 +30,7 @@ fn frame_to_wire(frame: Frame) -> wit::Frame {
             method: call.method,
             payload: call.payload.bytes,
             refs: call.payload.refs,
+            promised: call.promised,
         }),
         Frame::Response(response) => {
             let (outcome, refs) = match response.outcome {
@@ -56,6 +57,7 @@ fn frame_from_wire(frame: wit::Frame) -> Frame {
             request: call.request,
             method: call.method,
             payload: Payload::from_parts(call.payload, call.refs),
+            promised: call.promised,
         }),
         wit::Frame::Response(response) => Frame::Response(Response {
             request: response.request,

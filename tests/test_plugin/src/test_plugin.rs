@@ -3,7 +3,7 @@
 //! attenuation, and fully dynamic dispatch.
 
 use anyhow::anyhow;
-use embedded_gpui::surface::{Geometry, SurfaceApi};
+use embedded_gpui::surface::SurfaceApi;
 use embedded_gpui::{
     Payload, Plugin, Ref, Remote, decode, encode, open_view, register_plugin, root, share,
     share_root, share_with, shared,
@@ -13,7 +13,7 @@ use gpui::{
     App, Context, Entity, EventEmitter, MouseDownEvent, Task, WeakEntity, Window, canvas, div,
     prelude::*, rgb,
 };
-use test_schema::{
+use test_schema::{SeenGeometry, 
     ChameleonApi, ChameleonState, CounterMilestone, FactoryApi, GatekeeperApi, ItemApi, ItemInfo,
     TestCounterApi, TestHost, TestHostCaller as _, TestPlugin, VaultApi, ViewProbeApi,
 };
@@ -154,17 +154,14 @@ impl TestPlugin for Root {
     fn mount(&mut self, surface: Ref<SurfaceApi>, cx: &mut Context<Self>) -> Ref<ViewProbeApi> {
         let probe = cx.new(|_| ViewProbe { view: None });
         let weak_probe = probe.downgrade();
-        let opened = open_view(surface, cx, |_, cx| {
-            let view = cx.new(|_| ProbeView {
-                geometry: None,
-                clicks: 0,
-            });
-            weak_probe
-                .update(cx, |probe, _| probe.view = Some(view.downgrade()))
-                .ok();
-            view
+        let view = cx.new(|_| ProbeView {
+            geometry: None,
+            clicks: 0,
         });
-        if let Err(error) = opened {
+        weak_probe
+            .update(cx, |probe, _| probe.view = Some(view.downgrade()))
+            .ok();
+        if let Err(error) = open_view(surface, view, cx) {
             embedded_gpui::log::error!("test_plugin: open_view failed: {error:#}");
         }
         let reference = share(&probe, cx);
@@ -175,7 +172,7 @@ impl TestPlugin for Root {
 
 /// The root view of a mounted window: records what the host drives it with.
 struct ProbeView {
-    geometry: Option<Geometry>,
+    geometry: Option<SeenGeometry>,
     clicks: u32,
 }
 
@@ -197,9 +194,14 @@ impl Render for ProbeView {
             .child(
                 canvas(
                     move |bounds, window, cx| {
-                        let geometry = Geometry {
+                        let viewport = window.viewport_size();
+                        let geometry = SeenGeometry {
+                            x: f32::from(bounds.origin.x),
+                            y: f32::from(bounds.origin.y),
                             width: f32::from(bounds.size.width),
                             height: f32::from(bounds.size.height),
+                            viewport_width: f32::from(viewport.width),
+                            viewport_height: f32::from(viewport.height),
                             scale_factor: window.scale_factor(),
                         };
                         measured.update(cx, |this, _| this.geometry = Some(geometry));
@@ -218,7 +220,7 @@ struct ViewProbe {
 
 #[shared]
 impl ViewProbeApi for ViewProbe {
-    fn last_geometry(&mut self, cx: &mut Context<Self>) -> Option<Geometry> {
+    fn last_geometry(&mut self, cx: &mut Context<Self>) -> Option<SeenGeometry> {
         let view = self.view.as_ref()?.upgrade()?;
         view.read(cx).geometry
     }

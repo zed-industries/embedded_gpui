@@ -7,7 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use embedded_gpui::surface::{
-    Geometry, Modifiers, MouseButton, MouseButtonEvent, MouseEvent, Point, ViewApiCaller as _,
+    Geometry, HostWindow, Modifiers, MouseButton, MouseButtonEvent, MouseEvent, Point,
+    ViewApiCaller as _,
 };
 use embedded_gpui::{
     PluginHost, PluginHostHandle as _, PluginInstance, PluginOptions, Ref, Remote, Surface, decode,
@@ -191,9 +192,16 @@ async fn test_script_renders_a_view_and_receives_input(cx: &mut TestAppContext) 
     cx.update(|cx| {
         view.resize(
             Geometry {
+                x: 0.,
+                y: 0.,
                 width: 200.,
                 height: 100.,
-                scale_factor: 1.,
+                window: HostWindow {
+                    id: 1,
+                    width: 640.,
+                    height: 480.,
+                    scale_factor: 1.,
+                },
             },
             cx,
         )
@@ -241,9 +249,16 @@ async fn test_reload_starts_clean_and_replays_the_host(cx: &mut TestAppContext) 
     cx.update(|cx| {
         first_view.resize(
             Geometry {
+                x: 0.,
+                y: 0.,
                 width: 200.,
                 height: 100.,
-                scale_factor: 1.,
+                window: HostWindow {
+                    id: 1,
+                    width: 640.,
+                    height: 480.,
+                    scale_factor: 1.,
+                },
             },
             cx,
         );
@@ -280,9 +295,16 @@ async fn test_reload_starts_clean_and_replays_the_host(cx: &mut TestAppContext) 
     cx.update(|cx| {
         second_view.resize(
             Geometry {
+                x: 0.,
+                y: 0.,
                 width: 200.,
                 height: 100.,
-                scale_factor: 1.,
+                window: HostWindow {
+                    id: 1,
+                    width: 640.,
+                    height: 480.,
+                    scale_factor: 1.,
+                },
             },
             cx,
         );

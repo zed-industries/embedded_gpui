@@ -7,8 +7,9 @@
 //!   through whatever typed method the plugin's own schema defines. Display lists are
 //!   addressed to it by object id.
 //! - A [`ViewApi`] object is guest-homed: the thing drawing on a surface. The guest
-//!   opens a GPUI window bound to the surface, shares the view, and calls
-//!   `surface.attach(view)`; the host then drives it with `resize`, `mouse`, and `key`.
+//!   shares the view object and calls `surface.attach(view)`; the host then drives it
+//!   with `resize`, `mouse`, and `key`. On the guest the view is a root of a window that
+//!   mirrors the host window the surface is in (see [`Geometry`]).
 //!
 //! Both are ordinary objects, so every capability tool applies: an
 //! `Attenuated<ViewApi>` allowing only `resize` is a display-only view, a `Revocable`
@@ -34,7 +35,8 @@ pub trait SurfaceApi {
 /// The thing drawing on a surface: a guest window.
 #[interface]
 pub trait ViewApi {
-    /// The surface's slot changed size or scale factor (also sent once on attach).
+    /// The surface's slot moved or changed size, or its host window changed size, scale
+    /// factor, or identity (also sent once on attach).
     fn resize(&mut self, geometry: Geometry, cx: &mut gpui::Context<Self>);
 
     fn mouse(&mut self, event: MouseEvent, cx: &mut gpui::Context<Self>);
@@ -42,11 +44,30 @@ pub trait ViewApi {
     fn key(&mut self, event: KeyEvent, cx: &mut gpui::Context<Self>);
 }
 
-/// A slot's size in logical pixels plus the window scale factor the view should render
-/// at.
+/// Where a surface's slot is: its bounds in a host window, and that window. The guest
+/// keeps one window per host window it hears of, mirroring its size and scale factor,
+/// and draws each view as a root of that window at the slot's real origin. So inside a
+/// view, `window.viewport_size()` is the host's viewport, a popover clamps to the host
+/// window's edges, and two views cannot overlap unless the host overlaps their slots.
 #[data]
 #[derive(Copy, PartialEq)]
 pub struct Geometry {
+    /// The slot's origin in the host window, logical pixels.
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub window: HostWindow,
+}
+
+/// The host window a surface is in.
+#[data]
+#[derive(Copy, PartialEq)]
+pub struct HostWindow {
+    /// Stable for the window's lifetime and distinct among the host's windows: surfaces
+    /// reporting the same id share one guest window.
+    pub id: u64,
+    /// The window's viewport, logical pixels.
     pub width: f32,
     pub height: f32,
     pub scale_factor: f32,

@@ -12,10 +12,11 @@ changes; nothing here is a supported API yet.
 
 ## What works today
 
-- A guest-side GPUI platform: one composition window per plugin in which every
-  host surface is a root of the frame (a memoized node-engine node, not a window),
-  per-surface display lists shipped only when a root changed, mouse and keyboard
-  input, timers/async, SVG and image rendering, text via host-side shaping. The WIT protocol (`wit/plugin.wit`) is pure substrate — `init`,
+- A guest-side GPUI platform: guest windows that mirror the host's windows (same
+  size and scale factor), in which every host surface is a root of the frame at its
+  real origin (a memoized node-engine node, not a window), per-surface display lists
+  shipped only when a root changed, mouse and keyboard input, timers/async, SVG and
+  image rendering, text via host-side shaping. The WIT protocol (`wit/plugin.wit`) is pure substrate — `init`,
   `tick(inbound frames) -> turn`, and synchronous text shaping; nothing in it
   has UI meaning.
 - A host runtime: loads a component with wasmtime on a background worker,
@@ -87,9 +88,9 @@ div()
     .child(panel)
 ```
 
-On the guest, drawing on a surface is `open_view(surface, cx, |window, cx| ...)`: the
-view is built in the plugin's one window and attached as a root of it at the surface's
-slot; its scene goes to that surface whenever it changes.
+On the guest, drawing on a surface is `open_view(surface, view, cx)`: the view becomes
+a root of the guest window mirroring the surface's host window, at the slot's real
+origin; its scene goes to that surface whenever it changes.
 
 The WASI sandbox grants nothing but stdout/stderr by default; every additional
 authority is an explicit `PluginOptions::with_wasi` choice — and everything the

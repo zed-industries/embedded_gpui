@@ -6,13 +6,15 @@ what it would do with the node engine, and the specific capability that needs.
 
 ## Where we stand
 
-A plugin is a GPUI `App` inside a wasm component with one `Window`. Every host **surface**
-a plugin draws on is a root attached to that window (`Window::attach_root`, added on top
-of the node engine as branch `gpui-multi-root-embedded`): a node of its own, memoized,
-hit-tested and dispatched to like any mounted view. After a frame the guest reads each
-root's scene back (`Window::take_root_scene`), which answers only for roots whose node was
-redrawn, and ships that as the surface's display list; the host replays the list into its
-own frame. Items 1 and 2 below are therefore done on the guest side; 3–6 remain.
+A plugin is a GPUI `App` inside a wasm component whose windows mirror the host's: one
+guest window per host window a surface is in, with its size and scale factor. Every host
+**surface** is a root attached to its window at the slot's real origin
+(`Window::attach_root`, added on top of the node engine as branch
+`gpui-multi-root-embedded`): a node of its own, memoized, hit-tested and dispatched to
+like any mounted view. After a frame the guest reads each root's scene back
+(`Window::take_root_scene`), which answers only for roots whose node was redrawn, and
+ships that as the surface's display list; the host replays the list into its own frame.
+Items 1, 2 and 5 below are therefore done on the guest side; 3, 4 and 6 remain.
 
 Before this, every surface was a guest `Window` of its own: the whole scene reshipped when
 one leaf changed, and a widget per buffer line meant a window per line.
@@ -81,16 +83,12 @@ after the fact.
 fragment. Listener *invocation* stays in the guest (that's where the closures live); only
 the routing decision moves.
 
-## 5. Scale factor per node (or per fragment root)
+## 5. Scale factor per node (or per fragment root) — not needed
 
-**Need:** the ambient inputs a clean scope checks before reuse should include scale
-factor, and a fragment root should be able to render at a scale different from its
-window's.
-
-**Why:** two surfaces of one plugin can sit on two host windows with different scale
-factors. With one guest window per plugin (which is what we have now), the window takes
-whichever factor the host last reported; per-node scale is what keeps text crisp on both
-displays.
+Scale factor is a window property, and the guest now has one window per host window, so
+two surfaces on two displays are roots of two guest windows with two scale factors. The
+engine's cache key already includes the scale factor, which is what a mirror needs when
+its host window moves between displays.
 
 ## 6. Focus per node, with an explicit boundary
 

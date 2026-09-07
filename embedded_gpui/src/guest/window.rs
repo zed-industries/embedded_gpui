@@ -1,48 +1,26 @@
-//! The guest's one window: a composition space in which every host surface is an
-//! attached root (`Window::attach_root`). Surfaces are laid out in a grid of fixed cells
-//! so that a surface's coordinates never depend on other surfaces (resizing one never
-//! moves another, and hit-testing separates them by position alone), and each root's
-//! scene is read back on its own (`Window::take_root_scene`) and shipped to its surface
-//! only when it changed.
+//! A guest window: the mirror of one host window. It has the host window's size and
+//! scale factor, every host surface in that window is a root attached to it at the
+//! slot's real origin (`Window::attach_root`), and after each frame each root's scene
+//! is read back on its own (`Window::take_root_scene`) and shipped to its surface only
+//! when it changed. The platform owns the table of surfaces and windows; this is one
+//! window's state and its `PlatformWindow`.
 
-use crate::guest::objects;
 use crate::platform::PluginDisplay;
-use crate::surface::SurfaceApi;
+use crate::surface::HostWindow;
 use crate::text_system::{PluginAtlas, PluginTextSystem, TileContent};
 use crate::wit;
-use anyhow::{Result, anyhow};
-use embedded_gpui::Remote;
+use anyhow::Result;
 use futures::channel::oneshot;
 use gpui::{
-    AnyView, AnyWindowHandle, App, AsyncApp, AttachedRootId, Bounds, Capslock, DispatchEventResult,
-    GpuSpecs, Modifiers, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
-    PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
-    ScaledPixels, Scene, Size, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControlArea, point, px, size,
+    AnyWindowHandle, Bounds, Capslock, DispatchEventResult, GpuSpecs, Modifiers, Pixels,
+    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+    PromptButton, PromptLevel, RequestFrameOptions, ScaledPixels, Scene, Size, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, point, px, size,
 };
 use raw_window_handle as rwh;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Once};
-
-/// The side of one grid cell in logical pixels; the largest slot a surface can be.
-pub const CELL_SIZE: f32 = 8192.;
-const COLUMNS: usize = 32;
-const ROWS: usize = 32;
-
-/// The composition window's fixed size: the whole grid. Coordinates stay small enough
-/// for `f32` to keep subpixel precision everywhere in it.
-pub fn composition_size() -> Size<Pixels> {
-    size(px(COLUMNS as f32 * CELL_SIZE), px(ROWS as f32 * CELL_SIZE))
-}
-
-fn cell_origin(cell: usize) -> Point<Pixels> {
-    point(
-        px((cell % COLUMNS) as f32 * CELL_SIZE),
-        px((cell / COLUMNS) as f32 * CELL_SIZE),
-    )
-}
 
 type RequestFrameCallback = Box<dyn FnMut(RequestFrameOptions)>;
 type InputCallback = Box<dyn FnMut(PlatformInput) -> DispatchEventResult>;
@@ -55,74 +33,28 @@ struct Callbacks {
     resize: Option<ResizeCallback>,
 }
 
-/// One host surface's place in the composition window.
-struct SurfaceRoot {
-    surface: Remote<SurfaceApi>,
-    view: AnyView,
-    cell: usize,
-    /// Distinguishes registrations: a surface reattached while its previous view's
-    /// release is still pending must not lose the new view to that release.
-    generation: u64,
-    /// The GPUI root, once the host has sent the slot's geometry. Until then the view is
-    /// not drawn, so its first frame is at the slot's real size.
-    attached: Option<AttachedRootId>,
-}
-
-/// Shared state for the guest's composition window: the platform's `PlatformWindow`
-/// and the exports reach it through one `Rc`.
+/// Shared state for one guest window: the platform's `PlatformWindow` and the surface
+/// table reach it through one `Rc`.
 pub struct PluginWindowState {
-    scale_factor: Cell<f32>,
+    host: Cell<HostWindow>,
     mouse_position: Cell<Point<Pixels>>,
     atlas: Arc<PluginAtlas>,
     callbacks: RefCell<Callbacks>,
     input_handler: RefCell<Option<PlatformInputHandler>>,
     handle: Cell<Option<AnyWindowHandle>>,
-    /// Surfaces with a view, keyed by surface object id.
-    roots: RefCell<HashMap<u64, SurfaceRoot>>,
-    free_cells: RefCell<Vec<usize>>,
-    next_cell: Cell<usize>,
-    next_generation: Cell<u64>,
-    /// Shared with the platform: the surface that most recently received input.
-    last_input_surface: Rc<Cell<Option<u64>>>,
-    /// Geometry and input the host delivered this turn. `ViewApi` handlers run inside
-    /// the registry's `App` borrow, and GPUI's window callbacks re-enter the app, so the
-    /// pump applies these once the borrow is released.
-    pending: RefCell<Vec<WindowEvent>>,
     /// GPUI dropped its `PlatformWindow`: nothing may be dispatched to this state again.
     closed: Cell<bool>,
 }
 
-/// One host-driven event, applied by the pump.
-pub enum WindowEvent {
-    Resize {
-        surface: u64,
-        size: Size<Pixels>,
-        scale_factor: f32,
-    },
-    Input {
-        surface: u64,
-        input: PlatformInput,
-    },
-}
-
 impl PluginWindowState {
-    pub fn new(
-        text_system: Arc<PluginTextSystem>,
-        last_input_surface: Rc<Cell<Option<u64>>>,
-    ) -> Self {
+    pub fn new(host: HostWindow, text_system: Arc<PluginTextSystem>) -> Self {
         Self {
-            scale_factor: Cell::new(1.),
+            host: Cell::new(host),
             mouse_position: Cell::new(Point::default()),
             atlas: Arc::new(PluginAtlas::new(text_system)),
             callbacks: RefCell::new(Callbacks::default()),
             input_handler: RefCell::new(None),
             handle: Cell::new(None),
-            roots: RefCell::new(HashMap::new()),
-            free_cells: RefCell::new(Vec::new()),
-            next_cell: Cell::new(0),
-            next_generation: Cell::new(0),
-            last_input_surface,
-            pending: RefCell::new(Vec::new()),
             closed: Cell::new(false),
         }
     }
@@ -139,110 +71,39 @@ impl PluginWindowState {
         self.handle.get()
     }
 
-    /// Give `surface` a view to draw. Replaces a previous view of the same surface (a
-    /// reattach). Returns the registration's generation, which identifies it to
-    /// [`remove_surface`](Self::remove_surface).
-    pub fn add_surface(
-        &self,
-        surface: Remote<SurfaceApi>,
-        view: AnyView,
-        cx: &mut App,
-    ) -> Result<u64> {
-        let surface_id = surface.reference().entity_id();
-        let previous = self.roots.borrow_mut().remove(&surface_id);
-        let cell = match previous {
-            Some(previous) => {
-                self.detach(previous.attached, cx);
-                previous.cell
-            }
-            None => self.allocate_cell()?,
-        };
-        let generation = self.next_generation.get();
-        self.next_generation.set(generation + 1);
-        self.roots.borrow_mut().insert(
-            surface_id,
-            SurfaceRoot {
-                surface,
-                view,
-                cell,
-                generation,
-                attached: None,
-            },
-        );
-        Ok(generation)
+    pub fn atlas(&self) -> &Arc<PluginAtlas> {
+        &self.atlas
     }
 
-    /// Stop drawing on `surface`, if `generation` is still the registration drawing there.
-    pub fn remove_surface(&self, surface: u64, generation: u64, cx: &mut App) {
-        let removed = {
-            let mut roots = self.roots.borrow_mut();
-            if roots
-                .get(&surface)
-                .is_some_and(|root| root.generation == generation)
-            {
-                roots.remove(&surface)
-            } else {
-                None
-            }
-        };
-        if let Some(root) = removed {
-            self.detach(root.attached, cx);
-            self.free_cells.borrow_mut().push(root.cell);
-        }
+    pub fn scale_factor(&self) -> f32 {
+        self.host.get().scale_factor
     }
 
-    /// The surface object behind a surface id, if a view is drawing on it.
-    pub fn surface_remote(&self, surface: u64) -> Option<Remote<SurfaceApi>> {
-        self.roots
-            .borrow()
-            .get(&surface)
-            .map(|root| root.surface.clone())
+    /// The host window this one mirrors.
+    pub fn host_id(&self) -> u64 {
+        self.host.get().id
     }
 
-    fn allocate_cell(&self) -> Result<usize> {
-        if let Some(cell) = self.free_cells.borrow_mut().pop() {
-            return Ok(cell);
-        }
-        let cell = self.next_cell.get();
-        if cell >= COLUMNS * ROWS {
-            return Err(anyhow!(
-                "embedded_gpui: at most {} surfaces can be open at once",
-                COLUMNS * ROWS
-            ));
-        }
-        self.next_cell.set(cell + 1);
-        Ok(cell)
+    fn size(&self) -> Size<Pixels> {
+        let host = self.host.get();
+        size(px(host.width), px(host.height))
     }
 
-    fn detach(&self, attached: Option<AttachedRootId>, cx: &mut App) {
-        if let (Some(id), Some(handle)) = (attached, self.handle.get()) {
-            handle
-                .update(cx, |_, window, _| window.detach_root(id))
-                .ok();
-        }
-    }
-
-    /// Queue a host-driven event for the next pump.
-    pub fn push_event(&self, event: WindowEvent) {
-        self.pending.borrow_mut().push(event);
-    }
-
-    /// Apply the queued events, in order. Called outside any `App` borrow: GPUI's window
-    /// callbacks borrow the app themselves.
-    pub fn flush_events(&self, async_app: &mut AsyncApp) {
-        let events = std::mem::take(&mut *self.pending.borrow_mut());
-        if self.closed.get() {
+    /// Follow the host window: a change of size or scale factor re-lays the window out.
+    /// Called outside any `App` borrow, since GPUI's resize callback borrows the app.
+    pub fn sync_host(&self, host: HostWindow) {
+        let current = self.host.get();
+        if current.width == host.width
+            && current.height == host.height
+            && current.scale_factor == host.scale_factor
+        {
             return;
         }
-        for event in events {
-            match event {
-                WindowEvent::Resize {
-                    surface,
-                    size,
-                    scale_factor,
-                } => self.resized(surface, size, scale_factor, async_app),
-                WindowEvent::Input { surface, input } => self.dispatch_input(surface, input),
-            }
+        self.host.set(host);
+        let callback = self.callbacks.borrow_mut().resize.take();
+        if let Some(mut callback) = callback {
+            callback(self.size(), host.scale_factor);
+            self.callbacks.borrow_mut().resize = Some(callback);
         }
     }
 
@@ -265,70 +126,21 @@ impl PluginWindowState {
         }
     }
 
-    /// Ship every root whose scene changed since it was last shipped, as that surface's
-    /// display list. Roots GPUI reused unchanged cost nothing here.
-    pub fn ship_scenes(&self, cx: &mut App) {
-        let Some(handle) = self.handle.get() else {
-            return;
-        };
-        if self.closed.get() {
-            return;
-        }
-        let scale_factor = self.scale_factor.get();
-        let roots = self.roots.borrow();
-        handle
-            .update(cx, |_, window, _| {
-                for (surface_id, root) in roots.iter() {
-                    let Some(attached) = root.attached else {
-                        continue;
-                    };
-                    if let Some(scene) = window.take_root_scene(attached) {
-                        let list = serialize_scene(
-                            &scene,
-                            scale_factor,
-                            cell_origin(root.cell),
-                            &self.atlas,
-                        );
-                        objects::push_scene(*surface_id, list);
-                    }
-                }
-            })
-            .ok();
-    }
-
-    /// Dispatch a host-forwarded input event through GPUI's input pipeline, translated
-    /// from the surface's slot to its cell in the composition window.
+    /// Dispatch an input event, already in this window's coordinates, through GPUI's
+    /// input pipeline.
     ///
     /// Unhandled printable key-downs fall through to the focused input handler, the same way
     /// GPUI's Linux backends synthesize text input from key events (there is no OS IME on
     /// this side of the wasm boundary).
-    pub fn dispatch_input(&self, surface: u64, mut input: PlatformInput) {
-        let Some(origin) = self
-            .roots
-            .borrow()
-            .get(&surface)
-            .map(|root| cell_origin(root.cell))
-        else {
+    pub fn dispatch_input(&self, input: PlatformInput) {
+        if self.closed.get() {
             return;
-        };
-        self.last_input_surface.set(Some(surface));
-        match &mut input {
-            PlatformInput::MouseDown(event) => {
-                event.position += origin;
-                self.mouse_position.set(event.position);
-            }
-            PlatformInput::MouseUp(event) => {
-                event.position += origin;
-                self.mouse_position.set(event.position);
-            }
-            PlatformInput::MouseMove(event) => {
-                event.position += origin;
-                self.mouse_position.set(event.position);
-            }
-            PlatformInput::ScrollWheel(event) => {
-                event.position += origin;
-                self.mouse_position.set(event.position);
-            }
+        }
+        match &input {
+            PlatformInput::MouseDown(event) => self.mouse_position.set(event.position),
+            PlatformInput::MouseUp(event) => self.mouse_position.set(event.position),
+            PlatformInput::MouseMove(event) => self.mouse_position.set(event.position),
+            PlatformInput::ScrollWheel(event) => self.mouse_position.set(event.position),
             _ => {}
         }
         let callback = self.callbacks.borrow_mut().input.take();
@@ -349,73 +161,10 @@ impl PluginWindowState {
             self.input_handler.replace(Some(input_handler));
         }
     }
-
-    /// Apply a slot size or scale factor change coming from the host: the surface's root
-    /// is attached at its cell (the first time) or moved to the new size.
-    fn resized(
-        &self,
-        surface: u64,
-        size: Size<Pixels>,
-        scale_factor: f32,
-        async_app: &mut AsyncApp,
-    ) {
-        static OVERSIZED_WARNED: Once = Once::new();
-        if size.width <= Pixels::ZERO || size.height <= Pixels::ZERO {
-            return;
-        }
-        let mut size = size;
-        if size.width > px(CELL_SIZE) || size.height > px(CELL_SIZE) {
-            warn_once(
-                &OVERSIZED_WARNED,
-                "embedded_gpui: a surface larger than 8192px is clipped to that size",
-            );
-            size.width = size.width.min(px(CELL_SIZE));
-            size.height = size.height.min(px(CELL_SIZE));
-        }
-        if scale_factor != self.scale_factor.get() {
-            // One scale factor per plugin: every surface of it is assumed to be on the
-            // same display. GPUI re-lays the window out for the new factor.
-            self.scale_factor.set(scale_factor);
-            let callback = self.callbacks.borrow_mut().resize.take();
-            if let Some(mut callback) = callback {
-                callback(composition_size(), scale_factor);
-                self.callbacks.borrow_mut().resize = Some(callback);
-            }
-        }
-        let Some(handle) = self.handle.get() else {
-            return;
-        };
-        let Some((view, cell, attached)) = self
-            .roots
-            .borrow()
-            .get(&surface)
-            .map(|root| (root.view.clone(), root.cell, root.attached))
-        else {
-            return;
-        };
-        let bounds = Bounds {
-            origin: cell_origin(cell),
-            size,
-        };
-        let attached = async_app.update(|cx| {
-            handle
-                .update(cx, |_, window, _| match attached {
-                    Some(id) => {
-                        window.set_root_bounds(id, bounds);
-                        id
-                    }
-                    None => window.attach_root(view, bounds),
-                })
-                .ok()
-        });
-        if let Some(root) = self.roots.borrow_mut().get_mut(&surface) {
-            root.attached = attached.or(root.attached);
-        }
-    }
 }
 
-/// The `PlatformWindow` handed to GPUI. GPUI owns this box; the platform and the exports
-/// reach the same state through the `Rc` kept in `PluginPlatform`.
+/// The `PlatformWindow` handed to GPUI. GPUI owns this box; the platform reaches the
+/// same state through the `Rc` it keeps.
 pub struct PluginWindow {
     state: Rc<PluginWindowState>,
     display: Rc<PluginDisplay>,
@@ -429,7 +178,7 @@ impl PluginWindow {
     fn bounds_px(&self) -> Bounds<Pixels> {
         Bounds {
             origin: Point::default(),
-            size: composition_size(),
+            size: self.state.size(),
         }
     }
 }
@@ -445,7 +194,7 @@ impl Drop for PluginWindow {
 impl rwh::HasWindowHandle for PluginWindow {
     fn window_handle(&self) -> Result<rwh::WindowHandle<'_>, rwh::HandleError> {
         // A synthetic handle: nothing consumes it, but the trait requires one.
-        let raw = rwh::WebWindowHandle::new(1);
+        let raw = rwh::WebWindowHandle::new(self.state.host.get().id as u32);
         Ok(unsafe { rwh::WindowHandle::borrow_raw(rwh::RawWindowHandle::Web(raw)) })
     }
 }
@@ -471,15 +220,15 @@ impl PlatformWindow for PluginWindow {
     }
 
     fn content_size(&self) -> Size<Pixels> {
-        composition_size()
+        self.state.size()
     }
 
     fn resize(&mut self, _size: Size<Pixels>) {
-        // The composition window has a fixed size; the host owns every surface's geometry.
+        // The window mirrors a host window; only the host resizes it.
     }
 
     fn scale_factor(&self) -> f32 {
-        self.state.scale_factor.get()
+        self.state.scale_factor()
     }
 
     fn appearance(&self) -> WindowAppearance {
@@ -576,8 +325,8 @@ impl PlatformWindow for PluginWindow {
     fn on_appearance_changed(&self, _callback: Box<dyn FnMut()>) {}
 
     fn draw(&self, _scene: &Scene) {
-        // The composite scene is never presented as a whole: after each frame the pump
-        // reads every surface root's scene on its own (`ship_scenes`).
+        // The window's scene as a whole is never presented: after each frame the platform
+        // reads every surface root's scene on its own (`PluginPlatform::ship_scenes`).
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
@@ -632,9 +381,9 @@ impl Wire {
 
 /// Convert one root's painted scene into the wire display list. Everything crossing the
 /// boundary is in logical pixels relative to the surface's slot (divided by the scale
-/// factor, minus the root's cell origin); glyph sprites are mapped back to the symbolic
-/// parameters remembered by the atlas so the host can rasterize them itself.
-fn serialize_scene(
+/// factor, minus the slot's origin in the window); glyph sprites are mapped back to the
+/// symbolic parameters remembered by the atlas so the host can rasterize them itself.
+pub fn serialize_scene(
     scene: &Scene,
     scale_factor: f32,
     origin: Point<Pixels>,

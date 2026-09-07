@@ -4,7 +4,7 @@
 //! id 0, and every other capability below is reached by calling root methods that
 //! return refs.
 
-use embedded_gpui::surface::{Geometry, SurfaceApi};
+use embedded_gpui::surface::SurfaceApi;
 use embedded_gpui::{Ref, data, interface};
 
 /// The plugin's root object: the host's entire view of the plugin. The methods create
@@ -33,11 +33,25 @@ pub trait TestPlugin {
     fn spin(&mut self, millis: u64, cx: &mut gpui::Context<Self>);
 }
 
+/// What a view can see of where it is: its bounds in its window, the window's viewport
+/// (the host window's, mirrored), and the scale factor it renders at.
+#[data]
+#[derive(Copy, PartialEq)]
+pub struct SeenGeometry {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub viewport_width: f32,
+    pub viewport_height: f32,
+    pub scale_factor: f32,
+}
+
 /// What the plugin observed of a mounted view.
 #[interface]
 pub trait ViewProbeApi {
-    /// The geometry the host last pushed, if any.
-    fn last_geometry(&mut self, cx: &mut gpui::Context<Self>) -> Option<Geometry>;
+    /// Where the view found itself when it last laid out, if it has.
+    fn last_geometry(&mut self, cx: &mut gpui::Context<Self>) -> Option<SeenGeometry>;
     /// Mouse-down events the view's root element received.
     fn clicks(&mut self, cx: &mut gpui::Context<Self>) -> u32;
     /// Whether the window's root view still exists (it dies when the host drops the

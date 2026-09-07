@@ -401,9 +401,8 @@ fn apply_op(op: Op, cx: &mut App) {
         Op::OpenView { surface, key } => {
             let surface: Ref<SurfaceApi> = registry().reference(surface);
             let view = cx.new(|_| JsView { tree: None });
-            let root = view.clone();
-            match open_view(surface, cx, move |_, _| root) {
-                Ok(view) => JsState::with(|state| {
+            match open_view(surface, view.clone(), cx) {
+                Ok(()) => JsState::with(|state| {
                     state.views.insert(key, view);
                 }),
                 Err(error) => log::error!("js_runtime: open_view failed: {error:#}"),

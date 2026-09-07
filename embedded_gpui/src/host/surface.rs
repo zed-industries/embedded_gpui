@@ -6,12 +6,12 @@
 use gpui::{
     App, Bounds, BoxShadow, ContentMask, Context, Corners, Edges, FocusHandle, IntoElement,
     KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
-    Pixels, PlatformInput, Point, Render, ScrollWheelEvent, Size, UnderlineStyle, Window, canvas,
-    div, point, prelude::*, px,
+    Pixels, PlatformInput, Point, Render, ScrollWheelEvent, UnderlineStyle, Window, canvas, div,
+    point, prelude::*, px,
 };
 
 use crate::surface::{
-    Cursor, Geometry, KeyEvent, MouseEvent, SurfaceApi, ViewApi, ViewApiCaller as _,
+    Cursor, Geometry, HostWindow, KeyEvent, MouseEvent, SurfaceApi, ViewApi, ViewApiCaller as _,
 };
 use crate::{PluginImages, Ref, Remote, bindings};
 
@@ -86,12 +86,21 @@ impl Surface {
         }
     }
 
-    /// Record the slot's measured geometry and push it to the view if it changed.
-    fn measured(&mut self, size: Size<Pixels>, scale_factor: f32, cx: &mut Context<Self>) {
+    /// Record the slot's measured geometry — its bounds and the window it is in — and
+    /// push it to the view if any of it changed.
+    fn measured(&mut self, bounds: Bounds<Pixels>, window: &Window, cx: &mut Context<Self>) {
+        let viewport = window.viewport_size();
         let geometry = Geometry {
-            width: f32::from(size.width),
-            height: f32::from(size.height),
-            scale_factor,
+            x: f32::from(bounds.origin.x),
+            y: f32::from(bounds.origin.y),
+            width: f32::from(bounds.size.width),
+            height: f32::from(bounds.size.height),
+            window: HostWindow {
+                id: window.window_handle().window_id().as_u64(),
+                width: f32::from(viewport.width),
+                height: f32::from(viewport.height),
+                scale_factor: window.scale_factor(),
+            },
         };
         if self.geometry == Some(geometry) {
             return;
@@ -170,10 +179,9 @@ impl Render for Surface {
             .child(
                 canvas(
                     move |bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App| {
-                        let scale = window.scale_factor();
                         prepaint_entity.update(cx, |this, cx| {
                             this.last_origin = bounds.origin;
-                            this.measured(bounds.size, scale, cx);
+                            this.measured(bounds, window, cx);
                         });
                         bounds
                     },

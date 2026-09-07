@@ -182,7 +182,8 @@ impl DemoPlugin for PluginRoot {
 
     fn show_button(&mut self, surface: Ref<SurfaceApi>, cx: &mut Context<Self>) {
         let host = self.host.clone();
-        if let Err(error) = open_view(surface, cx, |_, cx| cx.new(|cx| ButtonView::new(host, cx))) {
+        let view = cx.new(|cx| ButtonView::new(host, cx));
+        if let Err(error) = open_view(surface, view, cx) {
             eprintln!("[example_plugin] show_button failed: {error:#}");
         }
     }
@@ -193,9 +194,8 @@ impl DemoPlugin for PluginRoot {
         let input_line = self.ensure_input_line(cx);
         let wave = self.ensure_wave(cx);
         let host = self.host.clone();
-        if let Err(error) = open_view(surface, cx, |_, cx| {
-            cx.new(|cx| PanelView::new(host, input_line, wave, cx))
-        }) {
+        let view = cx.new(|cx| PanelView::new(host, input_line, wave, cx));
+        if let Err(error) = open_view(surface, view, cx) {
             eprintln!("[example_plugin] show_panel failed: {error:#}");
         }
     }

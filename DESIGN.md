@@ -147,28 +147,31 @@ the rule for it is the same as for every plugin: events and notifies, not animat
    order, preserving guest stacking (including guest-side deferred draws / overlays).
 7. **Input and geometry are method calls** on the guest-homed `ViewApi` object a
    surface has attached: `resize`, `mouse`, `key` (slot-relative logical coordinates).
-   The guest translates them into its composition window (below) and lets GPUI's own
+   The guest translates them into the window mirror (below) and lets GPUI's own
    dispatch do hit-testing and run listeners; no callback registry crosses the boundary.
    Cursor styles flow back as `set_cursor` on the host-homed `SurfaceApi`. Because
    `ViewApi` handlers run inside the registry's `App` borrow and GPUI's window callbacks
    re-enter the app, the view queues events on the window and the pump applies them
    once the borrow is released — same turn, same order.
-8. **One window per plugin; a surface is a root of it.** The guest has a single
-   *composition window*, and every host surface is a root attached to it with
-   `Window::attach_root` — a node of the node engine like any mounted view, so it is
-   memoized, hit-tested, focused, and dispatched to by position, and hundreds of
-   surfaces are hundreds of nodes rather than hundreds of windows. Surfaces are laid out
-   in a grid of fixed cells (8192 px, 32×32) so a surface's coordinates never depend on
-   another's: resizing one never moves another, and hit-testing separates them by
-   position alone. After each frame the pump reads every root's scene on its own with
+8. **Guest windows mirror host windows; a surface is a root of its window.** A
+   surface's `Geometry` says where its slot is: its bounds in a host window, and that
+   window's identity, viewport, and scale factor. The guest keeps one window per host
+   window it hears of, with the host window's size and scale factor, and attaches each
+   surface's view to it at the slot's real origin with `Window::attach_root` — a node of
+   the node engine like any mounted view, so it is memoized, hit-tested, focused, and
+   dispatched to by position, and hundreds of surfaces are hundreds of nodes rather than
+   hundreds of windows. Because the guest window *is* the host window's shape, nothing
+   inside a view is a lie: `window.viewport_size()` is the host's viewport, a popover
+   clamps to the host window's edges, the scale factor is the display's, and two views
+   cannot interact unless the host overlaps their slots. A surface that moves to another
+   host window moves its root to that window's mirror; a mirror with no roots left
+   closes. After each frame the pump reads every root's scene on its own with
    `Window::take_root_scene`, which answers only for roots whose node was redrawn, so an
    idle surface ships nothing and a changed one ships exactly its own display list
-   (translated back to slot-relative coordinates). Window-level state now has one place
-   to land on the guest: focus is per window (matching the host's one-focus model), and
-   window-active or bounds mirroring from the host is a method on one object away. A
-   surface is not drawn until the host has pushed its first geometry, so its first frame
-   is at the slot's real size. One scale factor per plugin: the composition window takes
-   the factor the host's surfaces report and re-lays out if it changes.
+   (translated back to slot-relative coordinates). A view is not drawn until the host
+   has said where it is, so its first frame is at the slot's real size. Window-level
+   state (active, appearance) has its natural place now — the mirror — and is the next
+   thing `Geometry`'s `HostWindow` grows.
 9. **Scheduling**: the guest dispatcher queues runnables/timers locally. Every `tick`
    drains due work, pumps the window's `request_frame` callback (GPUI decides whether it
    is dirty), ships the changed roots' scenes into the turn's `scenes`, and reports the

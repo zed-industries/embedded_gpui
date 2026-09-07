@@ -14,7 +14,8 @@ use std::time::Duration;
 
 use embedded_gpui::schema::TypeKind;
 use embedded_gpui::surface::{
-    Geometry, Modifiers, MouseButton, MouseButtonEvent, MouseEvent, Point, ViewApiCaller as _,
+    Geometry, HostWindow, Modifiers, MouseButton, MouseButtonEvent, MouseEvent, Point,
+    ViewApiCaller as _,
 };
 use embedded_gpui::{
     Interface, Payload, PluginHost, PluginHostHandle as _, PluginInstance, PluginOptions, Ref,
@@ -26,8 +27,8 @@ use rand::prelude::*;
 use test_schema::{
     Bump, ChameleonApi, ChameleonState, Count, CounterMilestone, FactoryApi, FactoryApiCaller as _,
     GatekeeperApi, GatekeeperApiCaller as _, Increment, ItemApiCaller as _, KeyApi,
-    KeyApiCaller as _, TestCounterApi, TestCounterApiCaller as _, TestHost, TestPlugin,
-    TestPluginCaller as _, VaultApi, VaultApiCaller as _, ViewProbeApiCaller as _,
+    KeyApiCaller as _, SeenGeometry, TestCounterApi, TestCounterApiCaller as _, TestHost,
+    TestPlugin, TestPluginCaller as _, VaultApi, VaultApiCaller as _, ViewProbeApiCaller as _,
 };
 
 /// Builds the test plugin once per process and returns the component path.
@@ -93,6 +94,20 @@ fn setup(cx: &mut TestAppContext) -> Entity<PluginHost> {
 }
 
 /// Flush deferred effects and host-scheduled ticks deterministically.
+/// What the probe view should see of `geometry`: the slot's bounds in the guest window
+/// mirroring the host window, whose viewport and scale factor are the host's.
+fn seen_geometry(geometry: Geometry) -> SeenGeometry {
+    SeenGeometry {
+        x: geometry.x,
+        y: geometry.y,
+        width: geometry.width,
+        height: geometry.height,
+        viewport_width: geometry.window.width,
+        viewport_height: geometry.window.height,
+        scale_factor: geometry.window.scale_factor,
+    }
+}
+
 fn settle(cx: &mut TestAppContext) {
     for _ in 0..5 {
         cx.executor().run_until_parked();
@@ -593,15 +608,22 @@ async fn test_views_are_objects(cx: &mut TestAppContext) {
     // Geometry is a method call on the view (layout would make this call; tests drive
     // it directly), and the guest renders at that size: a display list comes back.
     let geometry = Geometry {
+        x: 40.,
+        y: 30.,
         width: 200.,
         height: 100.,
-        scale_factor: 2.,
+        window: HostWindow {
+            id: 7,
+            width: 800.,
+            height: 600.,
+            scale_factor: 2.,
+        },
     };
     cx.update(|cx| view.resize(geometry, cx));
     settle(cx);
     let seen = cx.update(|cx| probe.last_geometry(cx));
     settle(cx);
-    assert_eq!(seen.await.expect("geometry"), Some(geometry));
+    assert_eq!(seen.await.expect("geometry"), Some(seen_geometry(geometry)));
     assert!(
         surface.read_with(cx, |surface, _| surface.has_scene()),
         "the surface received a display list"
@@ -643,9 +665,16 @@ async fn test_reattaching_a_surface_replaces_its_view(cx: &mut TestAppContext) {
     let surface = cx.new(Surface::new);
     let root = cx.update(|cx| host.root::<TestPlugin>(cx));
     let geometry = Geometry {
+        x: 0.,
+        y: 0.,
         width: 200.,
         height: 100.,
-        scale_factor: 1.,
+        window: HostWindow {
+            id: 1,
+            width: 640.,
+            height: 480.,
+            scale_factor: 1.,
+        },
     };
 
     let first = cx.update(|cx| root.mount(host.share(&surface, cx), cx));
@@ -673,7 +702,7 @@ async fn test_reattaching_a_surface_replaces_its_view(cx: &mut TestAppContext) {
     settle(cx);
     let seen = cx.update(|cx| second.last_geometry(cx));
     settle(cx);
-    assert_eq!(seen.await.expect("geometry"), Some(geometry));
+    assert_eq!(seen.await.expect("geometry"), Some(seen_geometry(geometry)));
     assert!(surface.read_with(cx, |surface, _| surface.has_scene()));
 
     // Once nobody holds the first view (the surface let go on reattach, and so do we),

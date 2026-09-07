@@ -8,18 +8,19 @@ to prove the architecture; these are the known gaps between "proven" and
 
 Views are `SurfaceApi`/`ViewApi` objects; see `DESIGN.md`. What remains:
 
-- [x] **Data-shaped surfaces at scale**: one composition window per plugin; every
-  surface is a root attached to it (`Window::attach_root`, a node-engine node), and
-  only roots whose node was redrawn ship a display list (`Window::take_root_scene`).
-  Still open: **per-root scale factor** (one factor per plugin today; two host windows
-  on displays with different factors would fight over it — a node-engine ask, see
-  `docs/node_engine_needs.md` §5), and **window-level overlays**: a deferred draw
-  inside a surface ships with that surface, but a tooltip or prompt is a window-level
-  root with no owner and is not routed to any surface yet.
-- [ ] **Window state mirroring**: with one guest window, the host can mirror
-  window-active, appearance, and bounds into it — a `WindowApi` object the guest homes
-  per composition window, or methods on the plugin root — so plugins see the host
-  window's state instead of a window that is always active.
+- [x] **Data-shaped surfaces at scale**: guest windows mirror host windows; every
+  surface is a root attached to its window at its real origin (`Window::attach_root`,
+  a node-engine node), and only roots whose node was redrawn ship a display list
+  (`Window::take_root_scene`). Scale factor is per window, as it should be. Still
+  open: **window-level overlays** — a deferred draw inside a surface ships with that
+  surface, but a tooltip or prompt is a window-level root with no owner and is not
+  routed to any surface yet.
+- [ ] **Window state mirroring**: `Geometry.window` carries id, viewport, and scale
+  factor. Grow it (or a host-homed window object it refers to) with active state and
+  appearance, so a guest window mirrors everything about its host window and plugins
+  stop seeing a window that is always active and always dark.
+- [ ] **Moving a surface between host windows** moves its root between mirrors; focus
+  inside it is lost on the way. Fine for a drag between windows; worth a test.
 - [ ] **Host-side retained replay**: the host `Surface` still replays its display list
   through `paint_*` every host frame. With the node engine on the host too, a surface
   is a node whose scene is the guest's output (`docs/node_engine_needs.md` §3): an

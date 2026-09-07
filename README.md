@@ -18,8 +18,8 @@ changes; nothing here is a supported API yet.
   shipped only when a root changed, overlays (popovers, tooltips, drag previews)
   painted above the host window with the guest's own hit regions, real window state
   (active, appearance, modifiers, hover), mouse and keyboard input with a synchronous
-  path for key precedence and IME composition, timers/async, SVG and image rendering,
-  text via host-side shaping. The WIT protocol (`wit/plugin.wit`) is pure substrate — `init`,
+  path for key precedence and IME composition, a clipboard that is a capability the
+  host hands out, timers/async, SVG and image rendering, text via host-side shaping. The WIT protocol (`wit/plugin.wit`) is pure substrate — `init`,
   `tick(inbound frames) -> turn`, and synchronous text shaping; nothing in it
   has UI meaning.
 - A host runtime: loads a component with wasmtime on a background worker,
@@ -62,9 +62,10 @@ changes; nothing here is a supported API yet.
   tree that becomes GPUI elements on a host surface. Edit `index.js` and the
   runtime reloads it, replaying the host's calls so views come back.
   `typescript::declarations` renders the Rust schemas as `.d.ts` for authors.
-- **Resource limits**: a per-turn budget (wasmtime epoch deadline) and a memory
-  cap on `PluginOptions`; a plugin that overruns stops and its in-flight calls
-  fail instead of hanging.
+- **Resource limits**: a per-turn budget (wasmtime epoch deadline), an input-query
+  budget, a memory cap, and display-list caps on `PluginOptions`; a plugin that
+  overruns stops, its in-flight calls fail instead of hanging, and its surfaces show
+  why.
 
 <img width="750" height="643" alt="Screenshot 2026-07-08 at 12 12 14 AM" src="https://github.com/user-attachments/assets/81d10dfa-bad7-4fb2-9385-5629880c11ca" />
 

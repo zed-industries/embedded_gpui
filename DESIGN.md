@@ -204,7 +204,22 @@ the rule for it is the same as for every plugin: events and notifies, not animat
    FIFO like everything else, so they observe every frame queued before them; a guest
    that does not answer within the budget is treated as having no text field. This is
    the substrate's fast path, as text shaping is in the other direction; everything else
-   about input stays in the object model.
+   about input stays in the object model. The wait has its own budget
+   (`PluginOptions::input_query_budget`, 50 ms by default), separate from the turn budget.
+12. **The clipboard is an object.** Every `PluginHost` homes a `Clipboard` entity
+   implementing `ClipboardApi` (`read`, `write`, and a `ClipboardChanged` event); a host
+   grants the clipboard by handing its ref out through its root schema, withholds it by
+   not, and loans it by wrapping it in a `Revocable` first. GPUI's clipboard calls are
+   synchronous, so on the guest `use_clipboard(remote)` keeps a copy fed by the object's
+   events and forwards writes as calls. The copy is fresh when it matters: the host
+   surface refreshes the object before forwarding any modified key-down, and the event
+   that produces is a frame, which the key-down query queues behind — so a paste reads
+   what the host had at the moment of the keystroke.
+13. **Resource limits are the host's.** Besides the turn and query budgets and the
+   memory cap, `DisplayListLimits` caps primitives and image bytes per display list; a
+   plugin over a cap stops, like one that trapped: in-flight calls fail, its worker and
+   store are dropped, `PluginHost::stopped` says why, and every `Surface` it drew on
+   shows the reason in place of its scene.
 9. **Scheduling**: the guest dispatcher queues runnables/timers locally. Every `tick`
    drains due work, pumps the window's `request_frame` callback (GPUI decides whether it
    is dirty), ships the changed roots' scenes into the turn's `scenes`, and reports the

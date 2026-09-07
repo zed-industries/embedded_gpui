@@ -299,6 +299,19 @@ impl Objects {
         entity.downcast::<T>().ok()
     }
 
+    /// Every live local entity of type `T`: how the boundary reaches all the surfaces
+    /// it shared when the plugin behind them stops.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub fn local_entities<T: 'static>(&self) -> Vec<Entity<T>> {
+        self.inner
+            .state
+            .borrow()
+            .homes
+            .values()
+            .filter_map(|home| home.entity.upgrade()?.downcast::<T>().ok())
+            .collect()
+    }
+
     /// Attach to an entity by id. Connecting the same id twice returns a handle to the
     /// same projection; when the last clone drops, the home end is told to release the
     /// entity. Context-free: connecting allocates nothing but a map entry.

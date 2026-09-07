@@ -6,18 +6,19 @@ use anyhow::anyhow;
 use embedded_gpui::surface::SurfaceApi;
 use embedded_gpui::{
     Payload, Plugin, Ref, Remote, decode, encode, open_view, register_plugin, root, share,
-    share_root, share_with, shared,
+    share_root, share_with, shared, use_clipboard,
 };
 use embedded_gpui_util::Revocable;
 use gpui::{
-    App, AppContext as _, Bounds, Context, ElementInputHandler, Entity, EntityInputHandler,
-    EventEmitter, FocusHandle, KeyDownEvent, MouseDownEvent, Pixels, Task, UTF16Selection,
-    WeakEntity, Window, canvas, div, prelude::*, rgb,
+    App, AppContext as _, Bounds, ClipboardItem, Context, ElementInputHandler, Entity,
+    EntityInputHandler, EventEmitter, FocusHandle, KeyDownEvent, MouseDownEvent, Pixels, Task,
+    UTF16Selection, WeakEntity, Window, canvas, div, prelude::*, rgb,
 };
 use std::ops::Range;
-use test_schema::{SeenGeometry, 
+use test_schema::{
     ChameleonApi, ChameleonState, CounterMilestone, FactoryApi, GatekeeperApi, ItemApi, ItemInfo,
-    TestCounterApi, TestHost, TestHostCaller as _, TestPlugin, VaultApi, ViewProbeApi,
+    SeenGeometry, TestCounterApi, TestHost, TestHostCaller as _, TestPlugin, VaultApi,
+    ViewProbeApi,
 };
 
 /// The plugin's whole bootstrap: construct the root object and install it at this end's
@@ -29,6 +30,15 @@ struct TestGuest {
 impl Plugin for TestGuest {
     fn new(cx: &mut App) -> Self {
         let host = root::<TestHost>();
+        // The clipboard is a capability the host may or may not hand out; ask, and if it
+        // arrives, let the platform's synchronous clipboard read from it.
+        let clipboard = host.clipboard(cx);
+        cx.spawn(async move |cx| {
+            if let Ok(clipboard) = clipboard.await {
+                cx.update(|cx| use_clipboard(clipboard, cx));
+            }
+        })
+        .detach();
         let root = cx.new(|_| Root {
             host,
             counter: None,
@@ -215,7 +225,11 @@ impl EntityInputHandler for ProbeView {
         })
     }
 
-    fn marked_text_range(&self, _window: &mut Window, _cx: &mut Context<Self>) -> Option<Range<usize>> {
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
         self.marked.clone()
     }
 
@@ -230,7 +244,9 @@ impl EntityInputHandler for ProbeView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let range = range.or_else(|| self.marked.clone()).unwrap_or(self.selection.clone());
+        let range = range
+            .or_else(|| self.marked.clone())
+            .unwrap_or(self.selection.clone());
         let mut chars: Vec<u16> = self.text.encode_utf16().collect();
         let end = range.end.min(chars.len());
         let start = range.start.min(end);
@@ -277,6 +293,24 @@ impl EntityInputHandler for ProbeView {
     ) -> Option<usize> {
         Some(self.text.encode_utf16().count())
     }
+
+    fn set_selected_text_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.selection = range_utf16;
+        cx.notify();
+    }
+
+    fn text_length_utf16(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        Some(self.text.encode_utf16().count())
+    }
 }
 
 impl Render for ProbeView {
@@ -297,11 +331,20 @@ impl Render for ProbeView {
                     cx.notify();
                 }),
             )
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                if event.keystroke.key == "enter" {
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                let keystroke = &event.keystroke;
+                if keystroke.key == "enter" {
                     this.handled_keys += 1;
                     cx.stop_propagation();
                     cx.notify();
+                } else if keystroke.modifiers.platform && keystroke.key == "v" {
+                    if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                        this.replace_text_in_range(None, &text, window, cx);
+                    }
+                    cx.stop_propagation();
+                } else if keystroke.modifiers.platform && keystroke.key == "c" {
+                    cx.write_to_clipboard(ClipboardItem::new_string(this.text.clone()));
+                    cx.stop_propagation();
                 }
             }))
             .child(

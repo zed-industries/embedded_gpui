@@ -16,7 +16,8 @@ use gpui::{
 
 use crate::host::{
     InputAnswer, InputQueries, InputQuery, KeyDownQuery, ReplaceAndMarkText, ReplaceText,
-    TextRange, WireKeystroke, WireModifiers,
+    TextRange, WireKeystroke, WireModifiers, bindings::Autocapitalize as WireAutocapitalize,
+    bindings::TextInputAction as WireTextInputAction,
 };
 use crate::surface::{
     Appearance, Cursor, Geometry, HostWindow, KeyEvent, MouseEvent, SurfaceApi, ViewApi,
@@ -50,6 +51,8 @@ pub struct Surface {
     /// The synchronous channel into the plugin the view lives in: key precedence and
     /// the IME's questions go through it (see [`InputQueries`]).
     queries: Option<Rc<InputQueries>>,
+    /// Why the plugin behind the view stopped, shown in place of the scene.
+    stopped: Option<String>,
 }
 
 impl Surface {
@@ -63,7 +66,14 @@ impl Surface {
             last_origin: Point::default(),
             focus_handle: cx.focus_handle(),
             queries: None,
+            stopped: None,
         }
+    }
+
+    pub(crate) fn set_stopped(&mut self, reason: String, cx: &mut Context<Self>) {
+        self.stopped = Some(reason);
+        self.overlay = None;
+        cx.notify();
     }
 
     /// Ask the plugin something the host cannot wait a turn for. `None` when there is no
@@ -183,6 +193,15 @@ impl Surface {
     /// key decides whether the host platform turns it into text (through the IME path,
     /// which lands in [`EntityInputHandler::replace_text_in_range`] below).
     fn key_down(&self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        // A paste reads the clipboard synchronously on the guest, from a copy the host's
+        // clipboard object keeps fresh: refreshing it here sends any change as an event
+        // that reaches the guest ahead of this key.
+        let modifiers = event.keystroke.modifiers;
+        if (modifiers.platform || modifiers.control || modifiers.alt)
+            && let Some(queries) = &self.queries
+        {
+            queries.refresh_clipboard(cx);
+        }
         let query = InputQuery::KeyDown(KeyDownQuery {
             keystroke: WireKeystroke {
                 modifiers: WireModifiers {
@@ -333,6 +352,18 @@ impl Render for Surface {
             deferred(anchor).with_priority(OVERLAY_PRIORITY)
         });
 
+        let stopped = self.stopped.clone().map(|reason| {
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::hsla(0., 0., 0., 0.6))
+                .text_color(gpui::white())
+                .text_size(px(12.))
+                .child(reason)
+        });
         slot.child(
             canvas(
                 move |bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App| {
@@ -362,6 +393,7 @@ impl Render for Surface {
             )
             .size_full(),
         )
+        .children(stopped)
         .children(overlay)
     }
 }
@@ -480,6 +512,76 @@ impl EntityInputHandler for Surface {
         });
         match self.query(query)? {
             InputAnswer::Index(index) => Some(index as usize),
+            _ => None,
+        }
+    }
+
+    fn set_selected_text_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        self.query(InputQuery::SetSelectedTextRange(wire_range(range_utf16)));
+    }
+
+    fn text_length_utf16(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        match self.query(InputQuery::TextLength)? {
+            InputAnswer::Index(length) => Some(length as usize),
+            _ => None,
+        }
+    }
+
+    fn accepts_text_input(&self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
+        matches!(
+            self.query(InputQuery::AcceptsTextInput),
+            Some(InputAnswer::Accepts(true))
+        )
+    }
+
+    fn text_input_configuration(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> gpui::TextInputConfiguration {
+        let Some(InputAnswer::Configuration(configuration)) =
+            self.query(InputQuery::TextInputConfiguration)
+        else {
+            return gpui::TextInputConfiguration::default();
+        };
+        gpui::TextInputConfiguration {
+            autocorrect: configuration.autocorrect,
+            autocapitalize: match configuration.autocapitalize {
+                WireAutocapitalize::None => gpui::Autocapitalize::None,
+                WireAutocapitalize::Words => gpui::Autocapitalize::Words,
+                WireAutocapitalize::Sentences => gpui::Autocapitalize::Sentences,
+                WireAutocapitalize::Characters => gpui::Autocapitalize::Characters,
+            },
+            suggestions: configuration.suggestions,
+            input_action: match configuration.input_action {
+                WireTextInputAction::Unspecified => gpui::TextInputAction::Unspecified,
+                WireTextInputAction::Enter => gpui::TextInputAction::Enter,
+                WireTextInputAction::Done => gpui::TextInputAction::Done,
+                WireTextInputAction::Go => gpui::TextInputAction::Go,
+                WireTextInputAction::Next => gpui::TextInputAction::Next,
+                WireTextInputAction::Previous => gpui::TextInputAction::Previous,
+                WireTextInputAction::Search => gpui::TextInputAction::Search,
+                WireTextInputAction::Send => gpui::TextInputAction::Send,
+            },
+        }
+    }
+
+    fn text_input_editable_range(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        match self.query(InputQuery::TextInputEditableRange)? {
+            InputAnswer::Range(range) => Some(range_from_wire(range)),
             _ => None,
         }
     }

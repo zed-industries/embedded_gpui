@@ -9,6 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
+use embedded_gpui::clipboard::ClipboardApi;
 use embedded_gpui::{
     PluginHost, PluginHostHandle as _, PluginOptions, Ref, Remote, Surface, shared,
 };
@@ -67,6 +68,7 @@ struct HostRoot {
     workspace: Entity<Workspace>,
     counter_ref: Option<Ref<CounterApi>>,
     workspace_ref: Option<Ref<WorkspaceApi>>,
+    clipboard_ref: Option<Ref<ClipboardApi>>,
 }
 
 #[shared]
@@ -86,6 +88,16 @@ impl DemoHost for HostRoot {
         }
         let reference = self.host.share(&self.workspace, cx);
         self.workspace_ref = Some(reference.clone());
+        reference
+    }
+
+    fn clipboard(&mut self, cx: &mut Context<Self>) -> Ref<ClipboardApi> {
+        if let Some(reference) = &self.clipboard_ref {
+            return reference.clone();
+        }
+        let clipboard = self.host.read(cx).clipboard();
+        let reference = self.host.share(&clipboard, cx);
+        self.clipboard_ref = Some(reference.clone());
         reference
     }
 }
@@ -170,6 +182,7 @@ fn open_demo_window(host: Entity<PluginHost>, js_host: Entity<PluginHost>, cx: &
                 workspace: workspace.clone(),
                 counter_ref: None,
                 workspace_ref: None,
+                clipboard_ref: None,
             });
             host.share_root(&root, cx);
             // The JavaScript runtime is another plugin with its own registry: it gets
@@ -180,6 +193,7 @@ fn open_demo_window(host: Entity<PluginHost>, js_host: Entity<PluginHost>, cx: &
                 workspace: workspace.clone(),
                 counter_ref: None,
                 workspace_ref: None,
+                clipboard_ref: None,
             });
             js_host.share_root(&js_root_entity, cx);
             let js_plugin = js_host.root::<DemoPlugin>(cx);

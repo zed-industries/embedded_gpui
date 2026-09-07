@@ -24,6 +24,7 @@
 // inside this crate itself.
 extern crate self as embedded_gpui;
 
+pub mod clipboard;
 pub(crate) mod registry;
 pub mod schema;
 pub mod surface;
@@ -42,6 +43,7 @@ pub use guest::*;
 #[cfg(target_arch = "wasm32")]
 pub(crate) use guest::{dispatcher, platform, text_system, window, wit};
 
+pub use clipboard::{ClipboardApi, ClipboardApiCaller, ClipboardChanged};
 pub use schema::{
     ArgumentSchema, Describe, EventSchema, MethodSchema, Schema, TypeDefinition, TypeSchema,
 };
@@ -802,8 +804,10 @@ impl<S: Interface> Ref<S> {
         }
     }
 
-    /// A ref bound to no registry: connecting it yields a remote whose calls all fail.
-    fn detached() -> Self {
+    /// A ref to nothing, bound to no registry: what a method returns for a capability it
+    /// withholds. Connecting it yields a remote whose every call fails, so "no clipboard
+    /// for you" is expressed in the same type as "here is the clipboard".
+    pub fn detached() -> Self {
         Self::new(0, registry::WeakObjects::detached())
     }
 

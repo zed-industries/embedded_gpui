@@ -12,21 +12,22 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+use embedded_gpui::clipboard::ClipboardApi;
 use embedded_gpui::schema::TypeKind;
 use embedded_gpui::surface::{
     Appearance, Geometry, HostWindow, Modifiers, MouseButton, MouseButtonEvent, MouseEvent, Point,
     ViewApiCaller as _,
 };
 use embedded_gpui::{
-    InputAnswer, InputQueries, InputQuery, KeyDownQuery, ReplaceAndMarkText, ReplaceText,
-    TextForRange, TextRange, Utf16Selection, WireKeystroke, WireModifiers,
+    Clipboard, InputAnswer, InputQueries, InputQuery, KeyDownQuery, Registry, ReplaceAndMarkText,
+    ReplaceText, TextForRange, TextRange, Utf16Selection, WireKeystroke, WireModifiers,
 };
 use embedded_gpui::{
     Interface, Payload, PluginHost, PluginHostHandle as _, PluginInstance, PluginOptions, Ref,
     Remote, Surface, TypeSchema, decode, encode, shared,
 };
 use embedded_gpui_util::{Attenuated, Audited, Mirror};
-use gpui::{AppContext as _, Context, Entity, Task, TestAppContext};
+use gpui::{AppContext as _, ClipboardItem, Context, Entity, Task, TestAppContext};
 use rand::prelude::*;
 use test_schema::{
     Bump, ChameleonApi, ChameleonState, Count, CounterMilestone, FactoryApi, FactoryApiCaller as _,
@@ -61,6 +62,10 @@ fn test_plugin_path() -> PathBuf {
 /// The host's root object: what the plugin reaches through `root()`.
 struct HostRoot {
     pings: u32,
+    /// The host's clipboard object and the registry to share it through; `None` for a
+    /// host that withholds the clipboard.
+    clipboard: Option<(Entity<Clipboard>, Registry)>,
+    clipboard_ref: Option<Ref<ClipboardApi>>,
 }
 
 #[shared]
@@ -69,6 +74,18 @@ impl TestHost for HostRoot {
         self.pings += 1;
         cx.notify();
         format!("pong: {message}")
+    }
+
+    fn clipboard(&mut self, cx: &mut Context<Self>) -> Ref<ClipboardApi> {
+        if let Some(reference) = &self.clipboard_ref {
+            return reference.clone();
+        }
+        let Some((clipboard, registry)) = &self.clipboard else {
+            return Ref::detached();
+        };
+        let reference = registry.share(clipboard, cx);
+        self.clipboard_ref = Some(reference.clone());
+        reference
     }
 }
 
@@ -91,13 +108,18 @@ fn setup_with_options(options: PluginOptions, cx: &mut TestAppContext) -> Entity
 fn setup(cx: &mut TestAppContext) -> Entity<PluginHost> {
     let host = setup_without_root(cx);
     cx.update(|cx| {
-        let root = cx.new(|_| HostRoot { pings: 0 });
+        let clipboard = host.read(cx).clipboard();
+        let registry = host.read(cx).registry();
+        let root = cx.new(|_| HostRoot {
+            pings: 0,
+            clipboard: Some((clipboard, registry)),
+            clipboard_ref: None,
+        });
         host.share_root(&root, cx);
     });
     host
 }
 
-/// Flush deferred effects and host-scheduled ticks deterministically.
 /// What the probe view should see of `geometry`: the slot's bounds in the guest window
 /// mirroring the host window, whose viewport and scale factor are the host's.
 fn seen_geometry(geometry: Geometry) -> SeenGeometry {
@@ -113,6 +135,7 @@ fn seen_geometry(geometry: Geometry) -> SeenGeometry {
     }
 }
 
+/// Flush deferred effects and host-scheduled ticks deterministically.
 fn settle(cx: &mut TestAppContext) {
     for _ in 0..5 {
         cx.executor().run_until_parked();
@@ -165,7 +188,11 @@ async fn test_bootstraps_may_race(cx: &mut TestAppContext) {
     // Install the root late: the queued traffic drains, and the bootstrap completes
     // as if the orders had never crossed.
     cx.update(|cx| {
-        let root = cx.new(|_| HostRoot { pings: 0 });
+        let root = cx.new(|_| HostRoot {
+            pings: 0,
+            clipboard: None,
+            clipboard_ref: None,
+        });
         host.share_root(&root, cx);
     });
 
@@ -755,6 +782,34 @@ async fn test_input_queries_reach_the_focused_field(cx: &mut TestAppContext) {
         matches!(ask(cx, InputQuery::BoundsForRange(TextRange { start: 0, end: 1 })), InputAnswer::Bounds(bounds) if bounds.origin.x == 0. && bounds.origin.y == 0.)
     );
 
+    // The rest of the text-field contract.
+    assert!(matches!(
+        ask(
+            cx,
+            InputQuery::SetSelectedTextRange(TextRange { start: 0, end: 1 })
+        ),
+        InputAnswer::Done
+    ));
+    assert!(matches!(
+        ask(cx, InputQuery::SelectedTextRange(false)),
+        InputAnswer::Selection(Utf16Selection {
+            range: TextRange { start: 0, end: 1 },
+            ..
+        })
+    ));
+    assert!(matches!(
+        ask(cx, InputQuery::TextLength),
+        InputAnswer::Index(2)
+    ));
+    assert!(matches!(
+        ask(cx, InputQuery::AcceptsTextInput),
+        InputAnswer::Accepts(true)
+    ));
+    assert!(matches!(
+        ask(cx, InputQuery::TextInputConfiguration),
+        InputAnswer::Configuration(_)
+    ));
+
     // Key precedence: the guest says whether it consumed the key.
     let key = |key: &str| {
         InputQuery::KeyDown(KeyDownQuery {
@@ -777,6 +832,98 @@ async fn test_input_queries_reach_the_focused_field(cx: &mut TestAppContext) {
     let handled = cx.update(|cx| probe.handled_keys(cx));
     settle(cx);
     assert_eq!(handled.await.expect("handled keys"), 1);
+}
+
+/// The clipboard is a capability: the host hands out a ref to its clipboard object
+/// (or does not), and the guest's synchronous `read_from_clipboard` answers from the
+/// object's change events, which the host sends ahead of any keystroke that may paste.
+#[gpui::test]
+async fn test_clipboard_is_an_object_the_host_hands_out(cx: &mut TestAppContext) {
+    let host = setup(cx);
+    let surface = cx.new(Surface::new);
+    let root = cx.update(|cx| host.root::<TestPlugin>(cx));
+    let probe = cx.update(|cx| root.mount(host.share(&surface, cx), cx));
+    settle(cx);
+    let probe = probe.await.expect("mount");
+    let view = surface
+        .read_with(cx, |surface, _| surface.view().cloned())
+        .expect("the guest attached a view");
+    cx.update(|cx| {
+        view.resize(
+            Geometry {
+                x: 0.,
+                y: 0.,
+                width: 200.,
+                height: 100.,
+                window: HostWindow {
+                    id: 1,
+                    width: 640.,
+                    height: 480.,
+                    scale_factor: 1.,
+                    active: true,
+                    appearance: Appearance::Dark,
+                },
+            },
+            cx,
+        )
+    });
+    settle(cx);
+    cx.update(|cx| probe.focus(cx));
+    settle(cx);
+    let queries = host
+        .read_with(cx, |host, _| host.registry().extension::<InputQueries>())
+        .expect("query channel");
+    let view_id = view.reference().entity_id();
+    let key = |key: &str| {
+        InputQuery::KeyDown(KeyDownQuery {
+            keystroke: WireKeystroke {
+                modifiers: WireModifiers {
+                    control: false,
+                    alt: false,
+                    shift: false,
+                    platform: true,
+                    function: false,
+                },
+                key: key.into(),
+                key_char: None,
+            },
+            is_held: false,
+        })
+    };
+
+    // Paste: what the host put on the clipboard reaches the guest's field. The refresh
+    // is what a Surface does before forwarding a modified key.
+    cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string("from the host".into())));
+    cx.update(|cx| queries.refresh_clipboard(cx));
+    settle(cx);
+    let pending = queries.send(view_id, key("v"));
+    settle(cx);
+    assert!(matches!(
+        pending.try_take(),
+        Some(InputAnswer::Handled(true))
+    ));
+    let text = cx.update(|cx| probe.text(cx));
+    settle(cx);
+    assert_eq!(text.await.expect("text"), "from the host");
+
+    // Copy: what the guest wrote lands on the host clipboard, through the object.
+    let pending = queries.send(
+        view_id,
+        InputQuery::ReplaceTextInRange(ReplaceText {
+            range: Some(TextRange { start: 0, end: 13 }),
+            text: "from the guest".into(),
+        }),
+    );
+    settle(cx);
+    assert!(matches!(pending.try_take(), Some(InputAnswer::Done)));
+    let pending = queries.send(view_id, key("c"));
+    settle(cx);
+    assert!(matches!(
+        pending.try_take(),
+        Some(InputAnswer::Handled(true))
+    ));
+    let on_host = cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text()));
+    assert_eq!(on_host.as_deref(), Some("from the guest"));
 }
 
 #[gpui::test]
@@ -848,7 +995,11 @@ async fn test_turn_budget_stops_a_runaway_plugin(cx: &mut TestAppContext) {
         cx,
     );
     cx.update(|cx| {
-        let root = cx.new(|_| HostRoot { pings: 0 });
+        let root = cx.new(|_| HostRoot {
+            pings: 0,
+            clipboard: None,
+            clipboard_ref: None,
+        });
         host.share_root(&root, cx);
     });
     let root = cx.update(|cx| host.root::<TestPlugin>(cx));

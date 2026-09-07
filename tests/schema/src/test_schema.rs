@@ -4,6 +4,7 @@
 //! id 0, and every other capability below is reached by calling root methods that
 //! return refs.
 
+use embedded_gpui::clipboard::ClipboardApi;
 use embedded_gpui::surface::SurfaceApi;
 use embedded_gpui::{Ref, data, interface};
 
@@ -70,6 +71,8 @@ pub trait ViewProbeApi {
 #[interface]
 pub trait TestHost {
     fn ping(&mut self, message: String, cx: &mut gpui::Context<Self>) -> String;
+    /// The host clipboard, as a capability.
+    fn clipboard(&mut self, cx: &mut gpui::Context<Self>) -> Ref<ClipboardApi>;
 }
 
 /// The plugin-homed counter driven from the host: reads are calls (`count`), and every

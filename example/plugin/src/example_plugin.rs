@@ -11,6 +11,7 @@
 use embedded_gpui::surface::SurfaceApi;
 use embedded_gpui::{
     Plugin, Receipt, Ref, Remote, open_view, register_plugin, root, share, share_root, shared,
+    use_clipboard,
 };
 use embedded_gpui_util::Mirror;
 use example_schema::{
@@ -18,9 +19,10 @@ use example_schema::{
     Milestone, PaletteApi, PaletteEntry, TextApi, WorkspaceApi, WorkspaceApiCaller as _,
 };
 use gpui::{
-    App, AssetSource, Bounds, Context, ElementInputHandler, Entity, EntityInputHandler,
-    FocusHandle, KeyDownEvent, MouseButton, PathBuilder, Pixels, RenderImage, SharedString,
-    Subscription, UTF16Selection, Window, canvas, div, hsla, img, point, prelude::*, px, rgb, svg,
+    App, AssetSource, Bounds, ClipboardItem, Context, ElementInputHandler, Entity,
+    EntityInputHandler, FocusHandle, KeyDownEvent, MouseButton, PathBuilder, Pixels, RenderImage,
+    SharedString, Subscription, UTF16Selection, Window, canvas, div, hsla, img, point, prelude::*,
+    px, rgb, svg,
 };
 use std::borrow::Cow;
 use std::ops::Range;
@@ -51,7 +53,17 @@ struct ExamplePlugin {
 
 impl Plugin for ExamplePlugin {
     fn new(cx: &mut App) -> Self {
-        let plugin_root = cx.new(|_| PluginRoot::new(root::<DemoHost>()));
+        let host = root::<DemoHost>();
+        // The clipboard is a capability the host hands out; ask for it and, once it
+        // arrives, let the platform's synchronous clipboard read from it.
+        let clipboard = host.clipboard(cx);
+        cx.spawn(async move |cx| {
+            if let Ok(clipboard) = clipboard.await {
+                cx.update(|cx| use_clipboard(clipboard, cx));
+            }
+        })
+        .detach();
+        let plugin_root = cx.new(|_| PluginRoot::new(host));
         share_root(&plugin_root, cx);
         Self { _root: plugin_root }
     }
@@ -774,9 +786,21 @@ impl Render for InputLine {
                 }),
             )
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
-                if event.keystroke.key == "backspace" {
+                let keystroke = &event.keystroke;
+                if keystroke.key == "backspace" {
                     this.text.pop();
                     cx.notify();
+                } else if keystroke.modifiers.platform && keystroke.key == "v" {
+                    // Paste: a synchronous read, answered from the clipboard object's
+                    // last event.
+                    if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                        this.text.push_str(&text);
+                        cx.notify();
+                    }
+                    cx.stop_propagation();
+                } else if keystroke.modifiers.platform && keystroke.key == "c" {
+                    cx.write_to_clipboard(ClipboardItem::new_string(this.text.clone()));
+                    cx.stop_propagation();
                 }
             }))
             .child(shown)

@@ -19,9 +19,14 @@ Views are `SurfaceApi`/`ViewApi` objects; see `DESIGN.md`. What remains:
   active state and appearance; the mirror reports them to GPUI as a platform would.
   Modifiers and hover come from the events themselves.
 - [x] **IME / marked text and key precedence**: a synchronous `input-query` export
-  (see DESIGN invariant 11). Open: `text_length_utf16`/`set_selected_text_range` and
-  the text-input configuration are not relayed yet; and the wait is on the UI thread,
-  so a plugin mid-turn delays a keystroke by up to the turn budget.
+  (see DESIGN invariant 11), with the whole `EntityInputHandler` contract relayed and a
+  query budget of its own.
+- [x] **Clipboard** as a host-homed object (DESIGN invariant 12). Open: a host cannot
+  wrap its own home in a `Revocable` today (loopback connects), so a clipboard *loan*
+  waits on loopback routing; a plugin can wrap the ref it holds for its own
+  sub-components.
+- [x] **Display-list limits** and a stopped state shown on every surface (DESIGN
+  invariant 13).
 - [ ] **Moving a surface between host windows** moves its root between mirrors; focus
   inside it is lost on the way. Fine for a drag between windows; worth a test.
 - [ ] **Host-side retained replay**: the host `Surface` still replays its display list
@@ -107,9 +112,9 @@ Views are `SurfaceApi`/`ViewApi` objects; see `DESIGN.md`. What remains:
 
 ## Platform completeness
 
-- [x] **Resource limits**: per-turn epoch deadline and memory cap (`PluginOptions`);
-  a trapped plugin stops and in-flight calls fail. Still open: a display-list size
-  cap at scene submission, and a UI for the host to show a stopped plugin.
+- [x] **Resource limits**: per-turn epoch deadline, query budget, memory cap, and
+  display-list caps (`PluginOptions`); a plugin that overruns stops, in-flight calls
+  fail, and its surfaces show why.
 - [x] **IME / marked text**: the host's `Surface` is an `EntityInputHandler` whose
   answers come from the guest over the synchronous `input-query` export.
 - [ ] **Rendering completeness**: gradient backgrounds (solid fallback today),

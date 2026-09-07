@@ -1,3 +1,4 @@
+use crate::clipboard::{ClipboardApi, ClipboardApiCaller as _};
 use crate::dispatcher::PluginDispatcher;
 use crate::guest::objects;
 use crate::surface::{Cursor, Geometry, HostWindow, SurfaceApi};
@@ -86,6 +87,13 @@ pub struct PluginPlatform {
     last_input_surface: Cell<Option<u64>>,
     /// A cursor style GPUI set since the last pump; flushed to `last_input_surface`.
     pending_cursor: Cell<Option<Cursor>>,
+    /// The clipboard object the plugin was given, if any, with the subscription that
+    /// keeps `clipboard` current.
+    clipboard_remote: RefCell<Option<(Remote<ClipboardApi>, gpui::Subscription)>>,
+    /// The host clipboard's text as last heard; what GPUI's synchronous read returns.
+    clipboard: RefCell<Option<ClipboardItem>>,
+    /// Text GPUI wrote to the clipboard since the last pump; forwarded as a call.
+    clipboard_write: RefCell<Option<String>>,
 }
 
 impl PluginPlatform {
@@ -107,6 +115,29 @@ impl PluginPlatform {
             pending_events: RefCell::new(Vec::new()),
             last_input_surface: Cell::new(None),
             pending_cursor: Cell::new(None),
+            clipboard_remote: RefCell::new(None),
+            clipboard: RefCell::new(None),
+            clipboard_write: RefCell::new(None),
+        }
+    }
+
+    pub fn set_clipboard(&self, clipboard: Remote<ClipboardApi>, subscription: gpui::Subscription) {
+        *self.clipboard_remote.borrow_mut() = Some((clipboard, subscription));
+    }
+
+    pub fn set_clipboard_text(&self, text: Option<String>) {
+        *self.clipboard.borrow_mut() = text.map(ClipboardItem::new_string);
+    }
+
+    /// Forward what GPUI wrote to the clipboard as a call on the clipboard object.
+    pub fn flush_clipboard_writes(&self, cx: &mut App) {
+        let Some(text) = self.clipboard_write.borrow_mut().take() else {
+            return;
+        };
+        // The copy is what a read returns until the host says otherwise.
+        *self.clipboard.borrow_mut() = Some(ClipboardItem::new_string(text.clone()));
+        if let Some((clipboard, _)) = self.clipboard_remote.borrow().as_ref() {
+            clipboard.write(text, cx);
         }
     }
 
@@ -150,7 +181,12 @@ impl PluginPlatform {
     /// key-down dispatched through its window (answering whether the guest consumed it),
     /// or a question for the window's focused text field. Runs between turns, outside
     /// any `App` borrow.
-    pub fn input_query(&self, view: u64, query: wit::InputQuery) -> wit::InputAnswer {
+    pub fn input_query(
+        &self,
+        view: u64,
+        query: wit::InputQuery,
+        async_app: &mut AsyncApp,
+    ) -> wit::InputAnswer {
         let Some(surface) = self.view_objects.borrow().get(&view).copied() else {
             return wit::InputAnswer::None;
         };
@@ -181,9 +217,52 @@ impl PluginPlatform {
                     None => wit::InputAnswer::None,
                 }
             }
+            // Two answers need the window itself, not just the handler.
+            wit::InputQuery::TextInputConfiguration | wit::InputQuery::AcceptsTextInput => {
+                let Some(handle) = window.handle() else {
+                    return wit::InputAnswer::None;
+                };
+                let accepts = matches!(query, wit::InputQuery::AcceptsTextInput);
+                window
+                    .with_input_handler(|handler| {
+                        async_app.update(|cx| {
+                            handle
+                                .update(cx, |_, gpui_window, cx| {
+                                    if accepts {
+                                        wit::InputAnswer::Accepts(
+                                            handler.accepts_text_input(gpui_window, cx),
+                                        )
+                                    } else {
+                                        wit::InputAnswer::Configuration(configuration_to_wire(
+                                            handler.text_input_configuration(gpui_window, cx),
+                                        ))
+                                    }
+                                })
+                                .ok()
+                        })
+                    })
+                    .flatten()
+                    .unwrap_or(wit::InputAnswer::None)
+            }
             query => window
                 .with_input_handler(|handler| match query {
-                    wit::InputQuery::KeyDown(_) => wit::InputAnswer::None,
+                    wit::InputQuery::KeyDown(_)
+                    | wit::InputQuery::TextInputConfiguration
+                    | wit::InputQuery::AcceptsTextInput => wit::InputAnswer::None,
+                    wit::InputQuery::SetSelectedTextRange(range) => {
+                        handler.set_selected_text_range(range_from_wire(range));
+                        wit::InputAnswer::Done
+                    }
+                    wit::InputQuery::TextLength => handler
+                        .text_length_utf16()
+                        .map_or(wit::InputAnswer::None, |length| {
+                            wit::InputAnswer::Index(length as u32)
+                        }),
+                    wit::InputQuery::TextInputEditableRange => handler
+                        .text_input_editable_range()
+                        .map_or(wit::InputAnswer::None, |range| {
+                            wit::InputAnswer::Range(wire_range(range))
+                        }),
                     wit::InputQuery::SelectedTextRange(ignore_disabled_input) => handler
                         .selected_text_range(ignore_disabled_input)
                         .map_or(wit::InputAnswer::None, |selection| {
@@ -664,10 +743,14 @@ impl Platform for PluginPlatform {
     }
 
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
-        None
+        self.clipboard.borrow().clone()
     }
 
-    fn write_to_clipboard(&self, _item: ClipboardItem) {}
+    fn write_to_clipboard(&self, item: ClipboardItem) {
+        if let Some(text) = item.text() {
+            *self.clipboard_write.borrow_mut() = Some(text);
+        }
+    }
 
     fn write_credentials(&self, _url: &str, _username: &str, _password: &[u8]) -> Task<Result<()>> {
         Task::ready(Err(anyhow!("credentials are not available in plugins")))
@@ -757,4 +840,29 @@ fn wire_range(range: std::ops::Range<usize>) -> wit::TextRange {
 
 fn range_from_wire(range: wit::TextRange) -> std::ops::Range<usize> {
     range.start as usize..range.end as usize
+}
+
+fn configuration_to_wire(
+    configuration: gpui::TextInputConfiguration,
+) -> wit::TextInputConfiguration {
+    wit::TextInputConfiguration {
+        autocorrect: configuration.autocorrect,
+        autocapitalize: match configuration.autocapitalize {
+            gpui::Autocapitalize::None => wit::Autocapitalize::None,
+            gpui::Autocapitalize::Words => wit::Autocapitalize::Words,
+            gpui::Autocapitalize::Sentences => wit::Autocapitalize::Sentences,
+            gpui::Autocapitalize::Characters => wit::Autocapitalize::Characters,
+        },
+        suggestions: configuration.suggestions,
+        input_action: match configuration.input_action {
+            gpui::TextInputAction::Unspecified => wit::TextInputAction::Unspecified,
+            gpui::TextInputAction::Enter => wit::TextInputAction::Enter,
+            gpui::TextInputAction::Done => wit::TextInputAction::Done,
+            gpui::TextInputAction::Go => wit::TextInputAction::Go,
+            gpui::TextInputAction::Next => wit::TextInputAction::Next,
+            gpui::TextInputAction::Previous => wit::TextInputAction::Previous,
+            gpui::TextInputAction::Search => wit::TextInputAction::Search,
+            gpui::TextInputAction::Send => wit::TextInputAction::Send,
+        },
+    }
 }

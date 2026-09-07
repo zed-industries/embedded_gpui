@@ -356,6 +356,32 @@ world plugin {
         is-held: bool,
     }
 
+    enum autocapitalize {
+        none,
+        words,
+        sentences,
+        characters,
+    }
+
+    enum text-input-action {
+        unspecified,
+        enter,
+        done,
+        go,
+        next,
+        previous,
+        search,
+        send,
+    }
+
+    /// Mirrors GPUI's `TextInputConfiguration`: hints a platform keyboard reads.
+    record text-input-configuration {
+        autocorrect: bool,
+        autocapitalize: autocapitalize,
+        suggestions: bool,
+        input-action: text-input-action,
+    }
+
     /// A range of UTF-16 offsets into the focused field's text.
     record text-range {
         start: u32,
@@ -400,6 +426,11 @@ world plugin {
         bounds-for-range(text-range),
         /// Slot-relative logical pixels.
         character-index-for-point(point),
+        set-selected-text-range(text-range),
+        text-length,
+        accepts-text-input,
+        text-input-configuration,
+        text-input-editable-range,
     }
 
     variant input-answer {
@@ -414,6 +445,8 @@ world plugin {
         bounds(bounds),
         index(u32),
         done,
+        accepts(bool),
+        configuration(text-input-configuration),
     }
 
     // ------------------------------------------------------------------

@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use crate::clipboard::{ClipboardApi, ClipboardChanged};
 use crate::registry::{Call, Frame, Objects, Response};
 use crate::{Interface, Methods, Payload, Ref, Registry, Remote, Shared};
 use anyhow::{Context as _, Result};
@@ -267,7 +268,10 @@ pub struct PluginInstance {
     bindings: Plugin,
     /// Epoch ticks a single guest turn may take before it traps.
     turn_deadline_ticks: u64,
-    turn_budget: Duration,
+    /// Epoch ticks an input query may take before it traps.
+    query_deadline_ticks: u64,
+    input_query_budget: Duration,
+    limits: DisplayListLimits,
     /// Stops the epoch ticker thread when the instance drops.
     ticker_alive: Arc<AtomicBool>,
 }
@@ -304,6 +308,11 @@ pub struct PluginOptions {
     /// that exceeds it traps and the instance stops; the host UI never waits on it
     /// either way, since turns run on a worker. Default: one second.
     pub turn_budget: Duration,
+    /// The most the host UI thread waits for an input query (a keystroke's precedence,
+    /// an IME question), and the most the guest may take answering one before it traps.
+    /// Default: 50 milliseconds.
+    pub input_query_budget: Duration,
+    pub limits: DisplayListLimits,
     /// The most linear memory the guest may grow to. Default: 512 MiB.
     pub memory_limit: usize,
 }
@@ -315,6 +324,8 @@ impl PluginOptions {
             configure_wasi: None,
             plugin_dir: None,
             turn_budget: Duration::from_secs(1),
+            input_query_budget: Duration::from_millis(50),
+            limits: DisplayListLimits::default(),
             memory_limit: 512 << 20,
         }
     }
@@ -327,6 +338,16 @@ impl PluginOptions {
 
     pub fn with_turn_budget(mut self, budget: Duration) -> Self {
         self.turn_budget = budget;
+        self
+    }
+
+    pub fn with_input_query_budget(mut self, budget: Duration) -> Self {
+        self.input_query_budget = budget;
+        self
+    }
+
+    pub fn with_limits(mut self, limits: DisplayListLimits) -> Self {
+        self.limits = limits;
         self
     }
 
@@ -411,7 +432,9 @@ impl PluginInstance {
             store,
             bindings,
             turn_deadline_ticks,
-            turn_budget: options.turn_budget,
+            query_deadline_ticks: budget_ticks(options.input_query_budget),
+            input_query_budget: options.input_query_budget,
+            limits: options.limits,
             ticker_alive,
         })
     }
@@ -429,10 +452,57 @@ impl PluginInstance {
         self.bindings.call_tick(&mut self.store, &inbound)
     }
 
-    /// A synchronous text-input query, between turns, under the turn budget.
+    /// A synchronous text-input query, between turns, under the query budget.
     pub fn input_query(&mut self, view: u64, query: &InputQuery) -> Result<InputAnswer> {
-        self.store.set_epoch_deadline(self.turn_deadline_ticks);
+        self.store.set_epoch_deadline(self.query_deadline_ticks);
         self.bindings.call_input_query(&mut self.store, view, query)
+    }
+}
+
+/// How many epoch ticks a budget spans, rounded up, at least one.
+fn budget_ticks(budget: Duration) -> u64 {
+    (budget.as_millis() as u64)
+        .div_ceil(EPOCH_TICK.as_millis() as u64)
+        .max(1)
+}
+
+/// Caps on what a plugin may ship in one display list. A list over a cap stops the
+/// plugin, like a trap: it is the one bulk path across the boundary, and a runaway
+/// scene would otherwise cost the host every frame it replays it.
+#[derive(Clone, Copy, Debug)]
+pub struct DisplayListLimits {
+    /// Primitives per display list (a surface's scene or overlay). Default: 100,000.
+    pub max_primitives: usize,
+    /// Bytes of new image payloads per display list. Default: 64 MiB.
+    pub max_image_bytes: usize,
+}
+
+impl Default for DisplayListLimits {
+    fn default() -> Self {
+        Self {
+            max_primitives: 100_000,
+            max_image_bytes: 64 << 20,
+        }
+    }
+}
+
+impl DisplayListLimits {
+    fn check(&self, list: &bindings::DisplayList) -> Result<(), String> {
+        if list.primitives.len() > self.max_primitives {
+            return Err(format!(
+                "display list has {} primitives, more than the {} allowed",
+                list.primitives.len(),
+                self.max_primitives
+            ));
+        }
+        let image_bytes: usize = list.new_images.iter().map(|image| image.bytes.len()).sum();
+        if image_bytes > self.max_image_bytes {
+            return Err(format!(
+                "display list ships {image_bytes} bytes of images, more than the {} allowed",
+                self.max_image_bytes
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -517,6 +587,7 @@ enum PluginRequest {
 pub struct InputQueries {
     requests: mpsc::UnboundedSender<PluginRequest>,
     timeout: Duration,
+    clipboard: gpui::WeakEntity<Clipboard>,
 }
 
 /// The answer to a query sent with [`InputQueries::send`], arriving on the worker's
@@ -562,14 +633,56 @@ impl InputQueries {
         PendingAnswer(answer)
     }
 
-    /// Send a query and wait for its answer, at most the turn budget.
+    /// Send a query and wait for its answer, at most the query budget.
     pub fn query(&self, view: u64, query: InputQuery) -> Option<InputAnswer> {
         let pending = self.send(view, query);
         let answer = pending.wait(self.timeout);
         if answer.is_none() {
-            log::warn!("embedded_gpui: input query unanswered within the turn budget");
+            log::warn!("embedded_gpui: input query unanswered within the query budget");
         }
         answer
+    }
+
+    /// Let the host's clipboard object look at the clipboard again, ahead of a keystroke
+    /// that may paste: a change reaches the plugin as an event before the key does.
+    pub fn refresh_clipboard(&self, cx: &mut gpui::App) {
+        self.clipboard
+            .update(cx, |clipboard, cx| clipboard.refresh(cx))
+            .ok();
+    }
+}
+
+/// The host clipboard as an object (see [`crate::clipboard`]). Every [`PluginHost`]
+/// owns one; hand its ref to a plugin through your root schema to grant the clipboard,
+/// and don't to withhold it.
+pub struct Clipboard {
+    last_seen: Option<String>,
+}
+
+impl gpui::EventEmitter<ClipboardChanged> for Clipboard {}
+
+impl Clipboard {
+    /// Look at the clipboard; tell subscribers if it changed since the last look.
+    pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        let text = cx.read_from_clipboard().and_then(|item| item.text());
+        if text != self.last_seen {
+            self.last_seen = text.clone();
+            cx.emit(ClipboardChanged { text });
+        }
+    }
+}
+
+#[crate::shared]
+impl ClipboardApi for Clipboard {
+    fn read(&mut self, cx: &mut Context<Self>) -> Option<String> {
+        let text = cx.read_from_clipboard().and_then(|item| item.text());
+        self.last_seen = text.clone();
+        text
+    }
+
+    fn write(&mut self, text: String, cx: &mut Context<Self>) {
+        self.last_seen = Some(text.clone());
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
     }
 }
 
@@ -585,6 +698,10 @@ pub struct PluginHost {
     /// entity supplies only its transport (the request queue) and the pixel path.
     objects: Objects,
     scheduled_tick: Option<Task<()>>,
+    limits: DisplayListLimits,
+    /// Why the plugin stopped, once it has: a trap, a budget, or a limit.
+    stopped: Option<String>,
+    clipboard: Entity<Clipboard>,
     _worker: Task<()>,
     _pump: Task<()>,
 }
@@ -595,7 +712,9 @@ impl PluginHost {
     /// worker, strictly one at a time, and their output is applied back on the
     /// foreground in the same order.
     pub fn new(mut instance: PluginInstance, cx: &mut Context<Self>) -> Self {
-        let turn_budget = instance.turn_budget;
+        let input_query_budget = instance.input_query_budget;
+        let limits = instance.limits;
+        let clipboard = cx.new(|_| Clipboard { last_seen: None });
         let (requests, mut request_rx) = mpsc::unbounded::<PluginRequest>();
         let (turns_tx, mut turns_rx) = mpsc::unbounded::<Result<bindings::Turn, String>>();
 
@@ -666,7 +785,8 @@ impl PluginHost {
         }));
         objects.set_extension(Rc::new(InputQueries {
             requests: requests.clone(),
-            timeout: turn_budget,
+            timeout: input_query_budget,
+            clipboard: clipboard.downgrade(),
         }));
 
         // Object traffic is applied straight to the registry, *outside* any update of
@@ -679,7 +799,9 @@ impl PluginHost {
                 let turn = match turn {
                     Ok(turn) => turn,
                     Err(reason) => {
-                        pump_objects.fail_pending(&reason);
+                        cx.update(|cx| {
+                            host.update(cx, |host, cx| host.stop(reason, cx)).ok();
+                        });
                         break;
                     }
                 };
@@ -705,6 +827,9 @@ impl PluginHost {
             images: PluginImages::default(),
             objects,
             scheduled_tick: None,
+            limits,
+            stopped: None,
+            clipboard,
             _worker: worker,
             _pump: pump,
         };
@@ -784,6 +909,36 @@ impl PluginHost {
         self.objects.root()
     }
 
+    /// The host clipboard as an object. Share it with the plugin (through a method on
+    /// your root, wrapped in a `Revocable` if the grant should be a loan) to give the
+    /// plugin the clipboard; a plugin without the ref has none.
+    pub fn clipboard(&self) -> Entity<Clipboard> {
+        self.clipboard.clone()
+    }
+
+    /// Why the plugin stopped, if it has. Observers of this entity are notified when it
+    /// does; every [`Surface`] it drew on shows the reason.
+    pub fn stopped(&self) -> Option<&str> {
+        self.stopped.as_deref()
+    }
+
+    /// The plugin is done for good: a trap, a budget, a limit. In-flight calls fail,
+    /// its surfaces show the reason, and the store is dropped.
+    fn stop(&mut self, reason: String, cx: &mut Context<Self>) {
+        if self.stopped.is_some() {
+            return;
+        }
+        log::error!("embedded_gpui: {reason}");
+        self.objects.fail_pending(&reason);
+        for surface in self.objects.local_entities::<Surface>() {
+            surface.update(cx, |surface, cx| surface.set_stopped(reason.clone(), cx));
+        }
+        self.stopped = Some(reason);
+        self.scheduled_tick = None;
+        self._worker = Task::ready(());
+        cx.notify();
+    }
+
     /// Flush deferred work (queued capability releases) and give the guest a turn.
     /// Hosts with quiescent plugins (no pending tick) can call this to make drops
     /// observable.
@@ -801,6 +956,12 @@ impl PluginHost {
         overlays: Vec<bindings::Scene>,
         cx: &mut Context<Self>,
     ) {
+        for list in scenes.iter().chain(&overlays).map(|scene| &scene.list) {
+            if let Err(reason) = self.limits.check(list) {
+                self.stop(format!("plugin stopped: {reason}"), cx);
+                return;
+            }
+        }
         for scene in scenes {
             self.ingest_images(&scene.list);
             match self.objects.local_entity::<Surface>(scene.surface) {

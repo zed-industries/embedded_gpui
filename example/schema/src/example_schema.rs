@@ -6,6 +6,7 @@
 //! at its id 0, and every other capability here is reached by calling a root method
 //! that returns a ref. No names, no registries — discovery *is* the root schema.
 
+use embedded_gpui::clipboard::ClipboardApi;
 use embedded_gpui::surface::SurfaceApi;
 use embedded_gpui::{Ref, data, interface};
 
@@ -17,6 +18,10 @@ pub trait DemoHost {
 
     /// The workspace service the plugin drives (toasts, accent color).
     fn workspace(&mut self, cx: &mut gpui::Context<Self>) -> Ref<WorkspaceApi>;
+
+    /// The host clipboard: a capability like any other. The demo hands it out plainly;
+    /// a host could wrap it in a `Revocable` first, or not offer it at all.
+    fn clipboard(&mut self, cx: &mut gpui::Context<Self>) -> Ref<ClipboardApi>;
 }
 
 /// The plugin's root object: everything the host can reach in the plugin. The methods

@@ -25,6 +25,7 @@ pub(crate) mod wit {
     });
 }
 
+use crate::clipboard::{ClipboardApi, ClipboardApiCaller as _, ClipboardChanged};
 use crate::surface::{Geometry, KeyEvent, MouseEvent, SurfaceApi, SurfaceApiCaller as _, ViewApi};
 use crate::{Ref, Remote};
 use gpui::{
@@ -149,7 +150,10 @@ fn pump(platform: &PluginPlatform, async_app: &mut AsyncApp) -> Option<u32> {
         window.pump_frame();
     }
     dispatcher.run_until_idle();
-    async_app.update(|cx| platform.ship_scenes(cx));
+    async_app.update(|cx| {
+        platform.flush_clipboard_writes(cx);
+        platform.ship_scenes(cx);
+    });
     if let Some((surface, cursor)) = platform.take_pending_cursor() {
         async_app.update(|cx| {
             surface.set_cursor(cursor, cx);
@@ -159,6 +163,31 @@ fn pump(platform: &PluginPlatform, async_app: &mut AsyncApp) -> Option<u32> {
     dispatcher
         .next_timer_delay()
         .map(|delay| delay.as_millis().min(u32::MAX as u128) as u32)
+}
+
+/// Give the guest platform a clipboard. GPUI's `cx.read_from_clipboard()` and
+/// `cx.write_to_clipboard()` are synchronous, so the platform keeps a copy fed by the
+/// object's [`ClipboardChanged`] events (which the host sends ahead of any keystroke
+/// that could paste) and forwards writes as calls on the next turn. The host decides
+/// whether a plugin gets a clipboard at all by whether it hands out the ref; a
+/// `Revocable` around it makes the grant a loan.
+pub fn use_clipboard(clipboard: Remote<ClipboardApi>, cx: &mut App) {
+    let Some((_, platform)) = runtime_handles() else {
+        return;
+    };
+    let cache = platform.clone();
+    let subscription = clipboard.subscribe(cx, move |event: &ClipboardChanged, _| {
+        cache.set_clipboard_text(event.text.clone());
+    });
+    let seed = clipboard.read(cx);
+    let cache = platform.clone();
+    cx.spawn(async move |_| {
+        if let Ok(text) = seed.await {
+            cache.set_clipboard_text(text);
+        }
+    })
+    .detach();
+    platform.set_clipboard(clipboard, subscription);
 }
 
 /// The guest end of a host surface: the object the host drives with geometry and input.
@@ -250,10 +279,10 @@ impl wit::Guest for Component {
     }
 
     fn input_query(view: u64, query: wit::InputQuery) -> wit::InputAnswer {
-        let Some((_, platform)) = runtime_handles() else {
+        let Some((mut async_app, platform)) = runtime_handles() else {
             return wit::InputAnswer::None;
         };
-        platform.input_query(view, query)
+        platform.input_query(view, query, &mut async_app)
     }
 }
 

@@ -22,17 +22,18 @@ futures = "0.3"
 # wasm32-wasip2 natively via wasi:random.
 getrandom = "0.3"
 # gpui is consumed from the zed repository: the node engine (zed-industries/zed#63800)
-# plus Window::attach_root / take_root_scene (branch gpui-multi-root-embedded), which
-# the guest needs to draw every surface as a root of its one window. A path dependency
-# on a sibling checkout while that branch is unpublished; switch to git once pushed.
-gpui = { path = "../../zed/crates/gpui", default-features = false }
+# plus the attached-root API (Window::attach_root, take_root_scene,
+# take_root_overlay_scene, root_overlay_hit_regions) on branch gpui-multi-root-embedded,
+# which the guest needs to draw every surface as a root of a window mirroring the host's.
+# Move to main once both land there.
+gpui = { git = "https://github.com/zed-industries/zed.git", branch = "gpui-multi-root-embedded", default-features = false }
 embedded_gpui_macros = { path = "../embedded_gpui_macros" }
 log = "0.4"
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-gpui = { path = "../../zed/crates/gpui" }
+gpui = { git = "https://github.com/zed-industries/zed.git", branch = "gpui-multi-root-embedded" }
 image = "0.25"
 smallvec = { version = "1.6", features = ["union", "const_new"] }
 wasmtime = { version = "36", default-features = false, features = [

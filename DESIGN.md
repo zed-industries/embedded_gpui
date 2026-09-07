@@ -147,9 +147,14 @@ the rule for it is the same as for every plugin: events and notifies, not animat
    order, preserving guest stacking (including guest-side deferred draws / overlays).
 7. **Input and geometry are method calls** on the guest-homed `ViewApi` object a
    surface has attached: `resize`, `mouse`, `key` (slot-relative logical coordinates).
-   The guest translates them into the window mirror (below) and lets GPUI's own
-   dispatch do hit-testing and run listeners; no callback registry crosses the boundary.
-   Cursor styles flow back as `set_cursor` on the host-homed `SurfaceApi`. Because
+   Everything a window would hear goes over the wire: mouse down/up/move/scroll, the
+   pointer leaving the slot (so hover clears and tooltips dismiss), key down/up, and
+   modifier changes; the guest window reports the held modifiers and hover state from
+   the last event it saw. The guest translates them into the window mirror (below) and
+   lets GPUI's own dispatch do hit-testing and run listeners; no callback registry
+   crosses the boundary. Cursor styles flow back as `set_cursor` on the host-homed
+   `SurfaceApi`. Still one-way: IME composition (marked text) needs synchronous answers
+   from the guest and is not proxied. Because
    `ViewApi` handlers run inside the registry's `App` borrow and GPUI's window callbacks
    re-enter the app, the view queues events on the window and the pump applies them
    once the borrow is released — same turn, same order.
@@ -169,9 +174,21 @@ the rule for it is the same as for every plugin: events and notifies, not animat
    `Window::take_root_scene`, which answers only for roots whose node was redrawn, so an
    idle surface ships nothing and a changed one ships exactly its own display list
    (translated back to slot-relative coordinates). A view is not drawn until the host
-   has said where it is, so its first frame is at the slot's real size. Window-level
-   state (active, appearance) has its natural place now — the mirror — and is the next
-   thing `Geometry`'s `HostWindow` grows.
+   has said where it is, so its first frame is at the slot's real size. `HostWindow`
+   also carries the host window's active state and appearance, which the mirror reports
+   to GPUI as a platform would, so a plugin's views see the real window state.
+10. **Overlays ship separately and paint above the host.** What a view draws outside
+   its own subtree — the deferred draws it attached (popovers, menus) and, for the
+   surface the pointer is in, the roots that belong to no surface (tooltips, drag
+   previews, prompts) — is read back with `Window::take_root_overlay_scene` and shipped
+   as a second display list for that surface (`turn.overlays`). The host paints it as a
+   deferred draw above its whole window, unclipped, positioned relative to the slot, and
+   puts an occluding hitbox over the primitives' union bounds that forwards input to the
+   same view, so a plugin's popover can extend past its slot and still be clicked. This
+   is deliberately powerful: a plugin can draw anywhere in the host window. The host is
+   the policy point if that ever needs attenuating (an `Attenuated<ViewApi>` cannot do
+   it; overlays are output, not calls), and a display-list size cap is the obvious
+   first limit.
 9. **Scheduling**: the guest dispatcher queues runnables/timers locally. Every `tick`
    drains due work, pumps the window's `request_frame` callback (GPUI decides whether it
    is dirty), ships the changed roots' scenes into the turn's `scenes`, and reports the

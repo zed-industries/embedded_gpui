@@ -45,6 +45,7 @@ pub struct SeenGeometry {
     pub viewport_width: f32,
     pub viewport_height: f32,
     pub scale_factor: f32,
+    pub active: bool,
 }
 
 /// What the plugin observed of a mounted view.

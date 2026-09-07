@@ -15,8 +15,10 @@ changes; nothing here is a supported API yet.
 - A guest-side GPUI platform: guest windows that mirror the host's windows (same
   size and scale factor), in which every host surface is a root of the frame at its
   real origin (a memoized node-engine node, not a window), per-surface display lists
-  shipped only when a root changed, mouse and keyboard input, timers/async, SVG and
-  image rendering, text via host-side shaping. The WIT protocol (`wit/plugin.wit`) is pure substrate — `init`,
+  shipped only when a root changed, overlays (popovers, tooltips, drag previews)
+  painted above the host window, real window state (active, appearance, modifiers,
+  hover), mouse and keyboard input, timers/async, SVG and image rendering, text via
+  host-side shaping. The WIT protocol (`wit/plugin.wit`) is pure substrate — `init`,
   `tick(inbound frames) -> turn`, and synchronous text shaping; nothing in it
   has UI meaning.
 - A host runtime: loads a component with wasmtime on a background worker,

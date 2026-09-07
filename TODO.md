@@ -11,14 +11,18 @@ Views are `SurfaceApi`/`ViewApi` objects; see `DESIGN.md`. What remains:
 - [x] **Data-shaped surfaces at scale**: guest windows mirror host windows; every
   surface is a root attached to its window at its real origin (`Window::attach_root`,
   a node-engine node), and only roots whose node was redrawn ship a display list
-  (`Window::take_root_scene`). Scale factor is per window, as it should be. Still
-  open: **window-level overlays** — a deferred draw inside a surface ships with that
-  surface, but a tooltip or prompt is a window-level root with no owner and is not
-  routed to any surface yet.
-- [ ] **Window state mirroring**: `Geometry.window` carries id, viewport, and scale
-  factor. Grow it (or a host-homed window object it refers to) with active state and
-  appearance, so a guest window mirrors everything about its host window and plugins
-  stop seeing a window that is always active and always dark.
+  (`Window::take_root_scene`). Scale factor is per window, as it should be.
+- [x] **Overlays**: deferred draws, tooltips, drag previews and prompts ship as a
+  second display list per surface and are painted above the host window, with an
+  occluding hitbox forwarding input. Open: a size cap; and the hitbox is the
+  primitives' union bounds, so a transparent margin around a popover eats clicks.
+- [x] **Window state mirroring**: `HostWindow` carries id, viewport, scale factor,
+  active state and appearance; the mirror reports them to GPUI as a platform would.
+  Modifiers and hover come from the events themselves.
+- [ ] **IME / marked text** stays open (see Platform completeness): composition needs
+  synchronous answers from the focused input handler, which the turn model cannot give
+  mid-call. A mirrored input-handler snapshot (selection, marked range, text around the
+  caret) shipped with each frame would let the host answer from cache.
 - [ ] **Moving a surface between host windows** moves its root between mirrors; focus
   inside it is lost on the way. Fine for a drag between windows; worth a test.
 - [ ] **Host-side retained replay**: the host `Surface` still replays its display list

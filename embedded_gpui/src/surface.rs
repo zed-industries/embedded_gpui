@@ -71,6 +71,19 @@ pub struct HostWindow {
     pub width: f32,
     pub height: f32,
     pub scale_factor: f32,
+    /// Whether the window is the active (key) window.
+    pub active: bool,
+    pub appearance: Appearance,
+}
+
+/// Mirrors GPUI's `WindowAppearance`.
+#[data]
+#[derive(Copy, PartialEq, Eq)]
+pub enum Appearance {
+    Light,
+    VibrantLight,
+    Dark,
+    VibrantDark,
 }
 
 #[data]
@@ -125,6 +138,16 @@ pub struct ScrollWheelEvent {
     pub modifiers: Modifiers,
 }
 
+/// The pointer left the surface (or the host window while over it). `position` is
+/// where it was last seen, slot-relative and possibly outside the slot.
+#[data]
+#[derive(PartialEq)]
+pub struct MouseExitEvent {
+    pub position: Point,
+    pub pressed_button: Option<MouseButton>,
+    pub modifiers: Modifiers,
+}
+
 #[data]
 #[derive(PartialEq)]
 pub enum MouseEvent {
@@ -132,6 +155,7 @@ pub enum MouseEvent {
     Up(MouseButtonEvent),
     Move(MouseMoveEvent),
     Scroll(ScrollWheelEvent),
+    Exited(MouseExitEvent),
 }
 
 /// Mirrors GPUI's `Keystroke`.
@@ -148,8 +172,17 @@ pub struct Keystroke {
 #[data]
 #[derive(PartialEq, Eq)]
 pub enum KeyEvent {
-    Down { keystroke: Keystroke, is_held: bool },
-    Up { keystroke: Keystroke },
+    Down {
+        keystroke: Keystroke,
+        is_held: bool,
+    },
+    Up {
+        keystroke: Keystroke,
+    },
+    /// The held modifiers changed while the surface had focus.
+    ModifiersChanged {
+        modifiers: Modifiers,
+    },
 }
 
 /// Mirrors GPUI's `CursorStyle` (subset).
@@ -245,6 +278,26 @@ impl Keystroke {
     }
 }
 
+impl Appearance {
+    pub fn from_gpui(appearance: gpui::WindowAppearance) -> Self {
+        match appearance {
+            gpui::WindowAppearance::Light => Self::Light,
+            gpui::WindowAppearance::VibrantLight => Self::VibrantLight,
+            gpui::WindowAppearance::Dark => Self::Dark,
+            gpui::WindowAppearance::VibrantDark => Self::VibrantDark,
+        }
+    }
+
+    pub fn to_gpui(self) -> gpui::WindowAppearance {
+        match self {
+            Self::Light => gpui::WindowAppearance::Light,
+            Self::VibrantLight => gpui::WindowAppearance::VibrantLight,
+            Self::Dark => gpui::WindowAppearance::Dark,
+            Self::VibrantDark => gpui::WindowAppearance::VibrantDark,
+        }
+    }
+}
+
 impl MouseEvent {
     /// Translate a host element event into a wire event at `origin`-relative
     /// coordinates. `None` for buttons the protocol does not carry.
@@ -285,6 +338,11 @@ impl MouseEvent {
                     modifiers: Modifiers::from_gpui(event.modifiers),
                 })
             }
+            gpui::PlatformInput::MouseExited(event) => Self::Exited(MouseExitEvent {
+                position: Point::from_gpui(event.position - origin),
+                pressed_button: event.pressed_button.and_then(MouseButton::from_gpui),
+                modifiers: Modifiers::from_gpui(event.modifiers),
+            }),
             _ => return None,
         };
         Some(event)
@@ -323,6 +381,11 @@ impl MouseEvent {
                 modifiers: event.modifiers.to_gpui(),
                 touch_phase: Default::default(),
             }),
+            Self::Exited(event) => gpui::PlatformInput::MouseExited(gpui::MouseExitEvent {
+                position: event.position.to_gpui(),
+                pressed_button: event.pressed_button.map(MouseButton::to_gpui),
+                modifiers: event.modifiers.to_gpui(),
+            }),
         }
     }
 }
@@ -336,6 +399,9 @@ impl KeyEvent {
             }),
             gpui::PlatformInput::KeyUp(event) => Some(Self::Up {
                 keystroke: Keystroke::from_gpui(&event.keystroke),
+            }),
+            gpui::PlatformInput::ModifiersChanged(event) => Some(Self::ModifiersChanged {
+                modifiers: Modifiers::from_gpui(event.modifiers),
             }),
             _ => None,
         }
@@ -351,6 +417,12 @@ impl KeyEvent {
             Self::Up { keystroke } => gpui::PlatformInput::KeyUp(gpui::KeyUpEvent {
                 keystroke: keystroke.to_gpui(),
             }),
+            Self::ModifiersChanged { modifiers } => {
+                gpui::PlatformInput::ModifiersChanged(gpui::ModifiersChangedEvent {
+                    modifiers: modifiers.to_gpui(),
+                    capslock: Default::default(),
+                })
+            }
         }
     }
 }

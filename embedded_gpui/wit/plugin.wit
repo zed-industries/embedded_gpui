@@ -333,6 +333,12 @@ world plugin {
         /// Object traffic toward the host, in send order.
         frames: list<frame>,
         scenes: list<scene>,
+        /// What a view drew outside its own subtree -- popovers and menus it deferred,
+        /// and the tooltips, drag previews and prompts that appeared while the pointer
+        /// was in it -- as a second display list per surface. The host paints it above
+        /// its whole window, unclipped, positioned relative to the slot, and forwards
+        /// input over it to the same view. An empty list clears the overlay.
+        overlays: list<scene>,
         /// Ask the host to tick again after at least this many milliseconds (zero: as
         /// soon as possible). Absent when the guest has no pending timers.
         wake-after-ms: option<u32>,

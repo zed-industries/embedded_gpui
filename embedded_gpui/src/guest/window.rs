@@ -25,12 +25,16 @@ use std::sync::{Arc, Once};
 type RequestFrameCallback = Box<dyn FnMut(RequestFrameOptions)>;
 type InputCallback = Box<dyn FnMut(PlatformInput) -> DispatchEventResult>;
 type ResizeCallback = Box<dyn FnMut(Size<Pixels>, f32)>;
+type ActiveCallback = Box<dyn FnMut(bool)>;
+type AppearanceCallback = Box<dyn FnMut()>;
 
 #[derive(Default)]
 struct Callbacks {
     request_frame: Option<RequestFrameCallback>,
     input: Option<InputCallback>,
     resize: Option<ResizeCallback>,
+    active: Option<ActiveCallback>,
+    appearance: Option<AppearanceCallback>,
 }
 
 /// Shared state for one guest window: the platform's `PlatformWindow` and the surface
@@ -38,6 +42,11 @@ struct Callbacks {
 pub struct PluginWindowState {
     host: Cell<HostWindow>,
     mouse_position: Cell<Point<Pixels>>,
+    /// The modifiers the last input event carried: what GPUI reads back when an
+    /// element asks which keys are held.
+    modifiers: Cell<Modifiers>,
+    /// Whether the pointer is over one of this window's surfaces.
+    hovered: Cell<bool>,
     atlas: Arc<PluginAtlas>,
     callbacks: RefCell<Callbacks>,
     input_handler: RefCell<Option<PlatformInputHandler>>,
@@ -51,6 +60,8 @@ impl PluginWindowState {
         Self {
             host: Cell::new(host),
             mouse_position: Cell::new(Point::default()),
+            modifiers: Cell::new(Modifiers::default()),
+            hovered: Cell::new(false),
             atlas: Arc::new(PluginAtlas::new(text_system)),
             callbacks: RefCell::new(Callbacks::default()),
             input_handler: RefCell::new(None),
@@ -89,21 +100,38 @@ impl PluginWindowState {
         size(px(host.width), px(host.height))
     }
 
-    /// Follow the host window: a change of size or scale factor re-lays the window out.
-    /// Called outside any `App` borrow, since GPUI's resize callback borrows the app.
+    /// Follow the host window: a change of size or scale factor re-lays the window out,
+    /// and active state and appearance are reported as GPUI expects from a platform.
+    /// Called outside any `App` borrow, since GPUI's callbacks borrow the app.
     pub fn sync_host(&self, host: HostWindow) {
         let current = self.host.get();
-        if current.width == host.width
-            && current.height == host.height
-            && current.scale_factor == host.scale_factor
-        {
+        if current == host {
             return;
         }
         self.host.set(host);
-        let callback = self.callbacks.borrow_mut().resize.take();
-        if let Some(mut callback) = callback {
-            callback(self.size(), host.scale_factor);
-            self.callbacks.borrow_mut().resize = Some(callback);
+        if current.width != host.width
+            || current.height != host.height
+            || current.scale_factor != host.scale_factor
+        {
+            let callback = self.callbacks.borrow_mut().resize.take();
+            if let Some(mut callback) = callback {
+                callback(self.size(), host.scale_factor);
+                self.callbacks.borrow_mut().resize = Some(callback);
+            }
+        }
+        if current.active != host.active {
+            let callback = self.callbacks.borrow_mut().active.take();
+            if let Some(mut callback) = callback {
+                callback(host.active);
+                self.callbacks.borrow_mut().active = Some(callback);
+            }
+        }
+        if current.appearance != host.appearance {
+            let callback = self.callbacks.borrow_mut().appearance.take();
+            if let Some(mut callback) = callback {
+                callback();
+                self.callbacks.borrow_mut().appearance = Some(callback);
+            }
         }
     }
 
@@ -137,10 +165,34 @@ impl PluginWindowState {
             return;
         }
         match &input {
-            PlatformInput::MouseDown(event) => self.mouse_position.set(event.position),
-            PlatformInput::MouseUp(event) => self.mouse_position.set(event.position),
-            PlatformInput::MouseMove(event) => self.mouse_position.set(event.position),
-            PlatformInput::ScrollWheel(event) => self.mouse_position.set(event.position),
+            PlatformInput::MouseDown(event) => {
+                self.mouse_position.set(event.position);
+                self.modifiers.set(event.modifiers);
+                self.hovered.set(true);
+            }
+            PlatformInput::MouseUp(event) => {
+                self.mouse_position.set(event.position);
+                self.modifiers.set(event.modifiers);
+                self.hovered.set(true);
+            }
+            PlatformInput::MouseMove(event) => {
+                self.mouse_position.set(event.position);
+                self.modifiers.set(event.modifiers);
+                self.hovered.set(true);
+            }
+            PlatformInput::ScrollWheel(event) => {
+                self.mouse_position.set(event.position);
+                self.modifiers.set(event.modifiers);
+                self.hovered.set(true);
+            }
+            PlatformInput::MouseExited(event) => {
+                self.mouse_position.set(event.position);
+                self.modifiers.set(event.modifiers);
+                self.hovered.set(false);
+            }
+            PlatformInput::KeyDown(event) => self.modifiers.set(event.keystroke.modifiers),
+            PlatformInput::KeyUp(event) => self.modifiers.set(event.keystroke.modifiers),
+            PlatformInput::ModifiersChanged(event) => self.modifiers.set(event.modifiers),
             _ => {}
         }
         let callback = self.callbacks.borrow_mut().input.take();
@@ -232,7 +284,7 @@ impl PlatformWindow for PluginWindow {
     }
 
     fn appearance(&self) -> WindowAppearance {
-        WindowAppearance::Dark
+        self.state.host.get().appearance.to_gpui()
     }
 
     fn display(&self) -> Option<Rc<dyn PlatformDisplay>> {
@@ -244,7 +296,7 @@ impl PlatformWindow for PluginWindow {
     }
 
     fn modifiers(&self) -> Modifiers {
-        Modifiers::default()
+        self.state.modifiers.get()
     }
 
     fn capslock(&self) -> Capslock {
@@ -272,11 +324,11 @@ impl PlatformWindow for PluginWindow {
     fn activate(&self) {}
 
     fn is_active(&self) -> bool {
-        true
+        self.state.host.get().active
     }
 
     fn is_hovered(&self) -> bool {
-        true
+        self.state.hovered.get()
     }
 
     fn background_appearance(&self) -> WindowBackgroundAppearance {
@@ -305,7 +357,9 @@ impl PlatformWindow for PluginWindow {
         self.state.callbacks.borrow_mut().input = Some(callback);
     }
 
-    fn on_active_status_change(&self, _callback: Box<dyn FnMut(bool)>) {}
+    fn on_active_status_change(&self, callback: Box<dyn FnMut(bool)>) {
+        self.state.callbacks.borrow_mut().active = Some(callback);
+    }
 
     fn on_hover_status_change(&self, _callback: Box<dyn FnMut(bool)>) {}
 
@@ -322,7 +376,9 @@ impl PlatformWindow for PluginWindow {
 
     fn on_close(&self, _callback: Box<dyn FnOnce()>) {}
 
-    fn on_appearance_changed(&self, _callback: Box<dyn FnMut()>) {}
+    fn on_appearance_changed(&self, callback: Box<dyn FnMut()>) {
+        self.state.callbacks.borrow_mut().appearance = Some(callback);
+    }
 
     fn draw(&self, _scene: &Scene) {
         // The window's scene as a whole is never presented: after each frame the platform

@@ -319,6 +319,7 @@ impl PluginPlatform {
             PlatformInput::MouseUp(event) => event.position += placed.origin,
             PlatformInput::MouseMove(event) => event.position += placed.origin,
             PlatformInput::ScrollWheel(event) => event.position += placed.origin,
+            PlatformInput::MouseExited(event) => event.position += placed.origin,
             _ => {}
         }
         window.dispatch_input(input);
@@ -346,6 +347,15 @@ impl PluginPlatform {
                         if let Some(scene) = gpui_window.take_root_scene(placed.root) {
                             let list = serialize_scene(&scene, scale_factor, placed.origin, &atlas);
                             objects::push_scene(*surface, list);
+                        }
+                        // Tooltips, drag previews and prompts belong to no root; they go
+                        // with the surface the pointer is in, which is where they appear.
+                        let include_unowned = self.last_input_surface.get() == Some(*surface);
+                        if let Some(scene) =
+                            gpui_window.take_root_overlay_scene(placed.root, include_unowned)
+                        {
+                            let list = serialize_scene(&scene, scale_factor, placed.origin, &atlas);
+                            objects::push_overlay(*surface, list);
                         }
                     }
                 })

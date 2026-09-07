@@ -4,15 +4,19 @@
 //! input as ordinary method calls.
 
 use gpui::{
-    App, Bounds, BoxShadow, ContentMask, Context, Corners, Edges, FocusHandle, IntoElement,
-    KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
-    Pixels, PlatformInput, Point, Render, ScrollWheelEvent, UnderlineStyle, Window, canvas, div,
-    point, prelude::*, px,
+    App, Bounds, BoxShadow, ContentMask, Context, Corners, Edges, FocusHandle, InteractiveElement,
+    IntoElement, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseButton, MouseDownEvent,
+    MouseExitEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, PlatformInput, Point, Render,
+    ScrollWheelEvent, UnderlineStyle, Window, canvas, deferred, div, point, prelude::*, px, size,
 };
 
 use crate::surface::{
-    Cursor, Geometry, HostWindow, KeyEvent, MouseEvent, SurfaceApi, ViewApi, ViewApiCaller as _,
+    Appearance, Cursor, Geometry, HostWindow, KeyEvent, MouseEvent, SurfaceApi, ViewApi,
+    ViewApiCaller as _,
 };
+
+/// Overlays are deferred above everything the host defers itself.
+const OVERLAY_PRIORITY: usize = 1 << 20;
 use crate::{PluginImages, Ref, Remote, bindings};
 
 /// A place pixels go: one slot in the host's element tree, as a GPUI entity.
@@ -28,6 +32,9 @@ use crate::{PluginImages, Ref, Remote, bindings};
 pub struct Surface {
     view: Option<Remote<ViewApi>>,
     display_list: Option<(bindings::DisplayList, PluginImages)>,
+    /// What the view drew outside its slot (popovers, tooltips, drag previews), painted
+    /// above the whole host window, with the slot-relative bounds it covers.
+    overlay: Option<(bindings::DisplayList, PluginImages, Bounds<Pixels>)>,
     cursor: Option<gpui::CursorStyle>,
     geometry: Option<Geometry>,
     last_origin: Point<Pixels>,
@@ -39,6 +46,7 @@ impl Surface {
         Self {
             view: None,
             display_list: None,
+            overlay: None,
             cursor: None,
             geometry: None,
             last_origin: Point::default(),
@@ -64,6 +72,68 @@ impl Surface {
     ) {
         self.display_list = Some((list, images));
         cx.notify();
+    }
+
+    pub(crate) fn set_overlay(
+        &mut self,
+        list: bindings::DisplayList,
+        images: PluginImages,
+        cx: &mut Context<Self>,
+    ) {
+        self.overlay = list_bounds(&list).map(|bounds| (list, images, bounds));
+        cx.notify();
+    }
+
+    /// Mouse listeners forwarding to the view, for the slot and for its overlay alike.
+    /// Positions are made slot-relative; the guest puts them back into window
+    /// coordinates, so an overlay outside the slot works the same way.
+    fn wire_mouse<E: StatefulInteractiveElement>(&self, element: E, cx: &mut Context<Self>) -> E {
+        element
+            .on_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                window.focus(&this.focus_handle, cx);
+                this.forward_mouse(PlatformInput::MouseDown(event.clone()), cx);
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseUpEvent, _window, cx| {
+                    this.forward_mouse(PlatformInput::MouseUp(event.clone()), cx);
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseUpEvent, _window, cx| {
+                    this.forward_mouse(PlatformInput::MouseUp(event.clone()), cx);
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(|this, event: &MouseUpEvent, _window, cx| {
+                    this.forward_mouse(PlatformInput::MouseUp(event.clone()), cx);
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
+                this.forward_mouse(PlatformInput::MouseMove(event.clone()), cx);
+            }))
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
+                this.forward_mouse(PlatformInput::ScrollWheel(event.clone()), cx);
+            }))
+            // Leaving the element (or the window while over it): the guest clears hover
+            // and dismisses tooltips, as it would for a pointer leaving a real window.
+            .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
+                if !*hovered {
+                    this.forward_mouse(
+                        PlatformInput::MouseExited(MouseExitEvent {
+                            position: window.mouse_position(),
+                            pressed_button: None,
+                            modifiers: window.modifiers(),
+                        }),
+                        cx,
+                    );
+                }
+            }))
+            .on_mouse_exit(cx.listener(|this, event: &MouseExitEvent, _window, cx| {
+                this.forward_mouse(PlatformInput::MouseExited(event.clone()), cx);
+            }))
     }
 
     /// Forward input to the attached view. Fire-and-forget: the guest's own dispatch
@@ -100,6 +170,8 @@ impl Surface {
                 width: f32::from(viewport.width),
                 height: f32::from(viewport.height),
                 scale_factor: window.scale_factor(),
+                active: window.is_window_active(),
+                appearance: Appearance::from_gpui(window.appearance()),
             },
         };
         if self.geometry == Some(geometry) {
@@ -136,69 +208,120 @@ impl Render for Surface {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let prepaint_entity = cx.entity();
         let paint_entity = cx.entity();
+        let overlay_entity = cx.entity();
+        let overlay_bounds = self.overlay.as_ref().map(|(_, _, bounds)| *bounds);
 
-        div()
+        let slot = div()
             .size_full()
             .id(("embedded-surface", cx.entity_id()))
             .track_focus(&self.focus_handle)
             .when_some(self.cursor, |this, cursor| this.cursor(cursor))
-            .on_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                window.focus(&this.focus_handle, cx);
-                this.forward_mouse(PlatformInput::MouseDown(event.clone()), cx);
-            }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
                 this.forward_key(PlatformInput::KeyDown(event.clone()), cx);
             }))
             .on_key_up(cx.listener(|this, event: &KeyUpEvent, _window, cx| {
                 this.forward_key(PlatformInput::KeyUp(event.clone()), cx);
             }))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, event: &MouseUpEvent, _window, cx| {
-                    this.forward_mouse(PlatformInput::MouseUp(event.clone()), cx);
-                }),
+            .on_modifiers_changed(cx.listener(
+                |this, event: &ModifiersChangedEvent, _window, cx| {
+                    this.forward_key(PlatformInput::ModifiersChanged(event.clone()), cx);
+                },
+            ));
+        let slot = self.wire_mouse(slot, cx);
+
+        let overlay = overlay_bounds.map(|bounds| {
+            let overlay = div()
+                .id(("embedded-overlay", cx.entity_id()))
+                .absolute()
+                .left(bounds.origin.x)
+                .top(bounds.origin.y)
+                .w(bounds.size.width)
+                .h(bounds.size.height)
+                .occlude()
+                .child(
+                    canvas(
+                        |_, _, _| (),
+                        move |_: Bounds<Pixels>, _: (), window: &mut Window, cx: &mut App| {
+                            let surface = overlay_entity.read(cx);
+                            if let Some((list, images, _)) = surface.overlay.as_ref() {
+                                let images = images.borrow();
+                                let clip = Bounds {
+                                    origin: Point::default(),
+                                    size: window.viewport_size(),
+                                };
+                                replay(list, surface.last_origin, clip, &images, window);
+                            }
+                        },
+                    )
+                    .size_full(),
+                );
+            deferred(self.wire_mouse(overlay, cx)).with_priority(OVERLAY_PRIORITY)
+        });
+
+        slot.child(
+            canvas(
+                move |bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App| {
+                    prepaint_entity.update(cx, |this, cx| {
+                        this.last_origin = bounds.origin;
+                        this.measured(bounds, window, cx);
+                    });
+                    bounds
+                },
+                move |bounds: Bounds<Pixels>,
+                      _: Bounds<Pixels>,
+                      window: &mut Window,
+                      cx: &mut App| {
+                    let surface = paint_entity.read(cx);
+                    if let Some((list, images)) = surface.display_list.as_ref() {
+                        let images = images.borrow();
+                        replay(list, bounds.origin, bounds, &images, window);
+                    }
+                },
             )
-            .on_mouse_up(
-                MouseButton::Right,
-                cx.listener(|this, event: &MouseUpEvent, _window, cx| {
-                    this.forward_mouse(PlatformInput::MouseUp(event.clone()), cx);
-                }),
-            )
-            .on_mouse_up(
-                MouseButton::Middle,
-                cx.listener(|this, event: &MouseUpEvent, _window, cx| {
-                    this.forward_mouse(PlatformInput::MouseUp(event.clone()), cx);
-                }),
-            )
-            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
-                this.forward_mouse(PlatformInput::MouseMove(event.clone()), cx);
-            }))
-            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
-                this.forward_mouse(PlatformInput::ScrollWheel(event.clone()), cx);
-            }))
-            .child(
-                canvas(
-                    move |bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App| {
-                        prepaint_entity.update(cx, |this, cx| {
-                            this.last_origin = bounds.origin;
-                            this.measured(bounds, window, cx);
-                        });
-                        bounds
-                    },
-                    move |bounds: Bounds<Pixels>,
-                          _: Bounds<Pixels>,
-                          window: &mut Window,
-                          cx: &mut App| {
-                        let surface = paint_entity.read(cx);
-                        if let Some((list, images)) = surface.display_list.as_ref() {
-                            let images = images.borrow();
-                            replay(list, bounds, &images, window);
-                        }
-                    },
-                )
-                .size_full(),
-            )
+            .size_full(),
+        )
+        .children(overlay)
     }
+}
+
+/// The slot-relative bounds an overlay display list covers: where the host puts the
+/// hitbox that routes input over it to the view.
+fn list_bounds(list: &bindings::DisplayList) -> Option<Bounds<Pixels>> {
+    let mut union: Option<Bounds<Pixels>> = None;
+    let mut include = |bounds: Bounds<Pixels>| {
+        union = Some(match union {
+            Some(union) => union.union(&bounds),
+            None => bounds,
+        });
+    };
+    for placed in &list.primitives {
+        match &placed.prim {
+            bindings::Primitive::Quad(quad) => include(to_bounds(&quad.bounds, Point::default())),
+            bindings::Primitive::Shadow(shadow) => {
+                include(to_bounds(&shadow.bounds, Point::default()))
+            }
+            bindings::Primitive::Image(image) => {
+                include(to_bounds(&image.bounds, Point::default()))
+            }
+            bindings::Primitive::Underline(underline) => include(Bounds {
+                origin: to_point(&underline.origin, Point::default()),
+                size: size(px(underline.width), px(underline.thickness)),
+            }),
+            bindings::Primitive::Glyph(glyph) => include(Bounds {
+                origin: point(px(glyph.origin.x), px(glyph.origin.y - glyph.font_size)),
+                size: size(px(glyph.font_size), px(glyph.font_size * 1.5)),
+            }),
+            bindings::Primitive::Path(path) => {
+                for vertex in &path.vertices {
+                    include(Bounds {
+                        origin: to_point(&vertex.xy, Point::default()),
+                        size: size(px(0.), px(0.)),
+                    });
+                }
+            }
+        }
+    }
+    union
 }
 
 /// Replay a guest display list into the host window. Coordinates on the wire are logical
@@ -208,7 +331,8 @@ impl Render for Surface {
 /// preserved (invariant 6).
 fn replay(
     list: &bindings::DisplayList,
-    slot: Bounds<Pixels>,
+    origin: Point<Pixels>,
+    clip: Bounds<Pixels>,
     images: &std::collections::HashMap<u64, std::sync::Arc<gpui::RenderImage>>,
     window: &mut Window,
 ) {
@@ -223,9 +347,9 @@ fn replay(
             end += 1;
         }
         let layer = &indices[cursor..end];
-        window.paint_layer(slot, |window| {
+        window.paint_layer(clip, |window| {
             for &index in layer {
-                paint_primitive(&list.primitives[index].prim, slot, images, window);
+                paint_primitive(&list.primitives[index].prim, origin, clip, images, window);
             }
         });
         cursor = end;
@@ -234,14 +358,15 @@ fn replay(
 
 fn paint_primitive(
     primitive: &bindings::Primitive,
-    slot: Bounds<Pixels>,
+    slot_origin: Point<Pixels>,
+    clip: Bounds<Pixels>,
     images: &std::collections::HashMap<u64, std::sync::Arc<gpui::RenderImage>>,
     window: &mut Window,
 ) {
     match primitive {
         bindings::Primitive::Quad(quad) => {
-            let bounds = to_bounds(&quad.bounds, slot.origin);
-            let mask = to_bounds(&quad.content_mask, slot.origin).intersect(&slot);
+            let bounds = to_bounds(&quad.bounds, slot_origin);
+            let mask = to_bounds(&quad.content_mask, slot_origin).intersect(&clip);
             window.with_content_mask(Some(ContentMask { bounds: mask }), |window| {
                 window.paint_quad(PaintQuad {
                     bounds,
@@ -254,8 +379,8 @@ fn paint_primitive(
             });
         }
         bindings::Primitive::Shadow(shadow) => {
-            let bounds = to_bounds(&shadow.bounds, slot.origin);
-            let mask = to_bounds(&shadow.content_mask, slot.origin).intersect(&slot);
+            let bounds = to_bounds(&shadow.bounds, slot_origin);
+            let mask = to_bounds(&shadow.content_mask, slot_origin).intersect(&clip);
             let corner_radii = to_corners(&shadow.corner_radii);
             let box_shadow = BoxShadow {
                 color: to_hsla(&shadow.color),
@@ -271,8 +396,8 @@ fn paint_primitive(
             });
         }
         bindings::Primitive::Underline(underline) => {
-            let origin = to_point(&underline.origin, slot.origin);
-            let mask = to_bounds(&underline.content_mask, slot.origin).intersect(&slot);
+            let origin = to_point(&underline.origin, slot_origin);
+            let mask = to_bounds(&underline.content_mask, slot_origin).intersect(&clip);
             let style = UnderlineStyle {
                 color: Some(to_hsla(&underline.color)),
                 thickness: px(underline.thickness),
@@ -283,8 +408,8 @@ fn paint_primitive(
             });
         }
         bindings::Primitive::Glyph(glyph) => {
-            let origin = to_point(&glyph.origin, slot.origin);
-            let mask = to_bounds(&glyph.content_mask, slot.origin).intersect(&slot);
+            let origin = to_point(&glyph.origin, slot_origin);
+            let mask = to_bounds(&glyph.content_mask, slot_origin).intersect(&clip);
             let font_id = gpui::FontId(glyph.font_id as usize);
             let glyph_id = gpui::GlyphId(glyph.glyph_id);
             let font_size = px(glyph.font_size);
@@ -306,15 +431,15 @@ fn paint_primitive(
             if path.vertices.len() < 3 {
                 return;
             }
-            let mask = to_bounds(&path.content_mask, slot.origin).intersect(&slot);
+            let mask = to_bounds(&path.content_mask, slot_origin).intersect(&clip);
             let color = to_hsla(&path.color);
-            let mut rebuilt = gpui::Path::new(to_point(&path.vertices[0].xy, slot.origin));
+            let mut rebuilt = gpui::Path::new(to_point(&path.vertices[0].xy, slot_origin));
             for triangle in path.vertices.chunks_exact(3) {
                 rebuilt.push_triangle(
                     (
-                        to_point(&triangle[0].xy, slot.origin),
-                        to_point(&triangle[1].xy, slot.origin),
-                        to_point(&triangle[2].xy, slot.origin),
+                        to_point(&triangle[0].xy, slot_origin),
+                        to_point(&triangle[1].xy, slot_origin),
+                        to_point(&triangle[2].xy, slot_origin),
                     ),
                     (
                         point(triangle[0].st.x, triangle[0].st.y),
@@ -347,8 +472,8 @@ fn paint_primitive(
                     );
                 });
             }
-            let bounds = to_bounds(&image.bounds, slot.origin);
-            let mask = to_bounds(&image.content_mask, slot.origin).intersect(&slot);
+            let bounds = to_bounds(&image.bounds, slot_origin);
+            let mask = to_bounds(&image.content_mask, slot_origin).intersect(&clip);
             let corner_radii = to_corners(&image.corner_radii);
             let render_image = render_image.clone();
             let grayscale = image.grayscale;

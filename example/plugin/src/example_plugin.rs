@@ -244,6 +244,24 @@ impl ButtonView {
     }
 }
 
+struct ButtonTooltip;
+
+impl Render for ButtonTooltip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px(px(8.))
+            .py(px(4.))
+            .rounded(px(6.))
+            .bg(rgb(0x1b1f27))
+            .border_1()
+            .border_color(rgb(0x69a2d6))
+            .text_color(gpui::white())
+            .text_size(px(12.))
+            .font_family("Helvetica")
+            .child("Overlay: a tooltip drawn by the plugin, painted by the host")
+    }
+}
+
 impl Render for ButtonView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let click_count = self
@@ -266,6 +284,9 @@ impl Render for ButtonView {
             .font_family("Helvetica")
             .text_color(gpui::white())
             .text_size(px(15.))
+            // A tooltip is a window-level root on the guest; it reaches the host as
+            // this surface's overlay and is painted above the host's own tree.
+            .tooltip(|_, cx| cx.new(|_| ButtonTooltip).into())
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |_, _, _, cx| {

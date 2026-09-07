@@ -574,7 +574,7 @@ impl PluginHost {
                     }
                     pump_objects.drain_releases();
                     host.update(cx, |host, cx| {
-                        host.apply_scenes(turn.scenes, cx);
+                        host.apply_scenes(turn.scenes, turn.overlays, cx);
                         host.schedule_wake(turn.wake_after_ms, cx);
                     })
                 });
@@ -679,7 +679,12 @@ impl PluginHost {
     /// Route freshly rendered display lists to the surfaces they address. A scene names
     /// its surface by object id; the surface must be one this host shared, so a guest
     /// can only draw where it was handed a ref.
-    fn apply_scenes(&mut self, scenes: Vec<bindings::Scene>, cx: &mut Context<Self>) {
+    fn apply_scenes(
+        &mut self,
+        scenes: Vec<bindings::Scene>,
+        overlays: Vec<bindings::Scene>,
+        cx: &mut Context<Self>,
+    ) {
         for scene in scenes {
             self.ingest_images(&scene.list);
             match self.objects.local_entity::<Surface>(scene.surface) {
@@ -687,6 +692,18 @@ impl PluginHost {
                     surface.set_scene(scene.list, self.images.clone(), cx);
                 }),
                 None => log::warn!("embedded_gpui: scene for unknown surface {}", scene.surface),
+            }
+        }
+        for overlay in overlays {
+            self.ingest_images(&overlay.list);
+            match self.objects.local_entity::<Surface>(overlay.surface) {
+                Some(surface) => surface.update(cx, |surface, cx| {
+                    surface.set_overlay(overlay.list, self.images.clone(), cx);
+                }),
+                None => log::warn!(
+                    "embedded_gpui: overlay for unknown surface {}",
+                    overlay.surface
+                ),
             }
         }
     }

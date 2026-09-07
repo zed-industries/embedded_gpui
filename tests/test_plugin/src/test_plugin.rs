@@ -203,6 +203,7 @@ impl Render for ProbeView {
                             viewport_width: f32::from(viewport.width),
                             viewport_height: f32::from(viewport.height),
                             scale_factor: window.scale_factor(),
+                            active: window.is_window_active(),
                         };
                         measured.update(cx, |this, _| this.geometry = Some(geometry));
                     },

@@ -18,6 +18,7 @@ thread_local! {
     static OUTBOUND: RefCell<Vec<wit::Frame>> = const { RefCell::new(Vec::new()) };
     /// Display lists toward the host, collected until the turn returns.
     static SCENES: RefCell<Vec<wit::Scene>> = const { RefCell::new(Vec::new()) };
+    static OVERLAYS: RefCell<Vec<wit::Scene>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Registry frames -> wit-bindgen wire records, and back. Purely structural.
@@ -145,11 +146,17 @@ pub(crate) fn push_scene(surface: u64, list: wit::DisplayList) {
     SCENES.with(|scenes| scenes.borrow_mut().push(wit::Scene { surface, list }));
 }
 
+/// Queue a surface's overlay display list for the host.
+pub(crate) fn push_overlay(surface: u64, list: wit::DisplayList) {
+    OVERLAYS.with(|overlays| overlays.borrow_mut().push(wit::Scene { surface, list }));
+}
+
 /// Everything queued since the last turn, as the `tick` export returns it.
 pub(crate) fn take_turn(wake_after_ms: Option<u32>) -> wit::Turn {
     wit::Turn {
         frames: OUTBOUND.with(|outbound| std::mem::take(&mut *outbound.borrow_mut())),
         scenes: SCENES.with(|scenes| std::mem::take(&mut *scenes.borrow_mut())),
+        overlays: OVERLAYS.with(|overlays| std::mem::take(&mut *overlays.borrow_mut())),
         wake_after_ms,
     }
 }

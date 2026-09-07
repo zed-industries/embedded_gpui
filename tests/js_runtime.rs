@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use embedded_gpui::surface::{
-    Geometry, HostWindow, Modifiers, MouseButton, MouseButtonEvent, MouseEvent, Point,
+    Appearance, Geometry, HostWindow, Modifiers, MouseButton, MouseButtonEvent, MouseEvent, Point,
     ViewApiCaller as _,
 };
 use embedded_gpui::{
@@ -201,6 +201,8 @@ async fn test_script_renders_a_view_and_receives_input(cx: &mut TestAppContext) 
                     width: 640.,
                     height: 480.,
                     scale_factor: 1.,
+                    active: true,
+                    appearance: Appearance::Dark,
                 },
             },
             cx,
@@ -258,6 +260,8 @@ async fn test_reload_starts_clean_and_replays_the_host(cx: &mut TestAppContext) 
                     width: 640.,
                     height: 480.,
                     scale_factor: 1.,
+                    active: true,
+                    appearance: Appearance::Dark,
                 },
             },
             cx,
@@ -304,6 +308,8 @@ async fn test_reload_starts_clean_and_replays_the_host(cx: &mut TestAppContext) 
                     width: 640.,
                     height: 480.,
                     scale_factor: 1.,
+                    active: true,
+                    appearance: Appearance::Dark,
                 },
             },
             cx,

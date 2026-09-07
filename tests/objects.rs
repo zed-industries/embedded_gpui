@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use embedded_gpui::schema::TypeKind;
 use embedded_gpui::surface::{
-    Geometry, HostWindow, Modifiers, MouseButton, MouseButtonEvent, MouseEvent, Point,
+    Appearance, Geometry, HostWindow, Modifiers, MouseButton, MouseButtonEvent, MouseEvent, Point,
     ViewApiCaller as _,
 };
 use embedded_gpui::{
@@ -105,6 +105,7 @@ fn seen_geometry(geometry: Geometry) -> SeenGeometry {
         viewport_width: geometry.window.width,
         viewport_height: geometry.window.height,
         scale_factor: geometry.window.scale_factor,
+        active: geometry.window.active,
     }
 }
 
@@ -617,6 +618,8 @@ async fn test_views_are_objects(cx: &mut TestAppContext) {
             width: 800.,
             height: 600.,
             scale_factor: 2.,
+            active: true,
+            appearance: Appearance::Dark,
         },
     };
     cx.update(|cx| view.resize(geometry, cx));
@@ -674,6 +677,8 @@ async fn test_reattaching_a_surface_replaces_its_view(cx: &mut TestAppContext) {
             width: 640.,
             height: 480.,
             scale_factor: 1.,
+            active: true,
+            appearance: Appearance::Dark,
         },
     };
 
